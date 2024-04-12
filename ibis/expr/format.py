@@ -169,7 +169,7 @@ class Rendered(str):
 
 
 @public
-def pretty(expr: ir.Expr, scope: Optional[dict[str, ir.Expr]] = None):
+def pretty(expr: ops.Node | ir.Expr, scope: Optional[dict[str, ir.Expr]] = None) -> str:
     """Pretty print an expression.
 
     Parameters
@@ -178,18 +178,27 @@ def pretty(expr: ir.Expr, scope: Optional[dict[str, ir.Expr]] = None):
         The expression to pretty print.
     scope
         A dictionary of expression to name mappings used to intermediate
-        assignments. If not provided, the names of the expressions will be
-        generated.
+        assignments.
+        If not provided the names of the expressions will either be
+        - the variable name in the defining scope if
+          `ibis.options.repr.show_variables` is enabled
+        - generated names like `r0`, `r1`, etc. otherwise
 
     Returns
     -------
     str
         A pretty printed representation of the expression.
     """
-    if not isinstance(expr, ir.Expr):
-        raise TypeError(f"Expected an expression, got {type(expr)}")
+    if isinstance(expr, ir.Expr):
+        node = expr.op()
+    elif isinstance(expr, ops.Node):
+        node = expr
+    else:
+        raise TypeError(f"Expected an expression or a node, got {type(expr)}")
 
-    node = expr.op()
+    if scope is None and ibis.options.repr.show_variables:
+        scope = get_defining_scope(expr)
+
     refs = {}
     refcnt = itertools.count()
     variables = {v.op(): k for k, v in (scope or {}).items()}
@@ -224,7 +233,8 @@ def pretty(expr: ir.Expr, scope: Optional[dict[str, ir.Expr]] = None):
 
 @functools.singledispatch
 def fmt(op, **kwargs):
-    raise NotImplementedError(f"no pretty printer for {type(op)}")
+    top = f"{op.__class__.__name__}\n"
+    return top + render_fields(kwargs, 1)
 
 
 @fmt.register(ops.Relation)

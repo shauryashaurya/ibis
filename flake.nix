@@ -9,7 +9,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
 
     poetry2nix = {
       url = "github:nix-community/poetry2nix";
@@ -129,7 +129,7 @@
 
         default = pkgs.ibis312;
 
-        inherit (pkgs) update-lock-files gen-all-extras gen-examples check-release-notes-spelling;
+        inherit (pkgs) update-lock-files gen-examples check-release-notes-spelling;
       };
 
       devShells = rec {
@@ -138,7 +138,7 @@
         ibis311 = mkDevShell pkgs.ibisDevEnv311;
         ibis312 = mkDevShell pkgs.ibisDevEnv312;
 
-        default = ibis311;
+        default = ibis312;
 
         preCommit = pkgs.mkShell {
           name = "preCommit";

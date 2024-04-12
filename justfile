@@ -9,14 +9,14 @@ clean:
 # lock dependencies without updating existing versions
 lock:
     #!/usr/bin/env bash
-    required_version="1.7.1"
+    required_version="1.8.2"
     version="$(poetry --version)"
     if ! grep -qF "${required_version}" <<< "${version}"; then
         >&2 echo "poetry version must be ${required_version}, got ${version}"
         exit 1
     fi
     poetry lock --no-update
-    poetry export --extras all --with dev --with test --with docs --without-hashes --no-ansi > requirements-dev.txt
+    poetry export --all-extras --with dev --with test --with docs --without-hashes --no-ansi > requirements-dev.txt
 
 # show all backends
 @list-backends:

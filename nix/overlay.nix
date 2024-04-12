@@ -36,7 +36,7 @@ in
   ibisDevEnv312 = mkPoetryDevEnv pkgs.python312;
 
   ibisSmallDevEnv = mkPoetryEnv {
-    python = pkgs.python311;
+    python = pkgs.python312;
     groups = [ "dev" ];
     extras = [ ];
   };
@@ -90,15 +90,6 @@ in
 
     text = ''
       python "$PWD/ibis/examples/gen_registry.py" "''${@}"
-    '';
-  };
-
-  gen-all-extras = pkgs.writeShellApplication {
-    name = "gen-all-extras";
-    runtimeInputs = with pkgs; [ yj jq ];
-    text = ''
-      echo -n 'all = '
-      yj -tj < pyproject.toml | jq -rM '.tool.poetry.extras | with_entries(select(.key != "all")) | [.[]] | add | unique | sort'
     '';
   };
 }

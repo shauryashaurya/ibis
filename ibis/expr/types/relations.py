@@ -21,9 +21,10 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 from ibis import util
-from ibis.common.deferred import Deferred
+from ibis.common.deferred import Deferred, Resolver
 from ibis.expr.types.core import Expr, _FixedTextJupyterMixin
 from ibis.expr.types.generic import ValueExpr, literal
+from ibis.expr.types.pretty import to_rich
 from ibis.selectors import Selector
 from ibis.util import deprecated
 
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     import pandas as pd
     import polars as pl
     import pyarrow as pa
+    from rich.table import Table as RichTable
 
     import ibis.expr.types as ir
     import ibis.selectors as s
@@ -95,9 +97,9 @@ def _regular_join_method(
 
 # TODO(kszucs): should use (table, *args, **kwargs) instead to avoid interpreting
 # nested inputs
-def bind(table: Table, value: Any, prefer_column=True) -> Iterator[ir.Value]:
+def bind(table: Table, value: Any) -> Iterator[ir.Value]:
     """Bind a value to a table expression."""
-    if prefer_column and type(value) in (str, int):
+    if type(value) in (str, int):
         yield table._get_column(value)
     elif isinstance(value, ValueExpr):
         yield value
@@ -106,15 +108,17 @@ def bind(table: Table, value: Any, prefer_column=True) -> Iterator[ir.Value]:
             yield value._get_column(name)
     elif isinstance(value, Deferred):
         yield value.resolve(table)
+    elif isinstance(value, Resolver):
+        yield value.resolve({"_": table})
     elif isinstance(value, Selector):
         yield from value.expand(table)
     elif isinstance(value, Mapping):
         for k, v in value.items():
-            for val in bind(table, v, prefer_column=prefer_column):
+            for val in bind(table, v):
                 yield val.name(k)
     elif util.is_iterable(value):
         for v in value:
-            yield from bind(table, v, prefer_column=prefer_column)
+            yield from bind(table, v)
     elif isinstance(value, ops.Value):
         # TODO(kszucs): from certain builders, like ir.GroupedTable we pass
         # operation nodes instead of expressions to table methods, it would
@@ -495,41 +499,73 @@ class Table(Expr, _FixedTextJupyterMixin):
             cols.append(new_col)
         return self.select(*cols)
 
-    def __interactive_rich_console__(self, console, options):
-        from ibis.expr.types.pretty import to_rich_table
+    def preview(
+        self,
+        *,
+        max_rows: int | None = None,
+        max_columns: int | None = None,
+        max_length: int | None = None,
+        max_string: int | None = None,
+        max_depth: int | None = None,
+        console_width: int | float | None = None,
+    ) -> RichTable:
+        """Return a subset as a Rich Table.
 
-        if console.is_jupyter:
-            # Rich infers a console width in jupyter notebooks, but since
-            # notebooks can use horizontal scroll bars we don't want to apply a
-            # limit here. Since rich requires an integer for max_width, we
-            # choose an arbitrarily large integer bound. Note that we need to
-            # handle this here rather than in `to_rich_table`, as this setting
-            # also needs to be forwarded to `console.render`.
-            options = options.update(max_width=1_000_000)
-            width = None
-        else:
-            width = options.max_width
+        This is an explicit version of what you get when you inspect
+        this object in interactive mode, except with this version you
+        can pass formatting options. The options are the same as those exposed
+        in `ibis.options.interactive`.
 
-        try:
-            table = to_rich_table(self, width)
-        except Exception as e:
-            # In IPython exceptions inside of _repr_mimebundle_ are swallowed to
-            # allow calling several display functions and choosing to display
-            # the "best" result based on some priority.
-            # This behavior, though, means that exceptions that bubble up inside of the interactive repr
-            # are silently caught.
-            #
-            # We can't stop the exception from being swallowed, but we can force
-            # the display of that exception as we do here.
-            #
-            # A _very_ annoying caveat is that this exception is _not_ being
-            # ` raise`d, it is only being printed to the console.  This means
-            # that you cannot "catch" it.
-            #
-            # This restriction is only present in IPython, not in other REPLs.
-            console.print_exception()
-            raise e
-        return console.render(table, options=options)
+        Parameters
+        ----------
+        max_rows
+            Maximum number of rows to display
+        max_columns
+            Maximum number of columns to display
+        max_length
+            Maximum length for pretty-printed arrays and maps
+        max_string
+            Maximum length for pretty-printed strings
+        max_depth
+            Maximum depth for nested data types
+        console_width
+            Width of the console in characters. If not specified, the width
+            will be inferred from the console.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> t = ibis.examples.penguins.fetch()
+
+        Because the console_width is too small, only 2 columns are shown even though
+        we specified up to 3.
+
+        >>> t.preview(
+        ...     max_rows=3,
+        ...     max_columns=3,
+        ...     max_string=8,
+        ...     console_width=30,
+        ... )  # doctest: +SKIP
+        ┏━━━━━━━━━┳━━━━━━━━━━┳━━━┓
+        ┃ species ┃ island   ┃ … ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━╇━━━┩
+        │ string  │ string   │ … │
+        ├─────────┼──────────┼───┤
+        │ Adelie  │ Torgers… │ … │
+        │ Adelie  │ Torgers… │ … │
+        │ Adelie  │ Torgers… │ … │
+        │ …       │ …        │ … │
+        └─────────┴──────────┴───┘
+        """
+        return to_rich(
+            self,
+            max_columns=max_columns,
+            max_rows=max_rows,
+            max_length=max_length,
+            max_string=max_string,
+            max_depth=max_depth,
+            console_width=console_width,
+        )
 
     # TODO(kszucs): expose this method in the public API
     def _get_column(self, name: str | int) -> ir.Column:
@@ -1946,7 +1982,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         # string and integer inputs are going to be coerced to literals instead
         # of interpreted as column references like in select
         node = self.op()
-        values = bind(self, (exprs, mutations), prefer_column=False)
+        values = bind(self, (exprs, mutations))
         values = unwrap_aliases(values)
         # allow overriding of fields, hence the mutation behavior
         values = {**node.fields, **values}
@@ -3359,7 +3395,8 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> import ibis
         >>> ibis.options.interactive = True
         >>> t = ibis.examples.penguins.fetch()
-        >>> cached_penguins = t.mutate(computation="Heavy Computation").cache()
+        >>> heavy_computation = ibis.literal("Heavy Computation")
+        >>> cached_penguins = t.mutate(computation=heavy_computation).cache()
         >>> cached_penguins
         ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
         ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
@@ -3381,7 +3418,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Explicit cache cleanup
 
-        >>> with t.mutate(computation="Heavy Computation").cache() as cached_penguins:
+        >>> with t.mutate(computation=heavy_computation).cache() as cached_penguins:
         ...     cached_penguins
         ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
         ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃

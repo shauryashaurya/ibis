@@ -63,7 +63,7 @@ class GroupedTable(Concrete):
         else:
             return GroupedArray(field, self)
 
-    def aggregate(self, metrics=(), **kwds) -> ir.Table:
+    def aggregate(self, *metrics, **kwds) -> ir.Table:
         """Compute aggregates over a group by."""
         return self.table.to_expr().aggregate(
             metrics, by=self.groupings, having=self.havings, **kwds
@@ -71,7 +71,7 @@ class GroupedTable(Concrete):
 
     agg = aggregate
 
-    def having(self, expr: ir.BooleanScalar) -> GroupedTable:
+    def having(self, *expr: ir.BooleanScalar) -> GroupedTable:
         """Add a post-aggregation result filter `expr`.
 
         ::: {.callout-warning}
@@ -92,7 +92,7 @@ class GroupedTable(Concrete):
         havings = tuple(bind(table, expr))
         return self.copy(havings=self.havings + havings)
 
-    def order_by(self, expr: ir.Value | Iterable[ir.Value]) -> GroupedTable:
+    def order_by(self, *expr: ir.Value | Iterable[ir.Value]) -> GroupedTable:
         """Sort a grouped table expression by `expr`.
 
         Notes
@@ -201,13 +201,9 @@ class GroupedTable(Concrete):
         [`GroupedTable.mutate`](#ibis.expr.types.groupby.GroupedTable.mutate)
         """
         table = self.table.to_expr()
-        frame = ops.RowsWindowFrame(
-            table=self.table,
-            group_by=self.groupings,
-            order_by=self.orderings,
-        )
         values = bind(table, (exprs, kwexprs))
-        return [rewrite_window_input(expr.op(), frame).to_expr() for expr in values]
+        window = ibis.window(group_by=self.groupings, order_by=self.orderings)
+        return [rewrite_window_input(expr.op(), window).to_expr() for expr in values]
 
     projection = select
 
@@ -265,7 +261,7 @@ class GroupedTable(Concrete):
             The aggregated table
         """
         table = self.table.to_expr()
-        return table.aggregate([table.count()], by=self.groupings, having=self.havings)
+        return table.aggregate(table.count(), by=self.groupings, having=self.havings)
 
     size = count
 
