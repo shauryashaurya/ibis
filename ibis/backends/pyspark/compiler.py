@@ -57,6 +57,7 @@ class PySparkCompiler(SQLGlotCompiler):
         (
             ops.RowID,
             ops.TimestampBucket,
+            ops.RandomUUID,
         )
     )
 
@@ -77,6 +78,10 @@ class PySparkCompiler(SQLGlotCompiler):
         ops.MapMerge: "map_concat",
         ops.MapKeys: "map_keys",
         ops.MapValues: "map_values",
+        ops.UnwrapJSONString: "unwrap_json_str",
+        ops.UnwrapJSONInt64: "unwrap_json_int",
+        ops.UnwrapJSONFloat64: "unwrap_json_float",
+        ops.UnwrapJSONBoolean: "unwrap_json_bool",
     }
 
     def _aggregate(self, funcname: str, *args, where):
@@ -85,6 +90,16 @@ class PySparkCompiler(SQLGlotCompiler):
             args = tuple(self.if_(where, arg, NULL) for arg in args)
         return func(*args)
 
+    def visit_InSubquery(self, op, *, rel, needle):
+        if op.needle.dtype.is_struct():
+            # construct the outer struct for pyspark
+            ident = sge.to_identifier(op.rel.schema.names[0], quoted=self.quoted)
+            needle = sge.Struct.from_arg_list(
+                [sge.PropertyEQ(this=ident, expression=needle)]
+            )
+
+        return super().visit_InSubquery(op, rel=rel, needle=needle)
+
     def visit_NonNullLiteral(self, op, *, value, dtype):
         if dtype.is_floating():
             result = super().visit_NonNullLiteral(op, value=value, dtype=dtype)
@@ -92,9 +107,6 @@ class PySparkCompiler(SQLGlotCompiler):
                 return self.f.nanvl(result, NULL)
             else:
                 return result
-        elif dtype.is_string():
-            value = value.replace("\\", "\\\\")
-            return sge.convert(value)
         elif dtype.is_binary():
             return self.f.unhex(value.hex())
         elif dtype.is_decimal():
@@ -337,7 +349,7 @@ class PySparkCompiler(SQLGlotCompiler):
             return self.if_(self.f.map_contains_key(arg, key), arg[key], default)
 
     def visit_ArrayZip(self, op, *, arg):
-        return self.f.arrays_zip(*arg)
+        return self.cast(self.f.arrays_zip(*arg), op.dtype)
 
     def visit_ArrayMap(self, op, *, arg, body, param):
         param = sge.Identifier(this=param)

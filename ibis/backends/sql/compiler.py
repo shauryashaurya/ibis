@@ -27,6 +27,7 @@ from ibis.backends.sql.rewrites import (
     rewrite_capitalize,
     sqlize,
 )
+from ibis.config import options
 from ibis.expr.operations.udf import InputType
 from ibis.expr.rewrites import replace_bucket
 
@@ -262,7 +263,6 @@ class SQLGlotCompiler(abc.ABC):
         ops.Power: "pow",
         ops.RPad: "rpad",
         ops.Radians: "radians",
-        ops.RandomScalar: "random",
         ops.RegexSearch: "regexp_like",
         ops.RegexSplit: "regexp_split",
         ops.Repeat: "repeat",
@@ -278,6 +278,7 @@ class SQLGlotCompiler(abc.ABC):
         ops.StringLength: "length",
         ops.StringReplace: "replace",
         ops.StringSplit: "split",
+        ops.StringToDate: "str_to_date",
         ops.StringToTimestamp: "str_to_time",
         ops.Tan: "tan",
         ops.Translate: "translate",
@@ -453,7 +454,12 @@ class SQLGlotCompiler(abc.ABC):
         # substitute parameters immediately to avoid having to define a
         # ScalarParameter translation rule
         params = self._prepare_params(params)
-        op, ctes = sqlize(op, params=params, rewrites=self.rewrites)
+        op, ctes = sqlize(
+            op,
+            params=params,
+            rewrites=self.rewrites,
+            fuse_selects=options.sql.fuse_selects,
+        )
 
         aliases = {}
         counter = itertools.count()
@@ -586,7 +592,8 @@ class SQLGlotCompiler(abc.ABC):
             return self.cast(str(value), dtype)
         elif dtype.is_interval():
             return sge.Interval(
-                this=sge.convert(str(value)), unit=dtype.resolution.upper()
+                this=sge.convert(str(value)),
+                unit=sge.Var(this=dtype.resolution.upper()),
             )
         elif dtype.is_boolean():
             return sge.Boolean(this=bool(value))
@@ -686,6 +693,14 @@ class SQLGlotCompiler(abc.ABC):
         if digits is not None:
             return sge.Round(this=arg, decimals=digits)
         return sge.Round(this=arg)
+
+    ### Random Noise
+
+    def visit_RandomScalar(self, op, **kwargs):
+        return self.f.rand()
+
+    def visit_RandomUUID(self, op, **kwargs):
+        return self.f.uuid()
 
     ### Dtype Dysmorphia
 
@@ -788,10 +803,11 @@ class SQLGlotCompiler(abc.ABC):
         )
 
     def visit_IntervalFromInteger(self, op, *, arg, unit):
-        return sge.Interval(this=sge.convert(arg), unit=unit.singular.upper())
+        return sge.Interval(
+            this=sge.convert(arg), unit=sge.Var(this=unit.singular.upper())
+        )
 
     ### String Instruments
-
     def visit_Strip(self, op, *, arg):
         return self.f.trim(arg, string.whitespace)
 
@@ -930,7 +946,10 @@ class SQLGlotCompiler(abc.ABC):
         return self.f.exists(select)
 
     def visit_InSubquery(self, op, *, rel, needle):
-        return needle.isin(query=rel.this)
+        query = rel.this
+        if not isinstance(query, sge.Select):
+            query = sg.select(STAR).from_(query)
+        return needle.isin(query=query)
 
     def visit_Array(self, op, *, exprs):
         return self.f.array(*exprs)
@@ -1102,9 +1121,11 @@ class SQLGlotCompiler(abc.ABC):
         result = parent
 
         if selections:
-            result = sg.select(*self._cleanup_names(selections), copy=False).from_(
-                result, copy=False
-            )
+            if op.is_star_selection():
+                fields = [STAR]
+            else:
+                fields = self._cleanup_names(selections)
+            result = sg.select(*fields, copy=False).from_(result, copy=False)
 
         if predicates:
             result = result.where(*predicates, copy=False)
@@ -1144,6 +1165,8 @@ class SQLGlotCompiler(abc.ABC):
 
     def visit_SelfReference(self, op, *, parent, identifier):
         return parent
+
+    visit_JoinReference = visit_SelfReference
 
     def visit_JoinChain(self, op, *, first, rest, values):
         result = sg.select(*self._cleanup_names(values), copy=False).from_(
@@ -1374,9 +1397,6 @@ class SQLGlotCompiler(abc.ABC):
 
     def visit_SQLQueryResult(self, op, *, query, schema, source):
         return sg.parse_one(query, dialect=self.dialect).subquery(copy=False)
-
-    def visit_JoinTable(self, op, *, parent, index):
-        return parent
 
     def visit_RegexExtract(self, op, *, arg, pattern, index):
         return self.f.regexp_extract(arg, pattern, index, dialect=self.dialect)

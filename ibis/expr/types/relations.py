@@ -5,12 +5,7 @@ import operator
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from keyword import iskeyword
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Literal,
-)
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 import toolz
 from public import public
@@ -22,8 +17,9 @@ import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 from ibis import util
 from ibis.common.deferred import Deferred, Resolver
+from ibis.expr.rewrites import DerefMap
 from ibis.expr.types.core import Expr, _FixedTextJupyterMixin
-from ibis.expr.types.generic import ValueExpr, literal
+from ibis.expr.types.generic import Value, literal
 from ibis.expr.types.pretty import to_rich
 from ibis.selectors import Selector
 from ibis.util import deprecated
@@ -40,7 +36,7 @@ if TYPE_CHECKING:
     from ibis.expr.schema import SchemaLike
     from ibis.expr.types import Table
     from ibis.expr.types.groupby import GroupedTable
-    from ibis.expr.types.tvf import WindowedTable
+    from ibis.expr.types.temporal_windows import WindowedTable
     from ibis.formats.pyarrow import PyArrowData
     from ibis.selectors import IfAnyAll
 
@@ -97,15 +93,23 @@ def _regular_join_method(
 
 # TODO(kszucs): should use (table, *args, **kwargs) instead to avoid interpreting
 # nested inputs
-def bind(table: Table, value: Any) -> Iterator[ir.Value]:
+def bind(table: Table, value: Any, int_as_column=False) -> Iterator[ir.Value]:
     """Bind a value to a table expression."""
-    if type(value) in (str, int):
-        yield table._get_column(value)
-    elif isinstance(value, ValueExpr):
+    if isinstance(value, str):
+        # TODO(kszucs): perhaps use getattr(table, value) instead for nicer error msg
+        yield ops.Field(table, value).to_expr()
+    elif isinstance(value, bool):
+        yield literal(value)
+    elif int_as_column and isinstance(value, int):
+        name = table.columns[value]
+        yield ops.Field(table, name).to_expr()
+    elif isinstance(value, ops.Value):
+        yield value.to_expr()
+    elif isinstance(value, Value):
         yield value
     elif isinstance(value, Table):
         for name in value.columns:
-            yield value._get_column(name)
+            yield ops.Field(value, name).to_expr()
     elif isinstance(value, Deferred):
         yield value.resolve(table)
     elif isinstance(value, Resolver):
@@ -114,17 +118,11 @@ def bind(table: Table, value: Any) -> Iterator[ir.Value]:
         yield from value.expand(table)
     elif isinstance(value, Mapping):
         for k, v in value.items():
-            for val in bind(table, v):
+            for val in bind(table, v, int_as_column=int_as_column):
                 yield val.name(k)
     elif util.is_iterable(value):
         for v in value:
-            yield from bind(table, v)
-    elif isinstance(value, ops.Value):
-        # TODO(kszucs): from certain builders, like ir.GroupedTable we pass
-        # operation nodes instead of expressions to table methods, it would
-        # be better to convert them to expressions before passing them to
-        # this function
-        yield value.to_expr()
+            yield from bind(table, v, int_as_column=int_as_column)
     elif callable(value):
         yield value(table)
     else:
@@ -147,58 +145,12 @@ def unwrap_aliases(values: Iterator[ir.Value]) -> Mapping[str, ir.Value]:
     return result
 
 
-def dereference_mapping(parents):
-    parents = util.promote_list(parents)
-    mapping = {}
-
-    for parent in parents:
-        # do not defereference fields referencing the requested parents
-        for _, v in parent.fields.items():
-            mapping[v] = v
-
-    for parent in parents:
-        for k, v in parent.values.items():
-            if isinstance(v, ops.Field):
-                # track down the field in the hierarchy until no modification
-                # is made so only follow ops.Field nodes not arbitrary values;
-                # also stop tracking if the field belongs to a parent which
-                # we want to dereference to, see the docstring of
-                # `dereference_values()` for more details
-                while isinstance(v, ops.Field) and v not in mapping:
-                    mapping[v] = ops.Field(parent, k)
-                    v = v.rel.values.get(v.name)
-            elif v not in mapping:
-                # do not dereference literal expressions
-                mapping[v] = ops.Field(parent, k)
-
-    return mapping
-
-
 def dereference_values(
     parents: Iterable[ops.Parents], values: Mapping[str, ops.Value]
 ) -> Mapping[str, ops.Value]:
     """Trace and replace fields from earlier relations in the hierarchy.
 
-    In order to provide a nice user experience, we need to allow expressions
-    from earlier relations in the hierarchy. Consider the following example:
-
-    t = ibis.table([('a', 'int64'), ('b', 'string')], name='t')
-    t1 = t.select([t.a, t.b])
-    t2 = t1.filter(t.a > 0)  # note that not t1.a is referenced here
-    t3 = t2.select(t.a)  # note that not t2.a is referenced here
-
-    However the relational operations in the IR are strictly enforcing that
-    the expressions are referencing the immediate parent only. So we need to
-    track fields upwards the hierarchy to replace `t.a` with `t1.a` and `t2.a`
-    in the example above. This is called dereferencing.
-
-    Whether we can treat or not a field of a relation semantically equivalent
-    with a field of an earlier relation in the hierarchy depends on the
-    `.values` mapping of the relation. Leaf relations, like `t` in the example
-    above, have an empty `.values` mapping, so we cannot dereference fields
-    from them. On the other hand a projection, like `t1` in the example above,
-    has a `.values` mapping like `{'a': t.a, 'b': t.b}`, so we can deduce that
-    `t1.a` is semantically equivalent with `t.a` and so on.
+    For more details see :class:`ibis.expr.rewrites.DerefMap`.
 
     Parameters
     ----------
@@ -212,8 +164,8 @@ def dereference_values(
     The same mapping as `values` but with all the dereferenceable fields
     replaced with the fields from the parents.
     """
-    subs = dereference_mapping(parents)
-    return {k: v.replace(subs, filter=ops.Value) for k, v in values.items()}
+    dm = DerefMap.from_targets(parents)
+    return {k: dm.dereference(v) for k, v in values.items()}
 
 
 @public
@@ -567,13 +519,6 @@ class Table(Expr, _FixedTextJupyterMixin):
             console_width=console_width,
         )
 
-    # TODO(kszucs): expose this method in the public API
-    def _get_column(self, name: str | int) -> ir.Column:
-        """Get a column from the table."""
-        if isinstance(name, int):
-            name = self.schema().name_at_position(name)
-        return ops.Field(self, name).to_expr()
-
     def __getitem__(self, what):
         """Select items from a table expression.
 
@@ -820,22 +765,18 @@ class Table(Expr, _FixedTextJupyterMixin):
         """
         from ibis.expr.types.logical import BooleanValue
 
-        if isinstance(what, (str, int)):
-            return self._get_column(what)
-        elif isinstance(what, slice):
+        if isinstance(what, slice):
             limit, offset = util.slice_to_limit_offset(what, self.count())
             return self.limit(limit, offset=offset)
-        elif isinstance(what, (list, tuple, Table)):
-            # Projection case
-            return self.select(what)
 
-        items = tuple(bind(self, what))
-        if util.all_of(items, BooleanValue):
-            # TODO(kszucs): this branch should be removed, .filter should be
-            # used instead
-            return self.filter(items)
+        values = tuple(bind(self, what, int_as_column=True))
+        if isinstance(what, (str, int)):
+            assert len(values) == 1
+            return values[0]
+        elif util.all_of(values, BooleanValue):
+            return self.filter(values)
         else:
-            return self.select(items)
+            return self.select(values)
 
     def __len__(self):
         raise com.ExpressionError("Use .count() instead")
@@ -878,7 +819,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         └───────────┘
         """
         try:
-            return self._get_column(key)
+            return ops.Field(self, key).to_expr()
         except com.IbisTypeError:
             pass
 
@@ -1194,23 +1135,21 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         groups = bind(self, by)
         metrics = bind(self, (metrics, kwargs))
-        having = bind(self, having)
+        having = tuple(bind(self, having))
 
         groups = unwrap_aliases(groups)
         metrics = unwrap_aliases(metrics)
-        having = unwrap_aliases(having)
 
         groups = dereference_values(node, groups)
         metrics = dereference_values(node, metrics)
-        having = dereference_values(node, having)
 
         # the user doesn't need to specify the metrics used in the having clause
         # explicitly, we implicitly add them to the metrics list by looking for
         # any metrics depending on self which are not specified explicitly
         pattern = p.Reduction(relations=Contains(node)) & ~In(set(metrics.values()))
         original_metrics = metrics.copy()
-        for pred in having.values():
-            for metric in pred.find_topmost(pattern):
+        for pred in having:
+            for metric in pred.op().find_topmost(pattern):
                 if metric.name in metrics:
                     metrics[util.get_name("metric")] = metric
                 else:
@@ -1221,7 +1160,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         if having:
             # apply the having clause
-            agg = agg.filter(*having.values())
+            agg = agg.filter(*having)
             # remove any metrics that were only used in the having clause
             if metrics != original_metrics:
                 agg = agg.select(*groups.keys(), *original_metrics.keys())
@@ -2073,7 +2012,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Projection by zero-indexed column position
 
-        >>> t.select(0, 4).head()
+        >>> t.select(t[0], t[4]).head()
         ┏━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
         ┃ species ┃ flipper_length_mm ┃
         ┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
@@ -2894,6 +2833,139 @@ class Table(Expr, _FixedTextJupyterMixin):
             )
             aggs.append(agg)
         return ibis.union(*aggs).order_by(ibis.asc("pos"))
+
+    def describe(
+        self, quantile: Sequence[ir.NumericValue | float] = (0.25, 0.5, 0.75)
+    ) -> Table:
+        """Return summary information about a table.
+
+        Parameters
+        ----------
+        quantile
+            The quantiles to compute for numerical columns. Defaults to (0.25, 0.5, 0.75).
+
+        Returns
+        -------
+        Table
+            A table containing summary information about the columns of self.
+
+        Notes
+        -----
+        This function computes summary statistics for each column in the table. For
+        numerical columns, it computes statistics such as minimum, maximum, mean,
+        standard deviation, and quantiles. For string columns, it computes the mode
+        and the number of unique values.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> import ibis.selectors as s
+        >>> ibis.options.interactive = True
+        >>> p = ibis.examples.penguins.fetch()
+        >>> p.describe()
+        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━┓
+        ┃ name              ┃ type    ┃ count ┃ nulls ┃ unique ┃ mode   ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━┩
+        │ string            │ string  │ int64 │ int64 │ int64  │ string │ … │
+        ├───────────────────┼─────────┼───────┼───────┼────────┼────────┼───┤
+        │ species           │ string  │   344 │     0 │      3 │ Adelie │ … │
+        │ island            │ string  │   344 │     0 │      3 │ Biscoe │ … │
+        │ bill_length_mm    │ float64 │   344 │     2 │    164 │ NULL   │ … │
+        │ bill_depth_mm     │ float64 │   344 │     2 │     80 │ NULL   │ … │
+        │ flipper_length_mm │ int64   │   344 │     2 │     55 │ NULL   │ … │
+        │ body_mass_g       │ int64   │   344 │     2 │     94 │ NULL   │ … │
+        │ sex               │ string  │   344 │    11 │      2 │ male   │ … │
+        │ year              │ int64   │   344 │     0 │      3 │ NULL   │ … │
+        └───────────────────┴─────────┴───────┴───────┴────────┴────────┴───┘
+        >>> p.select(s.of_type("numeric")).describe()
+        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━┳━━━┓
+        ┃ name              ┃ type    ┃ count ┃ nulls ┃ unique ┃ mean        ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━╇━━━┩
+        │ string            │ string  │ int64 │ int64 │ int64  │ float64     │ … │
+        ├───────────────────┼─────────┼───────┼───────┼────────┼─────────────┼───┤
+        │ bill_length_mm    │ float64 │   344 │     2 │    164 │   43.921930 │ … │
+        │ bill_depth_mm     │ float64 │   344 │     2 │     80 │   17.151170 │ … │
+        │ flipper_length_mm │ int64   │   344 │     2 │     55 │  200.915205 │ … │
+        │ body_mass_g       │ int64   │   344 │     2 │     94 │ 4201.754386 │ … │
+        │ year              │ int64   │   344 │     0 │      3 │ 2008.029070 │ … │
+        └───────────────────┴─────────┴───────┴───────┴────────┴─────────────┴───┘
+        >>> p.select(s.of_type("string")).describe()
+        ┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+        ┃ name    ┃ type   ┃ count ┃ nulls ┃ unique ┃ mode   ┃
+        ┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+        │ string  │ string │ int64 │ int64 │ int64  │ string │
+        ├─────────┼────────┼───────┼───────┼────────┼────────┤
+        │ species │ string │   344 │     0 │      3 │ Adelie │
+        │ island  │ string │   344 │     0 │      3 │ Biscoe │
+        │ sex     │ string │   344 │    11 │      2 │ male   │
+        └─────────┴────────┴───────┴───────┴────────┴────────┘
+        """
+        import ibis.selectors as s
+        from ibis import literal as lit
+
+        quantile = sorted(quantile)
+        aggs = []
+        string_col = False
+        numeric_col = False
+        for colname in self.columns:
+            col = self[colname]
+            typ = col.type()
+
+            # default statistics to None
+            col_mean = lit(None).cast(float)
+            col_std = lit(None).cast(float)
+            col_min = lit(None).cast(float)
+            col_max = lit(None).cast(float)
+            col_mode = lit(None).cast(str)
+            quantile_values = {
+                f"p{100*q:.6f}".rstrip("0").rstrip("."): lit(None).cast(float)
+                for q in quantile
+            }
+
+            if typ.is_numeric():
+                numeric_col = True
+                col_mean = col.mean()
+                col_std = col.std()
+                col_min = col.min().cast(float)
+                col_max = col.max().cast(float)
+                quantile_values = {
+                    f"p{100*q:.6f}".rstrip("0").rstrip("."): col.quantile(q).cast(float)
+                    for q in quantile
+                }
+            elif typ.is_string():
+                string_col = True
+                col_mode = col.mode()
+            elif typ.is_boolean():
+                numeric_col = True
+                col_mean = col.mean()
+            else:
+                # Will not calculate statistics for other types
+                continue
+
+            agg = self.agg(
+                name=lit(colname),
+                type=lit(str(typ)),
+                count=col.isnull().count(),
+                nulls=col.isnull().sum(),
+                unique=col.nunique(),
+                mode=col_mode,
+                mean=col_mean,
+                std=col_std,
+                min=col_min,
+                **quantile_values,
+                max=col_max,
+            )
+            aggs.append(agg)
+
+        t = ibis.union(*aggs)
+
+        # TODO(jiting): Need a better way to remove columns with all NULL
+        if string_col and not numeric_col:
+            t = t.select(~s.of_type("float"))
+        elif numeric_col and not string_col:
+            t = t.drop("mode")
+
+        return t
 
     def join(
         left: Table,
@@ -4409,10 +4481,10 @@ class Table(Expr, _FixedTextJupyterMixin):
             where = 0
 
         # all columns that should come BEFORE the matched selectors
-        front = [left for left in range(where) if left not in sels]
+        front = [self[left] for left in range(where) if left not in sels]
 
         # all columns that should come AFTER the matched selectors
-        back = [right for right in range(where, ncols) if right not in sels]
+        back = [self[right] for right in range(where, ncols) if right not in sels]
 
         # selected columns
         middle = [self[i].name(name) for i, name in sels.items()]

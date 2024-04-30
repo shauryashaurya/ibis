@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import inspect
 import json
+import os
 import re
 import string
 import subprocess
@@ -313,6 +314,11 @@ def test_create_table_from_schema(con, new_schema, temp_table):
     reason="`tbl_properties` is required when creating table with schema",
 )
 def test_create_temporary_table_from_schema(con_no_data, new_schema):
+    if con_no_data.name == "snowflake" and os.environ.get("SNOWFLAKE_SNOWPARK"):
+        with pytest.raises(com.IbisError, match="Reconnecting is not supported"):
+            con_no_data.reconnect()
+        return
+
     temp_table = gen_name(f"test_{con_no_data.name}_tmp")
     table = con_no_data.create_table(temp_table, schema=new_schema, temp=True)
 
@@ -609,12 +615,12 @@ def test_insert_from_memtable(con, temp_table):
         "pandas",
         "polars",
         "flink",
-        "pyspark",
         "sqlite",
     ],
     raises=AttributeError,
     reason="doesn't support the common notion of a catalog",
 )
+@pytest.mark.xfail_version(pyspark=["pyspark<3.4"])
 def test_list_catalogs(con):
     # Every backend has its own databases
     test_catalogs = {
@@ -628,6 +634,7 @@ def test_list_catalogs(con):
         "risingwave": {"dev"},
         "snowflake": {"IBIS_TESTING"},
         "trino": {"memory"},
+        "pyspark": {"spark_catalog"},
     }
     result = set(con.list_catalogs())
     assert test_catalogs[con.name] <= result
@@ -641,7 +648,7 @@ def test_list_catalogs(con):
         "polars",
     ],
     raises=AttributeError,
-    reason="doesn't support the common notion of a catalog",
+    reason="doesn't support the common notion of a database",
 )
 def test_list_database_contents(con):
     # Every backend has its own databases
@@ -1579,6 +1586,14 @@ def test_json_to_pyarrow(con):
         None,
         [42, 47, 55],
         [],
+        "a",
+        "",
+        "b",
+        None,
+        True,
+        False,
+        42,
+        37.37,
     ]
     expected = {json.dumps(val) for val in expected}
 
@@ -1586,5 +1601,10 @@ def test_json_to_pyarrow(con):
         # loads and dumps so the string representation is the same
         json.dumps(json.loads(val))
         for val in js.to_pylist()
+        # proper null values must be ignored because they cannot be
+        # deserialized as JSON
+        #
+        # they exist in the json_t table, so the `js` value contains them
+        if val is not None
     }
     assert result == expected

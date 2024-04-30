@@ -59,6 +59,7 @@ class DataFusionCompiler(SQLGlotCompiler):
             ops.TimestampNow,
             ops.TypeOf,
             ops.Unnest,
+            ops.StringToDate,
             ops.StringToTimestamp,
         )
     )
@@ -75,7 +76,6 @@ class DataFusionCompiler(SQLGlotCompiler):
         ops.Last: "last_value",
         ops.Median: "median",
         ops.StringLength: "character_length",
-        ops.RandomUUID: "uuid",
         ops.RegexSplit: "regex_split",
         ops.EndsWith: "ends_with",
         ops.ArrayIntersect: "array_intersect",

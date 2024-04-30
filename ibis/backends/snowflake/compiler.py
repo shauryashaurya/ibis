@@ -78,7 +78,7 @@ class SnowflakeCompiler(SQLGlotCompiler):
         ops.Hash: "hash",
         ops.Median: "median",
         ops.Mode: "mode",
-        ops.RandomUUID: "uuid_string",
+        ops.StringToDate: "to_date",
         ops.StringToTimestamp: "to_timestamp_tz",
         ops.TimeFromHMS: "time_from_parts",
         ops.TimestampFromYMDHMS: "timestamp_from_parts",
@@ -109,9 +109,6 @@ class SnowflakeCompiler(SQLGlotCompiler):
     def visit_Literal(self, op, *, value, dtype):
         if value is None:
             return super().visit_Literal(op, value=value, dtype=dtype)
-        elif dtype.is_string():
-            # sqlglot doesn't escape backslashes in strings
-            return sge.convert(value.replace("\\", "\\\\"))
         elif dtype.is_timestamp():
             args = (
                 value.year,
@@ -182,6 +179,18 @@ class SnowflakeCompiler(SQLGlotCompiler):
     def visit_ToJSONArray(self, op, *, arg):
         return self.if_(self.f.is_array(arg), arg, NULL)
 
+    def visit_UnwrapJSONString(self, op, *, arg):
+        return self.if_(self.f.is_varchar(arg), self.f.as_varchar(arg), NULL)
+
+    def visit_UnwrapJSONInt64(self, op, *, arg):
+        return self.if_(self.f.is_integer(arg), self.f.as_integer(arg), NULL)
+
+    def visit_UnwrapJSONFloat64(self, op, *, arg):
+        return self.if_(self.f.is_double(arg), self.f.as_double(arg), NULL)
+
+    def visit_UnwrapJSONBoolean(self, op, *, arg):
+        return self.if_(self.f.is_boolean(arg), self.f.as_boolean(arg), NULL)
+
     def visit_IsNan(self, op, *, arg):
         return arg.eq(self.NAN)
 
@@ -241,10 +250,13 @@ class SnowflakeCompiler(SQLGlotCompiler):
     def visit_Log(self, op, *, arg, base):
         return self.f.log(base, arg, dialect=self.dialect)
 
-    def visit_RandomScalar(self, op):
+    def visit_RandomScalar(self, op, **kwargs):
         return self.f.uniform(
             self.f.to_double(0.0), self.f.to_double(1.0), self.f.random()
         )
+
+    def visit_RandomUUID(self, op, **kwargs):
+        return self.f.uuid_string()
 
     def visit_ApproxMedian(self, op, *, arg, where):
         return self.agg.approx_percentile(arg, 0.5, where=where)

@@ -30,6 +30,7 @@ from ibis.backends.tests.errors import (
     PySparkAnalysisException,
     TrinoUserError,
 )
+from ibis.common.collections import frozendict
 
 pytestmark = [
     pytest.mark.never(
@@ -815,7 +816,9 @@ def test_unnest_struct(con):
     result = con.execute(expr)
 
     expected = pd.DataFrame(data).explode("value").iloc[:, 0].reset_index(drop=True)
-    tm.assert_series_equal(result, expected)
+    assert frozenset(map(frozendict, result.values)) == frozenset(
+        map(frozendict, expected.values)
+    )
 
 
 @builtin_array
@@ -1015,7 +1018,12 @@ def flatten_data():
                     ["clickhouse"],
                     reason="Arrays are never nullable",
                     raises=AssertionError,
-                )
+                ),
+                pytest.mark.broken(
+                    ["polars"],
+                    raises=TypeError,
+                    reason="comparison of nested arrays doesn't work in pandas testing module",
+                ),
             ],
         ),
     ],
@@ -1230,7 +1238,7 @@ timestamp_range_tzinfos = pytest.mark.parametrize(
             datetime(2017, 1, 1),
             datetime(2017, 1, 2),
             ibis.interval(hours=1),
-            "1H",
+            "1h",
             id="pos",
             marks=pytest.mark.notimpl(
                 ["risingwave"],
@@ -1242,7 +1250,7 @@ timestamp_range_tzinfos = pytest.mark.parametrize(
             datetime(2017, 1, 2),
             datetime(2017, 1, 1),
             ibis.interval(hours=-1),
-            "-1H",
+            "-1h",
             id="neg_inner",
             marks=[
                 pytest.mark.broken(
@@ -1259,7 +1267,7 @@ timestamp_range_tzinfos = pytest.mark.parametrize(
             datetime(2017, 1, 2),
             datetime(2017, 1, 1),
             -ibis.interval(hours=1),
-            "-1H",
+            "-1h",
             id="neg_outer",
             marks=[
                 pytest.mark.notyet(["polars"], raises=com.UnsupportedOperationError),
@@ -1393,3 +1401,23 @@ def test_array_literal_with_exprs(con, input, expected):
     assert expr.op().shape == ds.scalar
     result = list(con.execute(expr))
     assert result == expected
+
+
+@pytest.mark.notimpl(
+    ["datafusion", "postgres", "pandas", "polars", "risingwave", "dask", "flink"],
+    raises=com.OperationNotDefinedError,
+)
+@pytest.mark.broken(
+    ["trino"],
+    raises=TrinoUserError,
+    reason="sqlglot generates code that assumes there's only at most two fields to unpack from a struct",
+)
+def test_zip_unnest_lift(con):
+    data = pd.DataFrame(dict(array1=[[1, 2, 3]], array2=[[4, 5, 6]]))
+    t = ibis.memtable(data)
+    zipped = t.mutate(zipped=t.array1.zip(t.array2))
+    unnested = zipped.mutate(unnest=zipped.zipped.unnest())
+    lifted = unnested.unnest.lift()
+    result = con.execute(lifted)
+    expected = pd.DataFrame({"f1": [1, 2, 3], "f2": [4, 5, 6]})
+    tm.assert_frame_equal(result, expected)

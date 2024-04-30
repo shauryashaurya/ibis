@@ -244,16 +244,11 @@ def test_timestamp_extract_week_of_year(backend, alltypes, df):
     backend.assert_series_equal(result, expected)
 
 
-PANDAS_UNITS = {
-    "m": "Min",
-    "ms": "L",
-}
-
-
 @pytest.mark.parametrize(
-    "unit",
+    ("ibis_unit", "pandas_unit"),
     [
         param(
+            "Y",
             "Y",
             marks=[
                 pytest.mark.broken(
@@ -265,6 +260,7 @@ PANDAS_UNITS = {
         ),
         param(
             "M",
+            "M",
             marks=[
                 pytest.mark.broken(
                     ["polars"],
@@ -275,6 +271,7 @@ PANDAS_UNITS = {
         ),
         param(
             "D",
+            "D",
             marks=[
                 pytest.mark.broken(
                     ["polars"],
@@ -284,6 +281,7 @@ PANDAS_UNITS = {
             ],
         ),
         param(
+            "W",
             "W",
             marks=[
                 pytest.mark.notimpl(["mysql"], raises=com.UnsupportedOperationError),
@@ -296,6 +294,7 @@ PANDAS_UNITS = {
         ),
         param(
             "h",
+            "h",
             marks=[
                 pytest.mark.notimpl(["sqlite"], raises=com.UnsupportedOperationError),
                 pytest.mark.broken(
@@ -307,6 +306,7 @@ PANDAS_UNITS = {
         ),
         param(
             "m",
+            "min",
             marks=[
                 pytest.mark.notimpl(["sqlite"], raises=com.UnsupportedOperationError),
                 pytest.mark.broken(
@@ -318,6 +318,7 @@ PANDAS_UNITS = {
         ),
         param(
             "s",
+            "s",
             marks=[
                 pytest.mark.notimpl(["sqlite"], raises=com.UnsupportedOperationError),
                 pytest.mark.broken(
@@ -328,6 +329,7 @@ PANDAS_UNITS = {
             ],
         ),
         param(
+            "ms",
             "ms",
             marks=[
                 pytest.mark.notimpl(
@@ -342,6 +344,7 @@ PANDAS_UNITS = {
             ],
         ),
         param(
+            "us",
             "us",
             marks=[
                 pytest.mark.notimpl(
@@ -361,6 +364,7 @@ PANDAS_UNITS = {
             ],
         ),
         param(
+            "ns",
             "ns",
             marks=[
                 pytest.mark.notimpl(
@@ -401,15 +405,15 @@ PANDAS_UNITS = {
     raises=AttributeError,
     reason="AttributeError: 'StringColumn' object has no attribute 'truncate'",
 )
-def test_timestamp_truncate(backend, alltypes, df, unit):
-    expr = alltypes.timestamp_col.truncate(unit).name("tmp")
+def test_timestamp_truncate(backend, alltypes, df, ibis_unit, pandas_unit):
+    expr = alltypes.timestamp_col.truncate(ibis_unit).name("tmp")
 
-    unit = PANDAS_UNITS.get(unit, unit)
+    dtns = df.timestamp_col.dt
 
-    try:
-        expected = df.timestamp_col.dt.floor(unit)
-    except ValueError:
-        expected = df.timestamp_col.dt.to_period(unit).dt.to_timestamp()
+    if ibis_unit in ("Y", "M", "D", "W"):
+        expected = dtns.to_period(pandas_unit).dt.to_timestamp()
+    else:
+        expected = dtns.floor(pandas_unit)
 
     result = expr.execute()
     expected = backend.default_series_rename(expected)
@@ -418,12 +422,13 @@ def test_timestamp_truncate(backend, alltypes, df, unit):
 
 
 @pytest.mark.parametrize(
-    "unit",
+    ("ibis_unit", "pandas_unit"),
     [
-        "Y",
-        "M",
-        "D",
+        ("Y", "Y"),
+        ("M", "M"),
+        ("D", "D"),
         param(
+            "W",
             "W",
             marks=[
                 pytest.mark.notyet(["mysql"], raises=com.UnsupportedOperationError),
@@ -444,15 +449,13 @@ def test_timestamp_truncate(backend, alltypes, df, unit):
     raises=AttributeError,
     reason="AttributeError: 'StringColumn' object has no attribute 'date'",
 )
-def test_date_truncate(backend, alltypes, df, unit):
-    expr = alltypes.timestamp_col.date().truncate(unit).name("tmp")
+def test_date_truncate(backend, alltypes, df, ibis_unit, pandas_unit):
+    expr = alltypes.timestamp_col.date().truncate(ibis_unit).name("tmp")
 
-    unit = PANDAS_UNITS.get(unit, unit)
-
-    try:
-        expected = df.timestamp_col.dt.floor(unit).dt.date
-    except ValueError:
-        expected = df.timestamp_col.dt.to_period(unit).dt.to_timestamp().dt.date
+    if ibis_unit in ("Y", "M", "D", "W"):
+        expected = df.timestamp_col.dt.to_period(pandas_unit).dt.to_timestamp().dt.date
+    else:
+        expected = df.timestamp_col.dt.floor(pandas_unit).dt.date
 
     result = expr.execute()
     expected = backend.default_series_rename(expected)
@@ -1130,7 +1133,7 @@ no_mixed_timestamp_comparisons = [
         reason="Invalid comparison between dtype=datetime64[ns, UTC] and datetime",
     ),
     pytest.mark.xfail_version(
-        duckdb=["duckdb>=0.10"],
+        duckdb=["duckdb>=0.10,<0.10.2"],
         raises=DuckDBBinderException,
         # perhaps we should consider disallowing this in ibis as well
         reason="DuckDB doesn't allow comparing timestamp with and without timezones starting at version 0.10",
@@ -1431,6 +1434,85 @@ def test_integer_to_timestamp(backend, con, unit):
 def test_string_to_timestamp(alltypes, fmt):
     table = alltypes
     result = table.mutate(date=table.date_string_col.to_timestamp(fmt)).execute()
+
+    # TEST: do we get the same date out, that we put in?
+    # format string assumes that we are using pandas' strftime
+    for i, val in enumerate(result["date"]):
+        assert val.strftime("%m/%d/%y") == result["date_string_col"][i]
+
+
+@pytest.mark.parametrize(
+    "fmt",
+    [
+        # "11/01/10" - "month/day/year"
+        param(
+            "%m/%d/%y",
+            id="mysql_format",
+            marks=[
+                pytest.mark.never(
+                    ["snowflake"],
+                    reason=(
+                        "(snowflake.connector.errors.ProgrammingError) 100096 (22007): "
+                        "Can't parse '11/01/10' as timestamp with format '%m/%d/%y'"
+                    ),
+                    raises=SnowflakeProgrammingError,
+                ),
+                pytest.mark.never(
+                    ["flink"],
+                    raises=ValueError,
+                    reason="Datetime formatting style is not supported.",
+                ),
+            ],
+        ),
+        param(
+            "MM/dd/yy",
+            id="pyspark_format",
+            marks=[
+                pytest.mark.never(
+                    ["bigquery"],
+                    reason="400 Mismatch between format character 'M' and string character '0'",
+                    raises=GoogleBadRequest,
+                ),
+                pytest.mark.never(
+                    ["mysql"],
+                    reason="NaTType does not support strftime",
+                    raises=ValueError,
+                ),
+                pytest.mark.never(
+                    ["trino"],
+                    reason="datetime formatting style not supported",
+                    raises=TrinoUserError,
+                ),
+                pytest.mark.never(
+                    ["polars"],
+                    reason="datetime formatting style not supported",
+                    raises=PolarsComputeError,
+                ),
+                pytest.mark.never(
+                    ["duckdb"],
+                    reason="datetime formatting style not supported",
+                    raises=DuckDBInvalidInputException,
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.notimpl(
+    [
+        "dask",
+        "pandas",
+        "clickhouse",
+        "sqlite",
+        "datafusion",
+        "mssql",
+        "druid",
+    ],
+    raises=com.OperationNotDefinedError,
+)
+@pytest.mark.notimpl(["exasol"], raises=com.OperationNotDefinedError)
+def test_string_to_date(alltypes, fmt):
+    table = alltypes
+    result = table.mutate(date=table.date_string_col.to_date(fmt)).execute()
 
     # TEST: do we get the same date out, that we put in?
     # format string assumes that we are using pandas' strftime

@@ -437,6 +437,18 @@ def test_cast_same_type_noop(table):
     assert i.cast("int8") is i
 
 
+def test_string_slice_step(table):
+    s = ibis.literal("abcde")
+    s[1:3]
+    s[1:3:1]
+    with pytest.raises(ValueError):
+        s[1:3:2]
+    with pytest.raises(ValueError):
+        s[1 : 3 : ibis.literal(1)]
+    with pytest.raises(ValueError):
+        s[1 : 3 : ibis.literal(2)]
+
+
 @pytest.mark.parametrize("type", ["int8", "int32", "double", "float32"])
 def test_string_to_number(table, type):
     casted = table.g.cast(type)
@@ -882,18 +894,10 @@ def test_bitwise_exprs(fn, expected_op):
         ([1, 0], ["bar", "foo"]),
     ],
 )
-@pytest.mark.parametrize(
-    "expr_func",
-    [
-        lambda t, args: t[args],
-        lambda t, args: t.order_by(args),
-        lambda t, args: t.group_by(args).aggregate(bar_avg=t.bar.mean()),
-    ],
-)
-def test_table_operations_with_integer_column(position, names, expr_func):
+def test_table_operations_with_integer_column(position, names):
     t = ibis.table([("foo", "string"), ("bar", "double")])
-    result = expr_func(t, position)
-    expected = expr_func(t, names)
+    result = t[position]
+    expected = t[names]
     assert result.equals(expected)
 
 
