@@ -3,9 +3,11 @@ from __future__ import annotations
 import itertools
 import operator
 import re
+import warnings
+from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from keyword import iskeyword
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal, NoReturn, overload
 
 import toolz
 from public import public
@@ -17,12 +19,13 @@ import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 from ibis import util
 from ibis.common.deferred import Deferred, Resolver
+from ibis.common.selectors import Expandable, Selector
 from ibis.expr.rewrites import DerefMap
-from ibis.expr.types.core import Expr, _FixedTextJupyterMixin
+from ibis.expr.types.core import Expr
 from ibis.expr.types.generic import Value, literal
-from ibis.expr.types.pretty import to_rich
-from ibis.selectors import Selector
-from ibis.util import deprecated
+from ibis.expr.types.rich import FixedTextJupyterMixin, to_rich
+from ibis.expr.types.temporal import TimestampColumn
+from ibis.util import deprecated, experimental
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -32,13 +35,393 @@ if TYPE_CHECKING:
 
     import ibis.expr.types as ir
     import ibis.selectors as s
-    from ibis.expr.operations.relations import JoinKind
+    from ibis.expr.operations.relations import JoinKind, Set
     from ibis.expr.schema import SchemaLike
     from ibis.expr.types import Table
     from ibis.expr.types.groupby import GroupedTable
     from ibis.expr.types.temporal_windows import WindowedTable
+    from ibis.formats.pandas import PandasData
     from ibis.formats.pyarrow import PyArrowData
     from ibis.selectors import IfAnyAll
+
+
+# Join method docstring templates following the ibis/examples pattern
+_JOIN_DOCSTRING_TEMPLATES = {
+    "inner": """\
+Perform an inner join between two tables.
+
+Returns only rows that have matching values in both tables.
+
+This is equivalent to: `table.join(other, predicates, how="inner")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.inner_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ title                            ┃ genres                          ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ int64  │ int64   │ float64 │ string                           │ string                          │
+├────────┼─────────┼─────────┼──────────────────────────────────┼─────────────────────────────────┤
+│      1 │       1 │     4.0 │ Toy Story (1995)                 │ Adventure|Animation|Children|C… │
+│      1 │       3 │     4.0 │ Grumpier Old Men (1995)          │ Comedy|Romance                  │
+│      1 │       6 │     4.0 │ Heat (1995)                      │ Action|Crime|Thriller           │
+└────────┴─────────┴─────────┴──────────────────────────────────┴─────────────────────────────────┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "left": """\
+Perform a left join between two tables.
+
+Returns all rows from the left table, and matched rows from the right table.
+
+This is equivalent to: `table.join(other, predicates, how="left")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.left_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ movieId_right ┃ title                       ┃ … ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ int64  │ int64   │ float64 │ int64         │ string                      │ … │
+├────────┼─────────┼─────────┼───────────────┼─────────────────────────────┼───┤
+│      1 │       1 │     4.0 │             1 │ Toy Story (1995)            │ … │
+│      1 │       3 │     4.0 │             3 │ Grumpier Old Men (1995)     │ … │
+│      1 │       6 │     4.0 │             6 │ Heat (1995)                 │ … │
+└────────┴─────────┴─────────┴───────────────┴─────────────────────────────┴───┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "right": """\
+Perform a right join between two tables.
+
+Returns all rows from the right table, and matched rows from the left table.
+
+This is equivalent to: `table.join(other, predicates, how="right")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.right_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ movieId_right ┃ title                       ┃ … ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ int64  │ int64   │ float64 │ int64         │ string                      │ … │
+├────────┼─────────┼─────────┼───────────────┼─────────────────────────────┼───┤
+│      1 │       1 │     4.0 │             1 │ Toy Story (1995)            │ … │
+│      1 │       3 │     4.0 │             3 │ Grumpier Old Men (1995)     │ … │
+│      1 │       6 │     4.0 │             6 │ Heat (1995)                 │ … │
+└────────┴─────────┴─────────┴───────────────┴─────────────────────────────┴───┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "outer": """\
+Perform an outer join between two tables.
+
+Returns all rows from both tables (full outer join).
+
+This is equivalent to: `table.join(other, predicates, how="outer")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.outer_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ movieId_right ┃ title                       ┃ … ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ int64  │ int64   │ float64 │ int64         │ string                      │ … │
+├────────┼─────────┼─────────┼───────────────┼─────────────────────────────┼───┤
+│      1 │       1 │     4.0 │             1 │ Toy Story (1995)            │ … │
+│      1 │       3 │     4.0 │             3 │ Grumpier Old Men (1995)     │ … │
+│      1 │       6 │     4.0 │             6 │ Heat (1995)                 │ … │
+└────────┴─────────┴─────────┴───────────────┴─────────────────────────────┴───┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "semi": """\
+Perform a semi join between two tables.
+
+Returns rows from the left table that have matches in the right table (no right columns).
+
+This is equivalent to: `table.join(other, predicates, how="semi")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> movies.semi_join(ratings, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ movieId ┃ title                            ┃ genres                          ┃
+┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ int64   │ string                           │ string                          │
+├─────────┼──────────────────────────────────┼─────────────────────────────────┤
+│       1 │ Toy Story (1995)                 │ Adventure|Animation|Children|C… │
+│       3 │ Grumpier Old Men (1995)          │ Comedy|Romance                  │
+│       6 │ Heat (1995)                      │ Action|Crime|Thriller           │
+└─────────┴──────────────────────────────────┴─────────────────────────────────┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "anti": """\
+Perform an anti join between two tables.
+
+Returns rows from the left table that have no matches in the right table.
+
+This is equivalent to: `table.join(other, predicates, how="anti")`
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> movies.anti_join(ratings, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ movieId ┃ title                            ┃ genres                          ┃
+┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ int64   │ string                           │ string                          │
+├─────────┼──────────────────────────────────┼─────────────────────────────────┤
+│   34048 │ Femalien (1996)                  │ Sci-Fi                          │
+│   34162 │ Lie Down with Dogs (1995)        │ Comedy                          │
+│   45517 │ Glass Tomb, The (Redeemer) (201… │ Horror                          │
+└─────────┴──────────────────────────────────┴─────────────────────────────────┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "any_inner": """\
+Perform an any-inner join between two tables.
+
+Returns rows from the inner join where at least one join condition is true.
+
+This is equivalent to: `table.join(other, predicates, how="any_inner")`
+
+.. note::
+   Any-joins are not supported by all backends. Check your backend documentation for availability.
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.any_inner_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ title                            ┃ genres                          ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ int64  │ int64   │ float64 │ string                           │ string                          │
+├────────┼─────────┼─────────┼──────────────────────────────────┼─────────────────────────────────┤
+│      1 │       1 │     4.0 │ Toy Story (1995)                 │ Adventure|Animation|Children|C… │
+│      1 │       3 │     4.0 │ Grumpier Old Men (1995)          │ Comedy|Romance                  │
+│      1 │       6 │     4.0 │ Heat (1995)                      │ Action|Crime|Thriller           │
+└────────┴─────────┴─────────┴──────────────────────────────────┴─────────────────────────────────┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+    "any_left": """\
+Perform an any-left join between two tables.
+
+Returns all rows from the left table, using any-semantics for join conditions.
+
+This is equivalent to: `table.join(other, predicates, how="any_left")`
+
+.. note::
+   Any-joins are not supported by all backends. Check your backend documentation for availability.
+
+Parameters
+----------
+right
+    Right table to join
+predicates
+    Boolean or column names to join on
+lname
+    A format string to use to rename overlapping columns in the left
+    table (e.g. `"left_{{name}}"`).
+rname
+    A format string to use to rename overlapping columns in the right
+    table (e.g. `"right_{{name}}"`).
+
+Returns
+-------
+Table
+    Joined table
+
+Examples
+--------
+>>> import ibis
+>>> ibis.options.interactive = True
+>>> movies = ibis.examples.ml_latest_small_movies.fetch()
+>>> ratings = ibis.examples.ml_latest_small_ratings.fetch().drop("timestamp")
+>>> ratings.any_left_join(movies, "movieId").head(3)  # doctest: +SKIP
+┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━┓
+┃ userId ┃ movieId ┃ rating  ┃ movieId_right ┃ title                       ┃ … ┃
+┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━┩
+│ int64  │ int64   │ float64 │ int64         │ string                      │ … │
+├────────┼─────────┼─────────┼───────────────┼─────────────────────────────┼───┤
+│      1 │       1 │     4.0 │             1 │ Toy Story (1995)            │ … │
+│      1 │       3 │     4.0 │             3 │ Grumpier Old Men (1995)     │ … │
+│      1 │       6 │     4.0 │             6 │ Heat (1995)                 │ … │
+└────────┴─────────┴─────────┴───────────────┴─────────────────────────────┴───┘
+
+See Also
+--------
+join : More complex join operations and additional examples
+""",
+}
 
 
 def _regular_join_method(
@@ -54,55 +437,40 @@ def _regular_join_method(
         "any_left",
     ],
 ):
-    def f(  # noqa: D417
+    def f(
         self: ir.Table,
         right: ir.Table,
-        predicates: str
-        | Sequence[
-            str | tuple[str | ir.Column, str | ir.Column] | ir.BooleanValue
-        ] = (),
+        /,
+        predicates: (
+            str
+            | Sequence[
+                str
+                | ir.BooleanColumn
+                | Literal[True]
+                | Literal[False]
+                | tuple[
+                    str | ir.Column | ir.Deferred,
+                    str | ir.Column | ir.Deferred,
+                ]
+                | ir.BooleanValue
+            ]
+        ) = (),
         *,
         lname: str = "",
         rname: str = "{name}_right",
     ) -> ir.Table:
-        """Perform a join between two tables.
-
-        Parameters
-        ----------
-        right
-            Right table to join
-        predicates
-            Boolean or column names to join on
-        lname
-            A format string to use to rename overlapping columns in the left
-            table (e.g. ``"left_{name}"``).
-        rname
-            A format string to use to rename overlapping columns in the right
-            table (e.g. ``"right_{name}"``).
-
-        Returns
-        -------
-        Table
-            Joined table
-        """
         return self.join(right, predicates, how=how, lname=lname, rname=rname)
 
     f.__name__ = name
+    f.__doc__ = _JOIN_DOCSTRING_TEMPLATES[how]
     return f
 
 
-# TODO(kszucs): should use (table, *args, **kwargs) instead to avoid interpreting
-# nested inputs
-def bind(table: Table, value: Any, int_as_column=False) -> Iterator[ir.Value]:
+def bind(table: Table, value) -> Iterator[ir.Value]:
     """Bind a value to a table expression."""
     if isinstance(value, str):
         # TODO(kszucs): perhaps use getattr(table, value) instead for nicer error msg
         yield ops.Field(table, value).to_expr()
-    elif isinstance(value, bool):
-        yield literal(value)
-    elif int_as_column and isinstance(value, int):
-        name = table.columns[value]
-        yield ops.Field(table, name).to_expr()
     elif isinstance(value, ops.Value):
         yield value.to_expr()
     elif isinstance(value, Value):
@@ -114,19 +482,22 @@ def bind(table: Table, value: Any, int_as_column=False) -> Iterator[ir.Value]:
         yield value.resolve(table)
     elif isinstance(value, Resolver):
         yield value.resolve({"_": table})
-    elif isinstance(value, Selector):
+    elif isinstance(value, Expandable):
         yield from value.expand(table)
-    elif isinstance(value, Mapping):
-        for k, v in value.items():
-            for val in bind(table, v, int_as_column=int_as_column):
-                yield val.name(k)
-    elif util.is_iterable(value):
-        for v in value:
-            yield from bind(table, v, int_as_column=int_as_column)
     elif callable(value):
-        yield value(table)
+        # rebind, otherwise the callable is required to return an expression
+        # which would preclude support for expressions like lambda _: 2
+        yield from bind(table, value(table))
     else:
         yield literal(value)
+
+
+def unwrap_alias(node: ops.Value) -> ops.Value:
+    """Unwrap an alias node."""
+    if isinstance(node, ops.Alias):
+        return node.arg
+    else:
+        return node
 
 
 def unwrap_aliases(values: Iterator[ir.Value]) -> Mapping[str, ir.Value]:
@@ -135,41 +506,15 @@ def unwrap_aliases(values: Iterator[ir.Value]) -> Mapping[str, ir.Value]:
     for value in values:
         node = value.op()
         if node.name in result:
-            raise com.IntegrityError(
+            raise com.IbisInputError(
                 f"Duplicate column name {node.name!r} in result set"
             )
-        if isinstance(node, ops.Alias):
-            result[node.name] = node.arg
-        else:
-            result[node.name] = node
+        result[node.name] = unwrap_alias(node)
     return result
 
 
-def dereference_values(
-    parents: Iterable[ops.Parents], values: Mapping[str, ops.Value]
-) -> Mapping[str, ops.Value]:
-    """Trace and replace fields from earlier relations in the hierarchy.
-
-    For more details see :class:`ibis.expr.rewrites.DerefMap`.
-
-    Parameters
-    ----------
-    parents
-        The relations we want the values to point to.
-    values
-        The values to dereference.
-
-    Returns
-    -------
-    The same mapping as `values` but with all the dereferenceable fields
-    replaced with the fields from the parents.
-    """
-    dm = DerefMap.from_targets(parents)
-    return {k: dm.dereference(v) for k, v in values.items()}
-
-
 @public
-class Table(Expr, _FixedTextJupyterMixin):
+class Table(Expr, FixedTextJupyterMixin):
     """An immutable and lazy dataframe.
 
     Analogous to a SQL table or a pandas DataFrame. A table expression contains
@@ -203,13 +548,22 @@ class Table(Expr, _FixedTextJupyterMixin):
     info.
     """
 
-    # Higher than numpy & dask objects
+    # Higher than numpy objects
     __array_priority__ = 20
 
     __array_ufunc__ = None
 
     def get_name(self) -> str:
-        """Return the fully qualified name of the table."""
+        """Return the fully qualified name of the table.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> con = ibis.duckdb.connect()
+        >>> t = con.create_table("t", {"id": [1, 2, 3]})
+        >>> t.get_name()
+        'memory.main.t'
+        """
         arg = self._arg
         namespace = getattr(arg, "namespace", ops.Namespace())
         pieces = namespace.catalog, namespace.database, arg.name
@@ -223,31 +577,110 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         return IbisDataFrame(self, nan_as_null=nan_as_null, allow_copy=allow_copy)
 
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        return self.to_pyarrow().__arrow_c_stream__(requested_schema)
+
     def __pyarrow_result__(
-        self, table: pa.Table, data_mapper: type[PyArrowData] | None = None
+        self,
+        table: pa.Table,
+        *,
+        schema: sch.Schema | None = None,
+        data_mapper: type[PyArrowData] | None = None,
     ) -> pa.Table:
         if data_mapper is None:
             from ibis.formats.pyarrow import PyArrowData as data_mapper
 
-        return data_mapper.convert_table(table, self.schema())
+        return data_mapper.convert_table(
+            table, self.schema() if schema is None else schema
+        )
 
-    def __pandas_result__(self, df: pd.DataFrame) -> pd.DataFrame:
-        from ibis.formats.pandas import PandasData
+    def __pandas_result__(
+        self,
+        df: pd.DataFrame,
+        *,
+        schema: sch.Schema | None = None,
+        data_mapper: type[PandasData] | None = None,
+    ) -> pd.DataFrame:
+        if data_mapper is None:
+            from ibis.formats.pandas import PandasData as data_mapper
 
-        return PandasData.convert_table(df, self.schema())
+        return data_mapper.convert_table(
+            df, self.schema() if schema is None else schema
+        )
 
     def __polars_result__(self, df: pl.DataFrame) -> Any:
         from ibis.formats.polars import PolarsData
 
         return PolarsData.convert_table(df, self.schema())
 
-    def _bind_reduction_filter(self, where):
-        if where is None or not isinstance(where, Deferred):
-            return where
+    # overriding Expr's implementation just for typing
+    @experimental
+    def to_pyarrow(
+        self,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Table:
+        return super().to_pyarrow(params=params, limit=limit, **kwargs)
 
-        return where.resolve(self)
+    def _fast_bind(self, *args, **kwargs):
+        # allow the first argument to be either a dictionary or a list of values
+        if len(args) == 1:
+            if isinstance(args[0], dict):
+                kwargs = {**args[0], **kwargs}
+                args = ()
+            else:
+                args = util.promote_list(args[0])
+        # bind positional arguments
+        values = []
+        for arg in args:
+            values.extend(bind(self, arg))
 
-    def as_scalar(self) -> ir.ScalarExpr:
+        # bind keyword arguments where each entry can produce only one value
+        # which is then named with the given key
+        for key, arg in kwargs.items():
+            bindings = tuple(bind(self, arg))
+            if len(bindings) != 1:
+                raise com.IbisInputError(
+                    "Keyword arguments cannot produce more than one value"
+                )
+            (value,) = bindings
+            values.append(value.name(key))
+        return values
+
+    def bind(self, *args: Any, **kwargs: Any) -> tuple[Value, ...]:
+        """Bind column values to a table expression.
+
+        This method handles the binding of every kind of column-like value that
+        Ibis handles, including strings, integers, deferred expressions and
+        selectors, to a table expression.
+
+        Parameters
+        ----------
+        args
+            Column-like values to bind.
+        kwargs
+            Column-like values to bind, with names.
+
+        Returns
+        -------
+        tuple[Value, ...]
+            A tuple of bound values
+        """
+        dm = DerefMap.from_targets(self.op())
+
+        bound = self._fast_bind(*args, **kwargs)
+        return (
+            derefed.to_expr().name(name) if original is not derefed else original
+            for name, original, derefed in zip(
+                (expr.get_name() for expr in bound),
+                bound,
+                dm.dereference(*(expr.op() for expr in bound)),
+            )
+        )
+
+    def as_scalar(self) -> ir.Scalar:
         """Inform ibis that the table expression should be treated as a scalar.
 
         Note that the table must have exactly one column and one row for this to
@@ -321,7 +754,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         """
         return name in self.schema()
 
-    def cast(self, schema: SchemaLike) -> Table:
+    def cast(self, schema: SchemaLike, /) -> Table:
         """Cast the columns of a table.
 
         Similar to `pandas.DataFrame.astype`.
@@ -374,7 +807,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         Columns not present in the input schema will be passed through unchanged
 
         >>> t.columns
-        ['species', 'island', 'bill_length_mm', 'bill_depth_mm', 'flipper_length_mm', 'body_mass_g', 'sex', 'year']
+        ('species', 'island', 'bill_length_mm', 'bill_depth_mm', 'flipper_length_mm', 'body_mass_g', 'sex', 'year')
         >>> expr = t.cast({"body_mass_g": "float64", "bill_length_mm": "int"})
         >>> expr.select(*cols).head()
         ┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
@@ -398,7 +831,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         """
         return self._cast(schema, cast_method="cast")
 
-    def try_cast(self, schema: SchemaLike) -> Table:
+    def try_cast(self, schema: SchemaLike, /) -> Table:
         """Cast the columns of a table.
 
         If the cast fails for a row, the value is returned
@@ -519,16 +952,22 @@ class Table(Expr, _FixedTextJupyterMixin):
             console_width=console_width,
         )
 
-    def __getitem__(self, what):
-        """Select items from a table expression.
+    @overload
+    def __getitem__(self, what: str | int) -> ir.Column: ...
 
-        This method implements square bracket syntax for table expressions,
-        including various forms of projection and filtering.
+    @overload
+    def __getitem__(self, what: slice | Sequence[str | int]) -> Table: ...
+
+    def __getitem__(self, what: str | int | slice | Sequence[str | int]):
+        """Select one or more columns or rows from a table expression.
 
         Parameters
         ----------
         what
-            Selection object. This can be a variety of types including strings, ints, lists.
+            What to select. Options are:
+            - A `str` column name or `int` column index to select a single column.
+            - A sequence of column names or indices to select multiple columns.
+            - A slice to select a subset of rows.
 
         Returns
         -------
@@ -539,10 +978,8 @@ class Table(Expr, _FixedTextJupyterMixin):
         Examples
         --------
         >>> import ibis
-        >>> import ibis.selectors as s
-        >>> from ibis import _
         >>> ibis.options.interactive = True
-        >>> t = ibis.examples.penguins.fetch()
+        >>> t = ibis.examples.penguins.fetch().head()
         >>> t
         ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
         ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
@@ -554,15 +991,9 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
         │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
         │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
-        │ Adelie  │ Torgersen │           39.3 │          20.6 │               190 │ … │
-        │ Adelie  │ Torgersen │           38.9 │          17.8 │               181 │ … │
-        │ Adelie  │ Torgersen │           39.2 │          19.6 │               195 │ … │
-        │ Adelie  │ Torgersen │           34.1 │          18.1 │               193 │ … │
-        │ Adelie  │ Torgersen │           42.0 │          20.2 │               190 │ … │
-        │ …       │ …         │              … │             … │                 … │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
 
-        Return a column by name
+        Select a single column by name:
 
         >>> t["island"]
         ┏━━━━━━━━━━━┓
@@ -575,15 +1006,9 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Torgersen │
         │ Torgersen │
         │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ …         │
         └───────────┘
 
-        Return the second column, starting from index 0
+        Select a single column by index:
 
         >>> t.columns[1]
         'island'
@@ -598,15 +1023,24 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Torgersen │
         │ Torgersen │
         │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ Torgersen │
-        │ …         │
         └───────────┘
 
-        Extract a range of rows
+        Select multiple columns by name:
+
+        >>> t[["island", "bill_length_mm"]]
+        ┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+        ┃ island    ┃ bill_length_mm ┃
+        ┡━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+        │ string    │ float64        │
+        ├───────────┼────────────────┤
+        │ Torgersen │           39.1 │
+        │ Torgersen │           39.5 │
+        │ Torgersen │           40.3 │
+        │ Torgersen │           NULL │
+        │ Torgersen │           36.7 │
+        └───────────┴────────────────┘
+
+        Select a range of rows:
 
         >>> t[:2]
         ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
@@ -616,18 +1050,6 @@ class Table(Expr, _FixedTextJupyterMixin):
         ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
         │ Adelie  │ Torgersen │           39.1 │          18.7 │               181 │ … │
         │ Adelie  │ Torgersen │           39.5 │          17.4 │               186 │ … │
-        └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
-        >>> t[:5]
-        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string  │ string    │ float64        │ float64       │ int64             │ … │
-        ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Adelie  │ Torgersen │           39.1 │          18.7 │               181 │ … │
-        │ Adelie  │ Torgersen │           39.5 │          17.4 │               186 │ … │
-        │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
-        │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
-        │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
         >>> t[2:5]
         ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
@@ -639,146 +1061,41 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
         │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
-
-        Some backends support negative slice indexing
-
-        >>> t[-5:]  # last 5 rows
-        ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species   ┃ island ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string    │ string │ float64        │ float64       │ int64             │ … │
-        ├───────────┼────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Chinstrap │ Dream  │           55.8 │          19.8 │               207 │ … │
-        │ Chinstrap │ Dream  │           43.5 │          18.1 │               202 │ … │
-        │ Chinstrap │ Dream  │           49.6 │          18.2 │               193 │ … │
-        │ Chinstrap │ Dream  │           50.8 │          19.0 │               210 │ … │
-        │ Chinstrap │ Dream  │           50.2 │          18.7 │               198 │ … │
-        └───────────┴────────┴────────────────┴───────────────┴───────────────────┴───┘
-        >>> t[-5:-3]  # last 5th to 3rd rows
-        ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species   ┃ island ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string    │ string │ float64        │ float64       │ int64             │ … │
-        ├───────────┼────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Chinstrap │ Dream  │           55.8 │          19.8 │               207 │ … │
-        │ Chinstrap │ Dream  │           43.5 │          18.1 │               202 │ … │
-        └───────────┴────────┴────────────────┴───────────────┴───────────────────┴───┘
-        >>> t[2:-2]  # chop off the first two and last two rows
-        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string  │ string    │ float64        │ float64       │ int64             │ … │
-        ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
-        │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
-        │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
-        │ Adelie  │ Torgersen │           39.3 │          20.6 │               190 │ … │
-        │ Adelie  │ Torgersen │           38.9 │          17.8 │               181 │ … │
-        │ Adelie  │ Torgersen │           39.2 │          19.6 │               195 │ … │
-        │ Adelie  │ Torgersen │           34.1 │          18.1 │               193 │ … │
-        │ Adelie  │ Torgersen │           42.0 │          20.2 │               190 │ … │
-        │ Adelie  │ Torgersen │           37.8 │          17.1 │               186 │ … │
-        │ Adelie  │ Torgersen │           37.8 │          17.3 │               180 │ … │
-        │ …       │ …         │              … │             … │                 … │ … │
-        └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
-
-        Select columns
-
-        >>> t[["island", "bill_length_mm"]].head()
-        ┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
-        ┃ island    ┃ bill_length_mm ┃
-        ┡━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
-        │ string    │ float64        │
-        ├───────────┼────────────────┤
-        │ Torgersen │           39.1 │
-        │ Torgersen │           39.5 │
-        │ Torgersen │           40.3 │
-        │ Torgersen │           NULL │
-        │ Torgersen │           36.7 │
-        └───────────┴────────────────┘
-        >>> t["island", "bill_length_mm"].head()
-        ┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
-        ┃ island    ┃ bill_length_mm ┃
-        ┡━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
-        │ string    │ float64        │
-        ├───────────┼────────────────┤
-        │ Torgersen │           39.1 │
-        │ Torgersen │           39.5 │
-        │ Torgersen │           40.3 │
-        │ Torgersen │           NULL │
-        │ Torgersen │           36.7 │
-        └───────────┴────────────────┘
-        >>> t[_.island, _.bill_length_mm].head()
-        ┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
-        ┃ island    ┃ bill_length_mm ┃
-        ┡━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
-        │ string    │ float64        │
-        ├───────────┼────────────────┤
-        │ Torgersen │           39.1 │
-        │ Torgersen │           39.5 │
-        │ Torgersen │           40.3 │
-        │ Torgersen │           NULL │
-        │ Torgersen │           36.7 │
-        └───────────┴────────────────┘
-
-        Filtering
-
-        >>> t[t.island.lower() != "torgersen"].head()
-        ┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species ┃ island ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string  │ string │ float64        │ float64       │ int64             │ … │
-        ├─────────┼────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Adelie  │ Biscoe │           37.8 │          18.3 │               174 │ … │
-        │ Adelie  │ Biscoe │           37.7 │          18.7 │               180 │ … │
-        │ Adelie  │ Biscoe │           35.9 │          19.2 │               189 │ … │
-        │ Adelie  │ Biscoe │           38.2 │          18.1 │               185 │ … │
-        │ Adelie  │ Biscoe │           38.8 │          17.2 │               180 │ … │
-        └─────────┴────────┴────────────────┴───────────────┴───────────────────┴───┘
-
-        Selectors
-
-        >>> t[~s.numeric() | (s.numeric() & ~s.c("year"))].head()
-        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
-        ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
-        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
-        │ string  │ string    │ float64        │ float64       │ int64             │ … │
-        ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
-        │ Adelie  │ Torgersen │           39.1 │          18.7 │               181 │ … │
-        │ Adelie  │ Torgersen │           39.5 │          17.4 │               186 │ … │
-        │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
-        │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
-        │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
-        └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
-        >>> t[s.r["bill_length_mm":"body_mass_g"]].head()
-        ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
-        ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ body_mass_g ┃
-        ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
-        │ float64        │ float64       │ int64             │ int64       │
-        ├────────────────┼───────────────┼───────────────────┼─────────────┤
-        │           39.1 │          18.7 │               181 │        3750 │
-        │           39.5 │          17.4 │               186 │        3800 │
-        │           40.3 │          18.0 │               195 │        3250 │
-        │           NULL │          NULL │              NULL │        NULL │
-        │           36.7 │          19.3 │               193 │        3450 │
-        └────────────────┴───────────────┴───────────────────┴─────────────┘
         """
         from ibis.expr.types.logical import BooleanValue
 
-        if isinstance(what, slice):
+        if isinstance(what, str):
+            return ops.Field(self.op(), what).to_expr()
+        elif isinstance(what, int):
+            return ops.Field(self.op(), self.columns[what]).to_expr()
+        elif isinstance(what, slice):
             limit, offset = util.slice_to_limit_offset(what, self.count())
             return self.limit(limit, offset=offset)
 
-        values = tuple(bind(self, what, int_as_column=True))
-        if isinstance(what, (str, int)):
-            assert len(values) == 1
-            return values[0]
-        elif util.all_of(values, BooleanValue):
+        columns = self.columns
+        args = [
+            columns[arg] if isinstance(arg, int) else arg
+            for arg in util.promote_list(what)
+        ]
+        if util.all_of(args, str):
+            return self.select(args)
+
+        # Once this deprecation is removed, we'll want to error here instead.
+        warnings.warn(
+            "Selecting/filtering arbitrary expressions in `Table.__getitem__` is "
+            "deprecated and will be removed in version 10.0. Please use "
+            "`Table.select` or `Table.filter` instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        values = tuple(self.bind(args))
+
+        if util.all_of(values, BooleanValue):
             return self.filter(values)
         else:
             return self.select(values)
 
-    def __len__(self):
+    def __len__(self) -> NoReturn:
         raise com.ExpressionError("Use .count() instead")
 
     def __getattr__(self, key: str) -> ir.Column:
@@ -848,8 +1165,8 @@ class Table(Expr, _FixedTextJupyterMixin):
         return self.columns
 
     @property
-    def columns(self) -> list[str]:
-        """The list of column names in this table.
+    def columns(self) -> tuple[str, ...]:
+        """Return a [](`tuple`) of column names in this table.
 
         Examples
         --------
@@ -857,16 +1174,16 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> ibis.options.interactive = True
         >>> t = ibis.examples.penguins.fetch()
         >>> t.columns
-        ['species',
+        ('species',
          'island',
          'bill_length_mm',
          'bill_depth_mm',
          'flipper_length_mm',
          'body_mass_g',
          'sex',
-         'year']
+         'year')
         """
-        return list(self.schema().names)
+        return self._arg.schema.names
 
     def schema(self) -> sch.Schema:
         """Return the [Schema](./schemas.qmd#ibis.expr.schema.Schema) for this table.
@@ -897,7 +1214,12 @@ class Table(Expr, _FixedTextJupyterMixin):
 
     def group_by(
         self,
-        *by: str | ir.Value | Iterable[str] | Iterable[ir.Value] | None,
+        *by: str
+        | ir.Value
+        | Deferred
+        | Iterable[str]
+        | Iterable[ir.Value]
+        | Iterable[Deferred],
         **key_exprs: str | ir.Value | Iterable[str] | Iterable[ir.Value],
     ) -> GroupedTable:
         """Create a grouped table expression.
@@ -953,9 +1275,9 @@ class Table(Expr, _FixedTextJupyterMixin):
         """
         from ibis.expr.types.groupby import GroupedTable
 
-        by = tuple(v for v in by if v is not None)
-        groups = bind(self, (by, key_exprs))
-        return GroupedTable(self, groups)
+        by = (v for v in by if v is not None)
+        groups = self.bind(*by, **key_exprs)
+        return GroupedTable(self, tuple(groups))
 
     # TODO(kszucs): shouldn't this be ibis.rowid() instead not bound to a specific table?
     def rowid(self) -> ir.IntegerValue:
@@ -998,70 +1320,11 @@ class Table(Expr, _FixedTextJupyterMixin):
         else:
             return ops.SelfReference(self).to_expr()
 
-    def difference(self, table: Table, *rest: Table, distinct: bool = True) -> Table:
-        """Compute the set difference of multiple table expressions.
-
-        The input tables must have identical schemas.
-
-        Parameters
-        ----------
-        table:
-            A table expression
-        *rest:
-            Additional table expressions
-        distinct
-            Only diff distinct rows not occurring in the calling table
-
-        See Also
-        --------
-        [`ibis.difference`](./expression-tables.qmd#ibis.difference)
-
-        Returns
-        -------
-        Table
-            The rows present in `self` that are not present in `tables`.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t1 = ibis.memtable({"a": [1, 2]})
-        >>> t1
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     1 │
-        │     2 │
-        └───────┘
-        >>> t2 = ibis.memtable({"a": [2, 3]})
-        >>> t2
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     2 │
-        │     3 │
-        └───────┘
-        >>> t1.difference(t2)
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     1 │
-        └───────┘
-        """
-        node = ops.Difference(self, table, distinct=distinct)
-        for table in rest:
-            node = ops.Difference(node, table, distinct=distinct)
-        return node.to_expr().select(self.columns)
-
     def aggregate(
         self,
-        metrics: Sequence[ir.Scalar] | None = (),
+        metrics: ir.Scalar | Deferred | Sequence[ir.Scalar | Deferred] | None = (),
+        /,
+        *,
         by: Sequence[ir.Value] | None = (),
         having: Sequence[ir.BooleanValue] | None = (),
         **kwargs: ir.Value,
@@ -1118,7 +1381,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         ...     total_cost=_.price.sum(),
         ...     avg_cost=_.price.mean(),
         ...     having=_.price.sum() < 0.5,
-        ... )
+        ... ).order_by("fruit")
         ┏━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━┓
         ┃ fruit  ┃ total_cost ┃ avg_cost ┃
         ┡━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━┩
@@ -1133,15 +1396,12 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         node = self.op()
 
-        groups = bind(self, by)
-        metrics = bind(self, (metrics, kwargs))
-        having = tuple(bind(self, having))
+        groups = self.bind(by)
+        metrics = self.bind(metrics, **kwargs)
+        having = tuple(self.bind(having))
 
         groups = unwrap_aliases(groups)
         metrics = unwrap_aliases(metrics)
-
-        groups = dereference_values(node, groups)
-        metrics = dereference_values(node, metrics)
 
         # the user doesn't need to specify the metrics used in the having clause
         # explicitly, we implicitly add them to the metrics list by looking for
@@ -1160,7 +1420,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         if having:
             # apply the having clause
-            agg = agg.filter(*having)
+            agg = agg.filter(having)
             # remove any metrics that were only used in the having clause
             if metrics != original_metrics:
                 agg = agg.select(*groups.keys(), *original_metrics.keys())
@@ -1270,9 +1530,13 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         >>> expr = t.distinct(on=["species", "island", "year", "bill_length_mm"], keep=None)
         >>> expr.count()
-        273
+        ┌─────┐
+        │ 273 │
+        └─────┘
         >>> t.count()
-        344
+        ┌─────┐
+        │ 344 │
+        └─────┘
 
         You can pass [`selectors`](./selectors.qmd) to `on`
 
@@ -1295,7 +1559,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ …       │ …         │              … │             … │                 … │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
 
-        The only valid values of `keep` are `"first"`, `"last"` and [`None][None]
+        The only valid values of `keep` are `"first"`, `"last"` and [](`None`).
 
         >>> t.distinct(on="species", keep="second")  # quartodoc: +EXPECTED_FAILURE
         Traceback (most recent call last):
@@ -1307,9 +1571,12 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         if on is None:
             # dedup everything
-            if keep != "first":
+            if keep is None:  # remove duplicates
+                return self.aggregate(by=self.columns, having=lambda t: t.count() == 1)
+            elif keep == "last":
                 raise com.IbisError(
-                    f"Only keep='first' (the default) makes sense when deduplicating all columns; got keep={keep!r}"
+                    "Only keep='first' and keep=`None` are well-defined when deduplicating "
+                    f"all columns; got keep={keep!r}"
                 )
             return ops.Distinct(self).to_expr()
 
@@ -1319,7 +1586,7 @@ class Table(Expr, _FixedTextJupyterMixin):
             having = lambda t: t.count() == 1
             method = "first"
         elif keep in ("first", "last"):
-            having = None
+            having = ()
             method = keep
         else:
             raise com.IbisError(
@@ -1327,11 +1594,7 @@ class Table(Expr, _FixedTextJupyterMixin):
             )
 
         aggs = {col.get_name(): getattr(col, method)() for col in (~on).expand(self)}
-
-        gb = self.group_by(on)
-        if having is not None:
-            gb = gb.having(having)
-        res = gb.agg(**aggs)
+        res = self.aggregate(aggs, by=on, having=having)
 
         assert len(res.columns) == len(self.columns)
         if res.columns != self.columns:
@@ -1341,6 +1604,7 @@ class Table(Expr, _FixedTextJupyterMixin):
     def sample(
         self,
         fraction: float,
+        /,
         *,
         method: Literal["row", "block"] = "row",
         seed: int | None = None,
@@ -1368,13 +1632,14 @@ class Table(Expr, _FixedTextJupyterMixin):
             float between 0 and 1.
         method
             The sampling method to use. The default is "row", which includes
-            each row with a probability of ``fraction``. If method is "block",
-            some backends may instead perform sampling a fraction of blocks of
-            rows (where "block" is a backend dependent definition). This is
-            identical to "row" for backends lacking a blockwise sampling
-            implementation. For those coming from SQL, "row" and "block"
-            correspond to "bernoulli" and "system" respectively in a
-            TABLESAMPLE clause.
+            each row with a probability of `fraction`. If method is "block",
+            some backends may instead sample a fraction of blocks of rows
+            (where "block" is a backend dependent definition), which may be
+            significantly more efficient (at the cost of a less statistically
+            random sample). This is identical to "row" for backends lacking a
+            blockwise sampling implementation. For those coming from SQL, "row"
+            and "block" correspond to "bernoulli" and "system" respectively in
+            a TABLESAMPLE clause.
         seed
             An optional random seed to use, for repeatable sampling. The range
             of possible seed values is backend specific (most support at least
@@ -1427,7 +1692,7 @@ class Table(Expr, _FixedTextJupyterMixin):
                 self, fraction=fraction, method=method, seed=seed
             ).to_expr()
 
-    def limit(self, n: int | None, offset: int = 0) -> Table:
+    def limit(self, n: int | None, /, *, offset: int = 0) -> Table:
         """Select `n` rows from `self` starting at `offset`.
 
         ::: {.callout-note}
@@ -1490,7 +1755,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         """
         return ops.Limit(self, n, offset).to_expr()
 
-    def head(self, n: int = 5) -> Table:
+    def head(self, n: int = 5, /) -> Table:
         """Select the first `n` rows of a table.
 
         ::: {.callout-note}
@@ -1537,17 +1802,15 @@ class Table(Expr, _FixedTextJupyterMixin):
         [`Table.limit`](#ibis.expr.types.relations.Table.limit)
         [`Table.order_by`](#ibis.expr.types.relations.Table.order_by)
         """
-        return self.limit(n=n)
+        return self.limit(n)
 
     def order_by(
         self,
         *by: str
         | ir.Column
         | s.Selector
-        | Sequence[str]
-        | Sequence[ir.Column]
-        | Sequence[s.Selector]
-        | None,
+        | Deferred
+        | Sequence[str | ir.Column | s.Selector | Deferred],
     ) -> Table:
         """Sort a table by one or more expressions.
 
@@ -1671,18 +1934,86 @@ class Table(Expr, _FixedTextJupyterMixin):
         │     3 │ a      │     4 │
         │     2 │ B      │     6 │
         └───────┴────────┴───────┘
+
+        [Selectors](./selectors.qmd) are allowed as sort keys and are a concise way to sort by
+        multiple columns matching some criteria
+
+        >>> import ibis.selectors as s
+        >>> penguins = ibis.examples.penguins.fetch()
+        >>> penguins[["year", "island"]].value_counts().order_by(s.startswith("year"))
+        ┏━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+        ┃ year  ┃ island    ┃ year_island_count ┃
+        ┡━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+        │ int64 │ string    │ int64             │
+        ├───────┼───────────┼───────────────────┤
+        │  2007 │ Torgersen │                20 │
+        │  2007 │ Biscoe    │                44 │
+        │  2007 │ Dream     │                46 │
+        │  2008 │ Torgersen │                16 │
+        │  2008 │ Dream     │                34 │
+        │  2008 │ Biscoe    │                64 │
+        │  2009 │ Torgersen │                16 │
+        │  2009 │ Dream     │                44 │
+        │  2009 │ Biscoe    │                60 │
+        └───────┴───────────┴───────────────────┘
+
+        Use the [`across`](./selectors.qmd#ibis.selectors.across) selector to
+        apply a specific order to multiple columns
+
+        >>> penguins[["year", "island"]].value_counts().order_by(
+        ...     s.across(s.startswith("year"), _.desc())
+        ... )
+        ┏━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+        ┃ year  ┃ island    ┃ year_island_count ┃
+        ┡━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+        │ int64 │ string    │ int64             │
+        ├───────┼───────────┼───────────────────┤
+        │  2009 │ Biscoe    │                60 │
+        │  2009 │ Dream     │                44 │
+        │  2009 │ Torgersen │                16 │
+        │  2008 │ Biscoe    │                64 │
+        │  2008 │ Dream     │                34 │
+        │  2008 │ Torgersen │                16 │
+        │  2007 │ Dream     │                46 │
+        │  2007 │ Biscoe    │                44 │
+        │  2007 │ Torgersen │                20 │
+        └───────┴───────────┴───────────────────┘
         """
-        keys = bind(self, by)
+        keys = self.bind(*by)
         keys = unwrap_aliases(keys)
-        keys = dereference_values(self.op(), keys)
         if not keys:
             raise com.IbisError("At least one sort key must be provided")
 
         node = ops.Sort(self, keys.values())
         return node.to_expr()
 
-    def union(self, table: Table, *rest: Table, distinct: bool = False) -> Table:
-        """Compute the set union of multiple table expressions.
+    def _assemble_set_op(
+        self, opcls: type[Set], table: Table, *rest: Table, distinct: bool
+    ) -> Table:
+        """Assemble a set operation expression.
+
+        This exists to workaround an issue in sqlglot where codegen blows the
+        Python stack because of set operation nesting.
+
+        The implementation here uses a queue to balance the operation tree.
+        """
+        queue = deque()
+
+        queue.append(self)
+        queue.append(table)
+        queue.extend(rest)
+
+        while len(queue) > 1:
+            left = queue.popleft()
+            right = queue.popleft()
+            node = opcls(left, right, distinct=distinct)
+            queue.append(node)
+        result = queue.popleft()
+        assert not queue, "items left in queue"
+        return result.to_expr()
+
+    def union(self, table: Table, /, *rest: Table, distinct: bool = False) -> Table:
+        """Compute the multiset (or set) union of multiple table expressions.
 
         The input tables must have identical schemas.
 
@@ -1693,7 +2024,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         *rest
             Additional table expressions
         distinct
-            Only return distinct rows
+            Use multiset union (False) or set union (True). See examples.
 
         Returns
         -------
@@ -1749,14 +2080,27 @@ class Table(Expr, _FixedTextJupyterMixin):
         │     2 │
         │     3 │
         └───────┘
-        """
-        node = ops.Union(self, table, distinct=distinct)
-        for table in rest:
-            node = ops.Union(node, table, distinct=distinct)
-        return node.to_expr().select(self.columns)
 
-    def intersect(self, table: Table, *rest: Table, distinct: bool = True) -> Table:
-        """Compute the set intersection of multiple table expressions.
+        You can union more than two tables at once.
+
+        >>> t1.union(t1, t1).order_by("a")
+        ┏━━━━━━━┓
+        ┃ a     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     1 │
+        │     1 │
+        │     1 │
+        │     2 │
+        │     2 │
+        │     2 │
+        └───────┘
+        """
+        return self._assemble_set_op(ops.Union, table, *rest, distinct=distinct)
+
+    def intersect(self, table: Table, /, *rest: Table, distinct: bool = True) -> Table:
+        """Compute the set (or multiset) intersection of multiple table expressions.
 
         The input tables must have identical schemas.
 
@@ -1767,7 +2111,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         *rest
             Additional table expressions
         distinct
-            Only return distinct rows
+            Use set intersect (True) or multiset intersect (False). See examples.
 
         Returns
         -------
@@ -1782,49 +2126,145 @@ class Table(Expr, _FixedTextJupyterMixin):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t1 = ibis.memtable({"a": [1, 2]})
-        >>> t1
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     1 │
-        │     2 │
-        └───────┘
-        >>> t2 = ibis.memtable({"a": [2, 3]})
-        >>> t2
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     2 │
-        │     3 │
-        └───────┘
-        >>> t1.intersect(t2)
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     2 │
-        └───────┘
-        """
-        node = ops.Intersection(self, table, distinct=distinct)
-        for table in rest:
-            node = ops.Intersection(node, table, distinct=distinct)
-        return node.to_expr().select(self.columns)
+        >>> two_a = ibis.memtable({"x": ["a", "a", "b"]})
+        >>> three_a = ibis.memtable({"x": ["a", "a", "a", "b"]})
+        >>> four_a = ibis.memtable({"x": ["a", "a", "a", "a", "c"]})
 
-    @deprecated(as_of="9.0", instead="use table.as_scalar() instead")
-    def to_array(self) -> ir.Column:
-        """View a single column table as an array.
+        With `distinct=True`, the intersection will return one row for each row that appears in all input tables.
+        This is equivalent to a set intersection.
+        So even though the source tables have multiple `"a"` values, the result will only have one:
+
+        >>> two_a.intersect(three_a).order_by("x")
+        ┏━━━━━━━━┓
+        ┃ x      ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │      a │
+        │      b │
+        └────────┘
+
+        With `distinct=False`, the intersection will return all rows that appear in all input tables.
+        This is equivalent to a multiset intersection.
+        Since the smallest number of appearances of `"a"` is 2, the result will have two `"a"` values:
+
+        >>> two_a.intersect(three_a, distinct=False).order_by("x")
+        ┏━━━━━━━━┓
+        ┃ x      ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │      a │
+        │      a │
+        │      b │
+        └────────┘
+
+        More than two table expressions can be intersected at once.
+        - Since `"a"` appears at minimum one time, it appears once in the result.
+        - Since `"b"` doesn't appear in `two_a` or `three_a`, it is not included.
+        - Since `"c"` does not appear in `one_a`, it is not included.
+
+        >>> two_a.intersect(three_a, four_a)
+        ┏━━━━━━━━┓
+        ┃ x      ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │      a │
+        └────────┘
+        >>> two_a.intersect(three_a, four_a, distinct=False)
+        ┏━━━━━━━━┓
+        ┃ x      ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │      a │
+        │      a │
+        └────────┘
+        """
+        return self._assemble_set_op(ops.Intersection, table, *rest, distinct=distinct)
+
+    def difference(self, table: Table, /, *rest: Table, distinct: bool = True) -> Table:
+        """Compute the set (or multiset) difference of multiple table expressions.
+
+        The input tables must have identical schemas.
+
+        Parameters
+        ----------
+        table
+            A table expression
+        *rest
+            Additional table expressions
+        distinct
+            Use set difference (`True`) or multiset difference (`False`). See examples.
+
+        See Also
+        --------
+        [`ibis.difference`](./expression-tables.qmd#ibis.difference)
 
         Returns
         -------
-        Value
-            A single column view of a table
+        Table
+            The rows present in `self` that are not present in `tables`.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t1 = ibis.memtable({"a": [7, 8, 8, 9, 9, 9]})
+        >>> t2 = ibis.memtable({"a": [8, 9]})
+
+        With distinct=True, if a row ever appears in any of `*rest`,
+        it will not appear in the result.
+        So here, all appearances of 8 and 9 are removed:
+
+        >>> t1.difference(t2)
+        ┏━━━━━━━┓
+        ┃ a     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     7 │
+        └───────┘
+
+        With `distinct=False`, the algorithm is a [multiset](https://en.wikipedia.org/wiki/Multiset) difference.
+        This means, that since 8 and 9 each appear once in `t2`,
+        the result will be the input with a single instance of each removed:
+
+        >>> t1.difference(t2, distinct=False).order_by("a")
+        ┏━━━━━━━┓
+        ┃ a     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     7 │
+        │     8 │
+        │     9 │
+        │     9 │
+        └───────┘
+
+        With multiple tables in `*rest`, we apply the operation consecutively.
+        Here, we remove two eights and two nines:
+
+        >>> t1.difference(t2, t2, distinct=False).order_by("a")
+        ┏━━━━━━━┓
+        ┃ a     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     7 │
+        │     9 │
+        └───────┘
         """
+        node = ops.Difference(self, table, distinct=distinct)
+        for expr in rest:
+            node = ops.Difference(node, expr, distinct=distinct)
+        return node.to_expr()
+
+    @deprecated(as_of="9.0", instead="use table.as_scalar() instead")
+    def to_array(self) -> ir.Column:
+        """Deprecated - use `as_scalar` instead."""
+
         schema = self.schema()
         if len(schema) != 1:
             raise com.ExpressionError(
@@ -1832,7 +2272,9 @@ class Table(Expr, _FixedTextJupyterMixin):
             )
         return self.as_scalar()
 
-    def mutate(self, *exprs: Sequence[ir.Expr] | None, **mutations: ir.Value) -> Table:
+    def mutate(
+        self, *exprs: ir.Value | Deferred, **mutations: ir.Value | Deferred | str
+    ) -> Table:
         """Add columns to a table expression.
 
         Parameters
@@ -1905,7 +2347,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Mutate across multiple columns
 
-        >>> t.mutate(s.across(s.numeric() & ~s.c("year"), _ - _.mean())).head()
+        >>> t.mutate(s.across(s.numeric() & ~s.cols("year"), _ - _.mean())).head()
         ┏━━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━━┓
         ┃ species ┃ year  ┃ bill_length_mm ┃
         ┡━━━━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━━━━┩
@@ -1918,19 +2360,31 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Adelie  │  2007 │       -7.22193 │
         └─────────┴───────┴────────────────┘
         """
+
+        # the implementation of `mutate` should be kept in sync with that of `select`
+        # with the exception that mutate does not call bind on the fields already in this table (node.fields)
+        from ibis.expr.rewrites import rewrite_project_input
+
         # string and integer inputs are going to be coerced to literals instead
         # of interpreted as column references like in select
         node = self.op()
-        values = bind(self, (exprs, mutations))
+        values = self.bind(*exprs, **mutations)  # bind new expressions/mutations
         values = unwrap_aliases(values)
-        # allow overriding of fields, hence the mutation behavior
-        values = {**node.fields, **values}
-        return self.select(**values)
+
+        # we need to detect reductions which are either turned into window functions
+        # or scalar subqueries depending on whether they are originating from self
+        values = {
+            k: rewrite_project_input(v, relation=self.op()) for k, v in values.items()
+        }
+
+        # note that existing fields in node.fields will skip bind&dereferencing to improve performance
+        # (unless overridden by mutations in **values)
+        return ops.Project(self, {**node.fields, **values}).to_expr()
 
     def select(
         self,
-        *exprs: ir.Value | str | Iterable[ir.Value | str],
-        **named_exprs: ir.Value | str,
+        *exprs: ir.Value | str | Iterable[ir.Value | str] | Deferred,
+        **named_exprs: ir.Value | str | Deferred,
     ) -> Table:
         """Compute a new table expression using `exprs` and `named_exprs`.
 
@@ -2075,7 +2529,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         Projection with a selector
 
         >>> import ibis.selectors as s
-        >>> t.select(s.numeric() & ~s.c("year")).head()
+        >>> t.select(s.numeric() & ~s.cols("year")).head()
         ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
         ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ body_mass_g ┃
         ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
@@ -2091,7 +2545,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         Projection + aggregation across multiple columns
 
         >>> from ibis import _
-        >>> t.select(s.across(s.numeric() & ~s.c("year"), _.mean())).head()
+        >>> t.select(s.across(s.numeric() & ~s.cols("year"), _.mean())).head()
         ┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
         ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ body_mass_g ┃
         ┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
@@ -2104,11 +2558,12 @@ class Table(Expr, _FixedTextJupyterMixin):
         │       43.92193 │      17.15117 │        200.915205 │ 4201.754386 │
         └────────────────┴───────────────┴───────────────────┴─────────────┘
         """
+        # note that if changes are made to implementation of select,
+        # corresponding changes may be needed in `.mutate()`
         from ibis.expr.rewrites import rewrite_project_input
 
-        values = bind(self, (exprs, named_exprs))
+        values = self.bind(*exprs, **named_exprs)
         values = unwrap_aliases(values)
-        values = dereference_values(self.op(), values)
         if not values:
             raise com.IbisTypeError(
                 "You must select at least one column for a valid projection"
@@ -2123,32 +2578,15 @@ class Table(Expr, _FixedTextJupyterMixin):
 
     projection = select
 
-    @util.deprecated(
-        as_of="7.0",
-        instead=(
-            "use `Table.rename` instead (if passing a mapping, note the meaning "
-            "of keys and values are swapped in Table.rename)."
-        ),
-    )
-    def relabel(
-        self,
-        substitutions: Mapping[str, str]
-        | Callable[[str], str | None]
-        | str
-        | Literal["snake_case", "ALL_CAPS"],
-    ) -> Table:
-        """Deprecated in favor of `Table.rename`."""
-        if isinstance(substitutions, Mapping):
-            substitutions = {new: old for old, new in substitutions.items()}
-        return self.rename(substitutions)
-
     def rename(
         self,
-        method: str
-        | Callable[[str], str | None]
-        | Literal["snake_case", "ALL_CAPS"]
-        | Mapping[str, str]
-        | None = None,
+        method: (
+            str
+            | Callable[[str], str | None]
+            | Literal["snake_case", "ALL_CAPS"]
+            | Mapping[str, str]
+            | None
+        ) = None,
         /,
         **substitutions: str,
     ) -> Table:
@@ -2160,16 +2598,16 @@ class Table(Expr, _FixedTextJupyterMixin):
             An optional method for renaming columns. May be one of:
 
             - A format string to use to rename all columns, like
-              ``"prefix_{name}"``.
+              `"prefix_{name}"`.
             - A function from old name to new name. If the function returns
-              ``None`` the old name is used.
-            - The literal strings ``"snake_case"`` or ``"ALL_CAPS"`` to
-              rename all columns using a ``snake_case`` or ``"ALL_CAPS"``
+              `None` the old name is used.
+            - The literal strings `"snake_case"` or `"ALL_CAPS"` to
+              rename all columns using a `snake_case` or `"ALL_CAPS"`
               naming convention respectively.
             - A mapping from new name to old name. Existing columns not present
               in the mapping will passthrough with their original name.
         substitutions
-            Columns to be explicitly renamed, expressed as ``new_name=old_name``
+            Columns to be explicitly renamed, expressed as `new_name=old_name`
             keyword arguments.
 
         Returns
@@ -2182,7 +2620,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> import ibis
         >>> import ibis.selectors as s
         >>> ibis.options.interactive = True
-        >>> first3 = s.r[:3]  # first 3 columns
+        >>> first3 = s.index[:3]  # first 3 columns
         >>> t = ibis.examples.penguins_raw_raw.fetch().select(first3)
         >>> t
         ┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -2204,7 +2642,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         └───────────┴───────────────┴─────────────────────────────────────┘
 
         Rename specific columns by passing keyword arguments like
-        ``new_name="old_name"``
+        `new_name="old_name"`
 
         >>> t.rename(study_name="studyName").head(1)
         ┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -2266,22 +2704,13 @@ class Table(Expr, _FixedTextJupyterMixin):
         # A mapping from old_name -> renamed expr
         renamed = {}
 
-        if substitutions:
-            for new_name, old_name in substitutions.items():
-                col = self[old_name]
-                if old_name not in renamed:
-                    renamed[old_name] = col.name(new_name)
-                else:
-                    raise ValueError(
-                        "duplicate new names passed for renaming {old_name!r}"
-                    )
+        for new_name, old_name in substitutions.items():
+            if old_name not in renamed:
+                renamed[old_name] = (new_name, self[old_name].op())
+            else:
+                raise ValueError("duplicate new names passed for renaming {old_name!r}")
 
-        if method is None:
-
-            def rename(c):
-                return None
-
-        elif isinstance(method, str) and method in {"snake_case", "ALL_CAPS"}:
+        if isinstance(method, str) and method in {"snake_case", "ALL_CAPS"}:
 
             def rename(c):
                 c = c.strip()
@@ -2319,17 +2748,19 @@ class Table(Expr, _FixedTextJupyterMixin):
         else:
             rename = method
 
-        exprs = []
+        exprs = {}
+        fields = self.op().fields
         for c in self.columns:
-            if c in renamed:
-                expr = renamed[c]
+            if (new_name_op := renamed.get(c)) is not None:
+                new_name, op = new_name_op
             else:
-                expr = self[c]
-                if (name := rename(c)) is not None:
-                    expr = expr.name(name)
-            exprs.append(expr)
+                op = fields[c]
+                if rename is None or (new_name := rename(c)) is None:
+                    new_name = c
 
-        return self.select(exprs)
+            exprs[new_name] = op
+
+        return ops.Project(self, exprs).to_expr()
 
     def drop(self, *fields: str | Selector) -> Table:
         """Remove fields from a table.
@@ -2411,27 +2842,20 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Torgersen │               193 │        3450 │ female │  2007 │
         └───────────┴───────────────────┴─────────────┴────────┴───────┘
         """
-        from ibis import selectors as s
-
         if not fields:
             # no-op if nothing to be dropped
             return self
 
-        fields = tuple(
-            field.resolve(self) if isinstance(field, Deferred) else field
-            for field in fields
-        )
-
-        if missing_fields := {f for f in fields if isinstance(f, str)}.difference(
-            self.schema().names
-        ):
-            raise KeyError(f"Fields not in table: {sorted(missing_fields)}")
-
-        return self.select(~s._to_selector(fields))
+        columns_to_drop = frozenset(map(Expr.get_name, self._fast_bind(*fields)))
+        return ops.DropColumns(parent=self, columns_to_drop=columns_to_drop).to_expr()
 
     def filter(
         self,
-        *predicates: ir.BooleanValue | Sequence[ir.BooleanValue] | IfAnyAll,
+        *predicates: ir.BooleanValue
+        | bool
+        | Sequence[ir.BooleanValue | bool]
+        | IfAnyAll
+        | Deferred,
     ) -> Table:
         """Select rows from `table` based on `predicates`.
 
@@ -2468,7 +2892,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Adelie  │ Torgersen │           42.0 │          20.2 │               190 │ … │
         │ …       │ …         │              … │             … │                 … │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
-        >>> t.filter([t.species == "Adelie", t.body_mass_g > 3500]).sex.value_counts().dropna(
+        >>> t.filter([t.species == "Adelie", t.body_mass_g > 3500]).sex.value_counts().drop_null(
         ...     "sex"
         ... ).order_by("sex")
         ┏━━━━━━━━┳━━━━━━━━━━━┓
@@ -2480,19 +2904,32 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ male   │        68 │
         └────────┴───────────┘
         """
-        from ibis.expr.analysis import flatten_predicates
-        from ibis.expr.rewrites import rewrite_filter_input
+        from ibis.expr.rewrites import flatten_predicates, rewrite_filter_input
 
-        preds = bind(self, predicates)
-        preds = unwrap_aliases(preds)
-        preds = dereference_values(self.op(), preds)
-        preds = flatten_predicates(list(preds.values()))
+        preds = self.bind(*predicates)
+
+        # we can't use `unwrap_aliases` here because that function
+        # deduplicates based on name alone
+        #
+        # it's perfectly valid to repeat a filter, even if it might be
+        # useless, so enforcing uniquely named expressions here doesn't make
+        # sense
+        #
+        # instead, compute all distinct unaliased predicates
+        result = toolz.unique(
+            node.arg if isinstance(node := value.op(), ops.Alias) else node
+            for value in preds
+        )
+
+        preds = flatten_predicates(list(result))
         preds = list(map(rewrite_filter_input, preds))
         if not preds:
             raise com.IbisInputError("You must pass at least one predicate to filter")
         return ops.Filter(self, preds).to_expr()
 
-    def nunique(self, where: ir.BooleanValue | None = None) -> ir.IntegerScalar:
+    def nunique(
+        self, *, where: ir.BooleanValue | Deferred | None = None
+    ) -> ir.IntegerScalar:
         """Compute the number of unique rows in the table.
 
         Parameters
@@ -2521,15 +2958,21 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ bar    │
         └────────┘
         >>> t.nunique()
-        2
-        >>> t.nunique(t.a != "foo")
-        1
+        ┌───┐
+        │ 2 │
+        └───┘
+        >>> t.nunique(where=t.a != "foo")
+        ┌───┐
+        │ 1 │
+        └───┘
         """
-        return ops.CountDistinctStar(
-            self, where=self._bind_reduction_filter(where)
-        ).to_expr()
+        if where is not None:
+            (where,) = bind(self, where)
+        return ops.CountDistinctStar(self, where=where).to_expr()
 
-    def count(self, where: ir.BooleanValue | None = None) -> ir.IntegerScalar:
+    def count(
+        self, *, where: ir.BooleanValue | Deferred | None = None
+    ) -> ir.IntegerScalar:
         """Compute the number of rows in the table.
 
         Parameters
@@ -2558,17 +3001,25 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ baz    │
         └────────┘
         >>> t.count()
-        3
-        >>> t.count(t.a != "foo")
-        2
+        ┌───┐
+        │ 3 │
+        └───┘
+        >>> t.count(where=t.a != "foo")
+        ┌───┐
+        │ 2 │
+        └───┘
         >>> type(t.count())
         <class 'ibis.expr.types.numeric.IntegerScalar'>
         """
-        return ops.CountStar(self, where=self._bind_reduction_filter(where)).to_expr()
+        if where is not None:
+            (where,) = bind(self, where)
+        return ops.CountStar(self, where=where).to_expr()
 
-    def dropna(
+    def drop_null(
         self,
         subset: Sequence[str] | str | None = None,
+        /,
+        *,
         how: Literal["any", "all"] = "any",
     ) -> Table:
         """Remove rows with null values from the table.
@@ -2612,24 +3063,27 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ …       │ …         │              … │             … │                 … │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
         >>> t.count()
-        344
-        >>> t.dropna(["bill_length_mm", "body_mass_g"]).count()
-        342
-        >>> t.dropna(how="all").count()  # no rows where all columns are null
-        344
+        ┌─────┐
+        │ 344 │
+        └─────┘
+        >>> t.drop_null(["bill_length_mm", "body_mass_g"]).count()
+        ┌─────┐
+        │ 342 │
+        └─────┘
+        >>> t.drop_null(how="all").count()  # no rows where all columns are null
+        ┌─────┐
+        │ 344 │
+        └─────┘
         """
         if subset is not None:
-            subset = bind(self, subset)
-        return ops.DropNa(self, how, subset).to_expr()
+            subset = tuple(self.bind(subset))
+        return ops.DropNull(self, how, subset).to_expr()
 
-    def fillna(
-        self,
-        replacements: ir.Scalar | Mapping[str, ir.Scalar],
-    ) -> Table:
+    def fill_null(self, replacements: ir.Scalar | Mapping[str, ir.Scalar], /) -> Table:
         """Fill null values in a table expression.
 
         ::: {.callout-note}
-        ## There is potential lack of type stability with the `fillna` API
+        ## There is potential lack of type stability with the `fill_null` API
 
         For example, different library versions may impact whether a given
         backend promotes integer replacement values to floats.
@@ -2641,6 +3095,11 @@ class Table(Expr, _FixedTextJupyterMixin):
             Value with which to fill nulls. If `replacements` is a mapping, the
             keys are column names that map to their replacement value. If
             passed as a scalar all columns are filled with that value.
+
+        Returns
+        -------
+        Table
+            Table expression
 
         Examples
         --------
@@ -2665,7 +3124,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ NULL   │
         │ …      │
         └────────┘
-        >>> t.fillna({"sex": "unrecorded"}).sex
+        >>> t.fill_null({"sex": "unrecorded"}).sex
         ┏━━━━━━━━━━━━┓
         ┃ sex        ┃
         ┡━━━━━━━━━━━━┩
@@ -2683,11 +3142,6 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ unrecorded │
         │ …          │
         └────────────┘
-
-        Returns
-        -------
-        Table
-            Table expression
         """
         schema = self.schema()
 
@@ -2704,7 +3158,7 @@ class Table(Expr, _FixedTextJupyterMixin):
                 val_type = val.type() if isinstance(val, Expr) else dt.infer(val)
                 if not val_type.castable(col_type):
                     raise com.IbisTypeError(
-                        f"Cannot fillna on column {col!r} of type {col_type} with a "
+                        f"Cannot fill_null on column {col!r} of type {col_type} with a "
                         f"value of type {val_type}"
                     )
         else:
@@ -2716,11 +3170,29 @@ class Table(Expr, _FixedTextJupyterMixin):
             for col, col_type in schema.items():
                 if col_type.nullable and not val_type.castable(col_type):
                     raise com.IbisTypeError(
-                        f"Cannot fillna on column {col!r} of type {col_type} with a "
+                        f"Cannot fill_null on column {col!r} of type {col_type} with a "
                         f"value of type {val_type} - pass in an explicit mapping "
-                        f"of fill values to `fillna` instead."
+                        f"of fill values to `fill_null` instead."
                     )
-        return ops.FillNa(self, replacements).to_expr()
+        return ops.FillNull(self, replacements).to_expr()
+
+    @deprecated(as_of="9.1", instead="use drop_null instead")
+    def dropna(
+        self,
+        subset: Sequence[str] | str | None = None,
+        /,
+        *,
+        how: Literal["any", "all"] = "any",
+    ) -> Table:
+        """Deprecated - use `drop_null` instead."""
+
+        return self.drop_null(subset, how=how)
+
+    @deprecated(as_of="9.1", instead="use fill_null instead")
+    def fillna(self, replacements: ir.Scalar | Mapping[str, ir.Scalar], /) -> Table:
+        """Deprecated - use `fill_null` instead."""
+
+        return self.fill_null(replacements)
 
     def unpack(self, *columns: str) -> Table:
         """Project the struct fields of each of `columns` into `self`.
@@ -2770,19 +3242,55 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ c      │    10.3 │    30.1 │
         └────────┴─────────┴─────────┘
 
+        Existing columns are overwritten by unpacking, regardless of existing
+        column ordering.
+
+        Here, `x` follows `a`:
+
+        >>> t = ibis.memtable(
+        ...     {"a": [{"x": 1}, {"x": 2}], "x": ["abc", "def"]},
+        ...     schema={"a": "struct<x: int>", "x": "string"},
+        ... )
+        >>> t.unpack("a")
+        ┏━━━━━━━┓
+        ┃ x     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     1 │
+        │     2 │
+        └───────┘
+
+        And here, `x` precedes `a`:
+
+        >>> t = ibis.memtable(
+        ...     {"x": ["abc", "def"], "a": [{"x": 1}, {"x": 2}]},
+        ...     schema={"x": "string", "a": "struct<x: int>"},
+        ... )
+        >>> t.unpack("a")
+        ┏━━━━━━━┓
+        ┃ x     ┃
+        ┡━━━━━━━┩
+        │ int64 │
+        ├───────┤
+        │     1 │
+        │     2 │
+        └───────┘
+
         See Also
         --------
         [`StructValue.lift`](./expression-collections.qmd#ibis.expr.types.structs.StructValue.lift)
         """
         columns_to_unpack = frozenset(columns)
-        result_columns = []
+        result_columns = {}
         for column in self.columns:
             if column in columns_to_unpack:
                 expr = self[column]
-                result_columns.extend(expr[field] for field in expr.names)
-            else:
-                result_columns.append(column)
-        return self[result_columns]
+                for field in expr.names:
+                    result_columns[field] = expr[field]
+            elif column not in result_columns:
+                result_columns[column] = self[column]
+        return self.select(**result_columns)
 
     def info(self) -> Table:
         """Return summary information about a table.
@@ -2820,22 +3328,20 @@ class Table(Expr, _FixedTextJupyterMixin):
         for pos, colname in enumerate(self.columns):
             col = self[colname]
             typ = col.type()
-            agg = self.select(
-                isna=ibis.case().when(col.isnull(), 1).else_(0).end()
-            ).agg(
+            agg = self.select(isna=ibis.cases((col.isnull(), 1), else_=0)).agg(
                 name=lit(colname),
                 type=lit(str(typ)),
                 nullable=lit(typ.nullable),
                 nulls=lambda t: t.isna.sum(),
                 non_nulls=lambda t: (1 - t.isna).sum(),
                 null_frac=lambda t: t.isna.mean(),
-                pos=lit(pos),
+                pos=lit(pos, type=dt.int16),
             )
             aggs.append(agg)
         return ibis.union(*aggs).order_by(ibis.asc("pos"))
 
     def describe(
-        self, quantile: Sequence[ir.NumericValue | float] = (0.25, 0.5, 0.75)
+        self, *, quantile: Sequence[ir.NumericValue | float] = (0.25, 0.5, 0.75)
     ) -> Table:
         """Return summary information about a table.
 
@@ -2863,42 +3369,42 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> ibis.options.interactive = True
         >>> p = ibis.examples.penguins.fetch()
         >>> p.describe()
-        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━┓
-        ┃ name              ┃ type    ┃ count ┃ nulls ┃ unique ┃ mode   ┃ … ┃
-        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━┩
-        │ string            │ string  │ int64 │ int64 │ int64  │ string │ … │
-        ├───────────────────┼─────────┼───────┼───────┼────────┼────────┼───┤
-        │ species           │ string  │   344 │     0 │      3 │ Adelie │ … │
-        │ island            │ string  │   344 │     0 │      3 │ Biscoe │ … │
-        │ bill_length_mm    │ float64 │   344 │     2 │    164 │ NULL   │ … │
-        │ bill_depth_mm     │ float64 │   344 │     2 │     80 │ NULL   │ … │
-        │ flipper_length_mm │ int64   │   344 │     2 │     55 │ NULL   │ … │
-        │ body_mass_g       │ int64   │   344 │     2 │     94 │ NULL   │ … │
-        │ sex               │ string  │   344 │    11 │      2 │ male   │ … │
-        │ year              │ int64   │   344 │     0 │      3 │ NULL   │ … │
-        └───────────────────┴─────────┴───────┴───────┴────────┴────────┴───┘
+        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━┓
+        ┃ name              ┃ pos   ┃ type    ┃ count ┃ nulls ┃ unique ┃ mode   ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━┩
+        │ string            │ int16 │ string  │ int64 │ int64 │ int64  │ string │ … │
+        ├───────────────────┼───────┼─────────┼───────┼───────┼────────┼────────┼───┤
+        │ species           │     0 │ string  │   344 │     0 │      3 │ Adelie │ … │
+        │ island            │     1 │ string  │   344 │     0 │      3 │ Biscoe │ … │
+        │ bill_length_mm    │     2 │ float64 │   344 │     2 │    164 │ NULL   │ … │
+        │ bill_depth_mm     │     3 │ float64 │   344 │     2 │     80 │ NULL   │ … │
+        │ flipper_length_mm │     4 │ int64   │   344 │     2 │     55 │ NULL   │ … │
+        │ body_mass_g       │     5 │ int64   │   344 │     2 │     94 │ NULL   │ … │
+        │ sex               │     6 │ string  │   344 │    11 │      2 │ male   │ … │
+        │ year              │     7 │ int64   │   344 │     0 │      3 │ NULL   │ … │
+        └───────────────────┴───────┴─────────┴───────┴───────┴────────┴────────┴───┘
         >>> p.select(s.of_type("numeric")).describe()
-        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━━┳━━━┓
-        ┃ name              ┃ type    ┃ count ┃ nulls ┃ unique ┃ mean        ┃ … ┃
-        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━━╇━━━┩
-        │ string            │ string  │ int64 │ int64 │ int64  │ float64     │ … │
-        ├───────────────────┼─────────┼───────┼───────┼────────┼─────────────┼───┤
-        │ bill_length_mm    │ float64 │   344 │     2 │    164 │   43.921930 │ … │
-        │ bill_depth_mm     │ float64 │   344 │     2 │     80 │   17.151170 │ … │
-        │ flipper_length_mm │ int64   │   344 │     2 │     55 │  200.915205 │ … │
-        │ body_mass_g       │ int64   │   344 │     2 │     94 │ 4201.754386 │ … │
-        │ year              │ int64   │   344 │     0 │      3 │ 2008.029070 │ … │
-        └───────────────────┴─────────┴───────┴───────┴────────┴─────────────┴───┘
+        ┏━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━┓
+        ┃ name              ┃ pos   ┃ type    ┃ count ┃ nulls ┃ unique ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━┩
+        │ string            │ int16 │ string  │ int64 │ int64 │ int64  │ … │
+        ├───────────────────┼───────┼─────────┼───────┼───────┼────────┼───┤
+        │ flipper_length_mm │     2 │ int64   │   344 │     2 │     55 │ … │
+        │ body_mass_g       │     3 │ int64   │   344 │     2 │     94 │ … │
+        │ year              │     4 │ int64   │   344 │     0 │      3 │ … │
+        │ bill_length_mm    │     0 │ float64 │   344 │     2 │    164 │ … │
+        │ bill_depth_mm     │     1 │ float64 │   344 │     2 │     80 │ … │
+        └───────────────────┴───────┴─────────┴───────┴───────┴────────┴───┘
         >>> p.select(s.of_type("string")).describe()
-        ┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
-        ┃ name    ┃ type   ┃ count ┃ nulls ┃ unique ┃ mode   ┃
-        ┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
-        │ string  │ string │ int64 │ int64 │ int64  │ string │
-        ├─────────┼────────┼───────┼───────┼────────┼────────┤
-        │ species │ string │   344 │     0 │      3 │ Adelie │
-        │ island  │ string │   344 │     0 │      3 │ Biscoe │
-        │ sex     │ string │   344 │    11 │      2 │ male   │
-        └─────────┴────────┴───────┴───────┴────────┴────────┘
+        ┏━━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+        ┃ name    ┃ pos   ┃ type   ┃ count ┃ nulls ┃ unique ┃ mode   ┃
+        ┡━━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+        │ string  │ int16 │ string │ int64 │ int64 │ int64  │ string │
+        ├─────────┼───────┼────────┼───────┼───────┼────────┼────────┤
+        │ sex     │     2 │ string │   344 │    11 │      2 │ male   │
+        │ species │     0 │ string │   344 │     0 │      3 │ Adelie │
+        │ island  │     1 │ string │   344 │     0 │      3 │ Biscoe │
+        └─────────┴───────┴────────┴───────┴───────┴────────┴────────┘
         """
         import ibis.selectors as s
         from ibis import literal as lit
@@ -2907,7 +3413,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         aggs = []
         string_col = False
         numeric_col = False
-        for colname in self.columns:
+        for pos, colname in enumerate(self.columns):
             col = self[colname]
             typ = col.type()
 
@@ -2918,7 +3424,7 @@ class Table(Expr, _FixedTextJupyterMixin):
             col_max = lit(None).cast(float)
             col_mode = lit(None).cast(str)
             quantile_values = {
-                f"p{100*q:.6f}".rstrip("0").rstrip("."): lit(None).cast(float)
+                f"p{100 * q:.6f}".rstrip("0").rstrip("."): lit(None).cast(float)
                 for q in quantile
             }
 
@@ -2929,7 +3435,9 @@ class Table(Expr, _FixedTextJupyterMixin):
                 col_min = col.min().cast(float)
                 col_max = col.max().cast(float)
                 quantile_values = {
-                    f"p{100*q:.6f}".rstrip("0").rstrip("."): col.quantile(q).cast(float)
+                    f"p{100 * q:.6f}".rstrip("0").rstrip("."): col.quantile(q).cast(
+                        float
+                    )
                     for q in quantile
                 }
             elif typ.is_string():
@@ -2944,6 +3452,7 @@ class Table(Expr, _FixedTextJupyterMixin):
 
             agg = self.agg(
                 name=lit(colname),
+                pos=lit(pos, type=dt.int16),
                 type=lit(str(typ)),
                 count=col.isnull().count(),
                 nulls=col.isnull().sum(),
@@ -2957,7 +3466,12 @@ class Table(Expr, _FixedTextJupyterMixin):
             )
             aggs.append(agg)
 
-        t = ibis.union(*aggs)
+        names = aggs[0].schema().names
+        new_schema = {
+            name: dt.highest_precedence(types)
+            for name, *types in zip(names, *(agg.schema().types for agg in aggs))
+        }
+        t = ibis.union(*(agg.cast(new_schema) for agg in aggs))
 
         # TODO(jiting): Need a better way to remove columns with all NULL
         if string_col and not numeric_col:
@@ -2968,21 +3482,25 @@ class Table(Expr, _FixedTextJupyterMixin):
         return t
 
     def join(
-        left: Table,
+        self,
         right: Table,
-        predicates: str
-        | Sequence[
+        /,
+        predicates: (
             str
-            | ir.BooleanColumn
-            | Literal[True]
-            | Literal[False]
-            | tuple[
-                str | ir.Column | ir.Deferred,
-                str | ir.Column | ir.Deferred,
+            | Sequence[
+                str
+                | ir.BooleanColumn
+                | Literal[True]
+                | Literal[False]
+                | tuple[
+                    str | ir.Column | ir.Deferred,
+                    str | ir.Column | ir.Deferred,
+                ]
+                | ir.BooleanValue
             ]
-        ] = (),
-        how: JoinKind = "inner",
+        ) = (),
         *,
+        how: JoinKind = "inner",
         lname: str = "",
         rname: str = "{name}_right",
     ) -> Table:
@@ -2990,20 +3508,18 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Parameters
         ----------
-        left
-            Left table to join
         right
             Right table to join
         predicates
             Condition(s) to join on. See examples for details.
         how
-            Join method, e.g. ``"inner"`` or ``"left"``.
+            Join method, e.g. `"inner"` or `"left"`.
         lname
             A format string to use to rename overlapping columns in the left
-            table (e.g. ``"left_{name}"``).
+            table (e.g. `"left_{name}"`).
         rname
             A format string to use to rename overlapping columns in the right
-            table (e.g. ``"right_{name}"``).
+            table (e.g. `"right_{name}"`).
 
         Examples
         --------
@@ -3088,21 +3604,27 @@ class Table(Expr, _FixedTextJupyterMixin):
         └────────┴─────────┴─────────────────┴────────────┘
 
         You can join on multiple columns/conditions by passing in a
-        sequence. Find all instances where a user both tagged and
-        rated a movie:
+        sequence. Show the top 5 users by the number of unique movies that
+        they both rated *and* tagged:
 
-        >>> tags.join(ratings, ["userId", "movieId"]).head(5).order_by("userId")
-        ┏━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━┓
-        ┃ userId ┃ movieId ┃ tag            ┃ timestamp  ┃ rating  ┃
-        ┡━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━┩
-        │ int64  │ int64   │ string         │ int64      │ float64 │
-        ├────────┼─────────┼────────────────┼────────────┼─────────┤
-        │     62 │       2 │ Robin Williams │ 1528843907 │     4.0 │
-        │     62 │     110 │ sword fight    │ 1528152535 │     4.5 │
-        │     62 │     410 │ gothic         │ 1525636609 │     4.5 │
-        │     62 │    2023 │ mafia          │ 1525636733 │     5.0 │
-        │     62 │    2124 │ quirky         │ 1525636846 │     5.0 │
-        └────────┴─────────┴────────────────┴────────────┴─────────┘
+        >>> (
+        ...     tags.join(ratings, ["userId", "movieId"])
+        ...     .group_by(_.userId)
+        ...     .agg(n_rated_and_tagged=_.movieId.nunique())
+        ...     .order_by(_.n_rated_and_tagged.desc())
+        ...     .head(5)
+        ... )
+        ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
+        ┃ userId ┃ n_rated_and_tagged ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┩
+        │ int64  │ int64              │
+        ├────────┼────────────────────┤
+        │    474 │               1149 │
+        │    567 │                109 │
+        │     62 │                 69 │
+        │    477 │                 66 │
+        │    424 │                 58 │
+        └────────┴────────────────────┘
 
         To self-join a table with itself, you need to call
         `.view()` on one of the arguments so the two tables
@@ -3133,26 +3655,27 @@ class Table(Expr, _FixedTextJupyterMixin):
         ┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
         │ int64   │ string            │ int64         │ string            │
         ├─────────┼───────────────────┼───────────────┼───────────────────┤
-        │    1732 │ funny             │         60756 │ funny             │
-        │    1732 │ Highly quotable   │         60756 │ Highly quotable   │
-        │    1732 │ drugs             │        106782 │ drugs             │
-        │    5989 │ Leonardo DiCaprio │        106782 │ Leonardo DiCaprio │
-        │  139385 │ tom hardy         │         89774 │ Tom Hardy         │
+        │   60756 │ funny             │          1732 │ funny             │
+        │   60756 │ Highly quotable   │          1732 │ Highly quotable   │
+        │   89774 │ Tom Hardy         │        139385 │ tom hardy         │
+        │  106782 │ drugs             │          1732 │ drugs             │
+        │  106782 │ Leonardo DiCaprio │          5989 │ Leonardo DiCaprio │
         └─────────┴───────────────────┴───────────────┴───────────────────┘
         """
         from ibis.expr.types.joins import Join
 
-        return Join(left.op()).join(
+        return Join(self.op()).join(
             right, predicates, how=how, lname=lname, rname=rname
         )
 
     def asof_join(
-        left: Table,
+        self,
         right: Table,
+        /,
         on: str | ir.BooleanColumn,
         predicates: str | ir.Column | Sequence[str | ir.Column] = (),
-        tolerance: str | ir.IntervalScalar | None = None,
         *,
+        tolerance: str | ir.IntervalScalar | None = None,
         lname: str = "",
         rname: str = "{name}_right",
     ) -> Table:
@@ -3163,8 +3686,6 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Parameters
         ----------
-        left
-            Table expression
         right
             Table expression
         on
@@ -3175,25 +3696,113 @@ class Table(Expr, _FixedTextJupyterMixin):
             Amount of time to look behind when joining
         lname
             A format string to use to rename overlapping columns in the left
-            table (e.g. ``"left_{name}"``).
+            table (e.g. `"left_{name}"`).
         rname
             A format string to use to rename overlapping columns in the right
-            table (e.g. ``"right_{name}"``).
+            table (e.g. `"right_{name}"`).
 
         Returns
         -------
         Table
             Table expression
+
+        Examples
+        --------
+        >>> from datetime import datetime, timedelta
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> sensors = ibis.memtable(
+        ...     {
+        ...         "site": ["a", "b", "a", "b", "a"],
+        ...         "humidity": [0.3, 0.4, 0.5, 0.6, 0.7],
+        ...         "event_time": [
+        ...             datetime(2024, 11, 16, 12, 0, 15, 500000),
+        ...             datetime(2024, 11, 16, 12, 0, 15, 700000),
+        ...             datetime(2024, 11, 17, 18, 12, 14, 950000),
+        ...             datetime(2024, 11, 17, 18, 12, 15, 120000),
+        ...             datetime(2024, 11, 18, 18, 12, 15, 100000),
+        ...         ],
+        ...     }
+        ... )
+        >>> events = ibis.memtable(
+        ...     {
+        ...         "site": ["a", "b", "a"],
+        ...         "event_type": [
+        ...             "cloud coverage",
+        ...             "rain start",
+        ...             "rain stop",
+        ...         ],
+        ...         "event_time": [
+        ...             datetime(2024, 11, 16, 12, 0, 15, 400000),
+        ...             datetime(2024, 11, 17, 18, 12, 15, 100000),
+        ...             datetime(2024, 11, 18, 18, 12, 15, 100000),
+        ...         ],
+        ...     }
+        ... )
+
+        This setup simulates time-series data by pairing irregularly collected sensor
+        readings with weather events, enabling analysis of environmental conditions
+        before each event. We will use the `asof_join` method to match each event with
+        the most recent prior sensor reading from the sensors table at the same site.
+
+        >>> sensors
+        ┏━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ site   ┃ humidity ┃ event_time              ┃
+        ┡━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string │ float64  │ timestamp               │
+        ├────────┼──────────┼─────────────────────────┤
+        │ a      │      0.3 │ 2024-11-16 12:00:15.500 │
+        │ b      │      0.4 │ 2024-11-16 12:00:15.700 │
+        │ a      │      0.5 │ 2024-11-17 18:12:14.950 │
+        │ b      │      0.6 │ 2024-11-17 18:12:15.120 │
+        │ a      │      0.7 │ 2024-11-18 18:12:15.100 │
+        └────────┴──────────┴─────────────────────────┘
+        >>> events
+        ┏━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ site   ┃ event_type     ┃ event_time              ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string │ string         │ timestamp               │
+        ├────────┼────────────────┼─────────────────────────┤
+        │ a      │ cloud coverage │ 2024-11-16 12:00:15.400 │
+        │ b      │ rain start     │ 2024-11-17 18:12:15.100 │
+        │ a      │ rain stop      │ 2024-11-18 18:12:15.100 │
+        └────────┴────────────────┴─────────────────────────┘
+
+        We can find the closest event to each sensor reading with a 1 second tolerance.
+        Using the "site" column as a join predicate ensures we only match events that
+        occurred at or near the same site as the sensor reading.
+
+        >>> tolerance = timedelta(seconds=1)
+        >>> sensors.asof_join(events, on="event_time", predicates="site", tolerance=tolerance).drop(
+        ...     "event_time_right"
+        ... ).order_by("event_time")
+        ┏━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+        ┃ site   ┃ humidity ┃ event_time              ┃ site_right ┃ event_type     ┃
+        ┡━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+        │ string │ float64  │ timestamp               │ string     │ string         │
+        ├────────┼──────────┼─────────────────────────┼────────────┼────────────────┤
+        │ a      │      0.3 │ 2024-11-16 12:00:15.500 │ a          │ cloud coverage │
+        │ b      │      0.4 │ 2024-11-16 12:00:15.700 │ NULL       │ NULL           │
+        │ a      │      0.5 │ 2024-11-17 18:12:14.950 │ NULL       │ NULL           │
+        │ b      │      0.6 │ 2024-11-17 18:12:15.120 │ b          │ rain start     │
+        │ a      │      0.7 │ 2024-11-18 18:12:15.100 │ a          │ rain stop      │
+        └────────┴──────────┴─────────────────────────┴────────────┴────────────────┘
         """
         from ibis.expr.types.joins import Join
 
-        return Join(left.op()).asof_join(
-            right, on, predicates, tolerance=tolerance, lname=lname, rname=rname
+        return Join(self.op()).asof_join(
+            right,
+            on=on,
+            predicates=predicates,
+            tolerance=tolerance,
+            lname=lname,
+            rname=rname,
         )
 
     def cross_join(
-        left: Table,
+        self,
         right: Table,
+        /,
         *rest: Table,
         lname: str = "",
         rname: str = "{name}_right",
@@ -3202,18 +3811,16 @@ class Table(Expr, _FixedTextJupyterMixin):
 
         Parameters
         ----------
-        left
-            Left table
         right
             Right table
         rest
             Additional tables to cross join
         lname
             A format string to use to rename overlapping columns in the left
-            table (e.g. ``"left_{name}"``).
+            table (e.g. `"left_{name}"`).
         rname
             A format string to use to rename overlapping columns in the right
-            table (e.g. ``"right_{name}"``).
+            table (e.g. `"right_{name}"`).
 
         Returns
         -------
@@ -3228,7 +3835,9 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> ibis.options.interactive = True
         >>> t = ibis.examples.penguins.fetch()
         >>> t.count()
-        344
+        ┌─────┐
+        │ 344 │
+        └─────┘
         >>> agg = t.drop("year").agg(s.across(s.numeric(), _.mean()))
         >>> expr = t.cross_join(agg)
         >>> expr
@@ -3250,7 +3859,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ …       │ …         │              … │             … │                 … │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
         >>> expr.columns
-        ['species',
+        ('species',
          'island',
          'bill_length_mm',
          'bill_depth_mm',
@@ -3261,13 +3870,15 @@ class Table(Expr, _FixedTextJupyterMixin):
          'bill_length_mm_right',
          'bill_depth_mm_right',
          'flipper_length_mm_right',
-         'body_mass_g_right']
+         'body_mass_g_right')
         >>> expr.count()
-        344
+        ┌─────┐
+        │ 344 │
+        └─────┘
         """
         from ibis.expr.types.joins import Join
 
-        return Join(left.op()).cross_join(right, *rest, lname=lname, rname=rname)
+        return Join(self.op()).cross_join(right, *rest, lname=lname, rname=rname)
 
     inner_join = _regular_join_method("inner_join", "inner")
     left_join = _regular_join_method("left_join", "left")
@@ -3278,7 +3889,7 @@ class Table(Expr, _FixedTextJupyterMixin):
     any_inner_join = _regular_join_method("any_inner_join", "any_inner")
     any_left_join = _regular_join_method("any_left_join", "any_left")
 
-    def alias(self, alias: str) -> ir.Table:
+    def alias(self, alias: str, /) -> ir.Table:
         """Create a table expression with a specific name `alias`.
 
         This method is useful for exposing an ibis expression to the underlying
@@ -3323,10 +3934,9 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
         """
-        expr = ops.View(child=self, name=alias).to_expr()
-        return expr
+        return ops.View(child=self, name=alias).to_expr()
 
-    def sql(self, query: str, dialect: str | None = None) -> ir.Table:
+    def sql(self, query: str, /, *, dialect: str | None = None) -> ir.Table:
         '''Run a SQL query against a table expression.
 
         Parameters
@@ -3425,27 +4035,45 @@ class Table(Expr, _FixedTextJupyterMixin):
             name = util.gen_name("sql_query")
             expr = self
 
-        schema = backend._get_sql_string_view_schema(name, expr, query)
+        schema = backend._get_sql_string_view_schema(name=name, table=expr, query=query)
         node = ops.SQLStringView(child=self.op(), query=query, schema=schema)
         return node.to_expr()
 
-    def to_pandas(self, **kwargs) -> pd.DataFrame:
+    def to_pandas(
+        self,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
         """Convert a table expression to a pandas DataFrame.
 
         Parameters
         ----------
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            no limit. The default is in `ibis/config.py`.
         kwargs
-            Same as keyword arguments to [`execute`](./expression-generic.qmd#ibis.expr.types.core.Expr.execute)
+            Keyword arguments
+
+        Returns
+        -------
+        DataFrame
+            The result of executing the expression as a pandas DataFrame
         """
-        return self.execute(**kwargs)
+        return self.execute(params=params, limit=limit, **kwargs)
 
     def cache(self) -> Table:
         """Cache the provided expression.
 
         All subsequent operations on the returned expression will be performed
-        on the cached data. Use the
+        on the cached data. The lifetime of the cached table is tied to its
+        python references (ie. it is released once the last reference to it is
+        garbage collected). Alternatively, use the
         [`with`](https://docs.python.org/3/reference/compound_stmts.html#with)
-        statement to limit the lifetime of a cached table.
+        statement or call the `.release()` method for more control.
 
         This method is idempotent: calling it multiple times in succession will
         return the same value as the first call.
@@ -3511,17 +4139,18 @@ class Table(Expr, _FixedTextJupyterMixin):
         └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
         """
         current_backend = self._find_backend(use_default=True)
-        return current_backend._cached(self)
+        return current_backend._cached_table(self)
 
     def pivot_longer(
         self,
         col: str | s.Selector,
+        /,
         *,
         names_to: str | Iterable[str] = "name",
         names_pattern: str | re.Pattern = r"(.+)",
-        names_transform: Callable[[str], ir.Value]
-        | Mapping[str, Callable[[str], ir.Value]]
-        | None = None,
+        names_transform: (
+            Callable[[str], ir.Value] | Mapping[str, Callable[[str], ir.Value]] | None
+        ) = None,
         values_to: str = "value",
         values_transform: Callable[[ir.Value], ir.Value] | Deferred | None = None,
     ) -> Table:
@@ -3582,7 +4211,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         Here we convert column names not matching the selector for the `religion` column
         and convert those names into values
 
-        >>> relig_income.pivot_longer(~s.c("religion"), names_to="income", values_to="count")
+        >>> relig_income.pivot_longer(~s.cols("religion"), names_to="income", values_to="count")
         ┏━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
         ┃ religion ┃ income             ┃ count ┃
         ┡━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
@@ -3630,7 +4259,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ ABW     │ SP.URB.TOTL │ 2004   │ 42317.0 │
         └─────────┴─────────────┴────────┴─────────┘
 
-        `pivot_longer` has some preprocessing capabiltiies like stripping a prefix and applying
+        `pivot_longer` has some preprocessing capabilities like stripping a prefix and applying
         a function to column names
 
         >>> billboard = ibis.examples.billboard.fetch()
@@ -3659,7 +4288,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         ...     names_transform=int,
         ...     values_to="rank",
         ...     values_transform=_.cast("int"),
-        ... ).dropna("rank")
+        ... ).drop_null("rank")
         ┏━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━┳━━━━━━━┓
         ┃ artist  ┃ track                   ┃ date_entered ┃ week ┃ rank  ┃
         ┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━╇━━━━━━━┩
@@ -3703,7 +4332,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> len(who.columns)
         60
         >>> who.pivot_longer(
-        ...     s.r["new_sp_m014":"newrel_f65"],
+        ...     s.index["new_sp_m014":"newrel_f65"],
         ...     names_to=["diagnosis", "gender", "age"],
         ...     names_pattern="new_?(.*)_(.)(.*)",
         ...     values_to="count",
@@ -3734,7 +4363,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         Let's recode gender and age to numeric values using a mapping
 
         >>> who.pivot_longer(
-        ...     s.r["new_sp_m014":"newrel_f65"],
+        ...     s.index["new_sp_m014":"newrel_f65"],
         ...     names_to=["diagnosis", "gender", "age"],
         ...     names_pattern="new_?(.*)_(.)(.*)",
         ...     names_transform=dict(
@@ -3769,7 +4398,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         The number of match groups in `names_pattern` must match the length of `names_to`
 
         >>> who.pivot_longer(  # quartodoc: +EXPECTED_FAILURE
-        ...     s.r["new_sp_m014":"newrel_f65"],
+        ...     s.index["new_sp_m014":"newrel_f65"],
         ...     names_to=["diagnosis", "gender", "age"],
         ...     names_pattern="new_?(.*)_.(.*)",
         ... )
@@ -3780,7 +4409,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         `names_transform` must be a mapping or callable
 
         >>> who.pivot_longer(
-        ...     s.r["new_sp_m014":"newrel_f65"], names_transform="upper"
+        ...     s.index["new_sp_m014":"newrel_f65"], names_transform="upper"
         ... )  # quartodoc: +EXPECTED_FAILURE
         Traceback (most recent call last):
           ...
@@ -3944,6 +4573,27 @@ class Table(Expr, _FixedTextJupyterMixin):
         │  4854 │       1 │     1 │   NULL │  NULL │    NULL │  NULL │  NULL │ … │
         │     … │       … │     … │      … │     … │       … │     … │     … │ … │
         └───────┴─────────┴───────┴────────┴───────┴─────────┴───────┴───────┴───┘
+
+        You can do simple transpose-like operations using `pivot_wider`
+
+        >>> t = ibis.memtable(dict(outcome=["yes", "no"], counted=[3, 4]))
+        >>> t
+        ┏━━━━━━━━━┳━━━━━━━━━┓
+        ┃ outcome ┃ counted ┃
+        ┡━━━━━━━━━╇━━━━━━━━━┩
+        │ string  │ int64   │
+        ├─────────┼─────────┤
+        │ yes     │       3 │
+        │ no      │       4 │
+        └─────────┴─────────┘
+        >>> t.pivot_wider(names_from="outcome", values_from="counted", names_sort=True)
+        ┏━━━━━━━┳━━━━━━━┓
+        ┃ no    ┃ yes   ┃
+        ┡━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64 │
+        ├───────┼───────┤
+        │     4 │     3 │
+        └───────┴───────┘
 
         Fill missing pivoted values using `values_fill`
 
@@ -4214,8 +4864,6 @@ class Table(Expr, _FixedTextJupyterMixin):
         │     … │        … │        … │        … │
         └───────┴──────────┴──────────┴──────────┘
         """
-        import pandas as pd
-
         import ibis.selectors as s
         from ibis.expr.rewrites import _, p, x
 
@@ -4237,23 +4885,25 @@ class Table(Expr, _FixedTextJupyterMixin):
         if names is None:
             # no names provided, compute them from the data
             names = self.select(names_from).distinct().execute()
+            columns = names.columns.tolist()
+            names = list(names.itertuples(index=False))
         else:
             if not (columns := [col.get_name() for col in names_from.expand(self)]):
                 raise com.IbisInputError(
                     f"No matching names columns in `names_from`: {orig_names_from}"
                 )
-            names = pd.DataFrame(list(map(util.promote_list, names)), columns=columns)
+            names = list(map(tuple, map(util.promote_list, names)))
 
         if names_sort:
-            names = names.sort_values(by=names.columns.tolist())
+            names.sort()
 
         values_cols = values_from.expand(self)
         more_than_one_value = len(values_cols) > 1
         aggs = {}
 
-        names_cols_exprs = [self[col] for col in names.columns]
+        names_cols_exprs = [self[col] for col in columns]
 
-        for keys in names.itertuples(index=False):
+        for keys in names:
             where = ibis.and_(*map(operator.eq, names_cols_exprs, keys))
 
             for values_col in values_cols:
@@ -4281,7 +4931,13 @@ class Table(Expr, _FixedTextJupyterMixin):
                 key = names_sep.join(filter(None, key_components))
                 aggs[key] = arg if values_fill is None else arg.coalesce(values_fill)
 
-        return self.group_by(id_cols).aggregate(**aggs)
+        grouping_keys = id_cols.expand(self)
+
+        # no id columns, so do an ungrouped aggregation
+        if not grouping_keys:
+            return self.aggregate(**aggs)
+
+        return self.group_by(*grouping_keys).aggregate(**aggs)
 
     def relocate(
         self,
@@ -4387,14 +5043,6 @@ class Table(Expr, _FixedTextJupyterMixin):
         ├────────┼────────┼────────┼───────┼───────┼───────┤
         │ a      │ a      │ a      │     1 │     1 │     1 │
         └────────┴────────┴────────┴───────┴───────┴───────┘
-        >>> t.relocate(s.any_of(s.c(*"ae")))
-        ┏━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
-        ┃ a     ┃ e      ┃ b     ┃ c     ┃ d      ┃ f      ┃
-        ┡━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
-        │ int64 │ string │ int64 │ int64 │ string │ string │
-        ├───────┼────────┼───────┼───────┼────────┼────────┤
-        │     1 │ a      │     1 │     1 │ a      │ a      │
-        └───────┴────────┴───────┴───────┴────────┴────────┘
 
         When multiple columns are selected with `before` or `after`, those
         selected columns are moved before and after the `selectors` input
@@ -4444,8 +5092,6 @@ class Table(Expr, _FixedTextJupyterMixin):
         │ a      │ a      │     1 │     1 │
         └────────┴────────┴───────┴───────┘
         """
-        import ibis.selectors as s
-
         if not columns and before is None and after is None and not kwargs:
             raise com.IbisInputError(
                 "At least one selector or `before` or `after` must be provided"
@@ -4455,79 +5101,395 @@ class Table(Expr, _FixedTextJupyterMixin):
             raise com.IbisInputError("Cannot specify both `before` and `after`")
 
         sels = {}
-        table_columns = self.columns
 
-        for name, sel in itertools.chain(
-            zip(itertools.repeat(None), map(s._to_selector, columns)),
-            zip(kwargs.keys(), map(s._to_selector, kwargs.values())),
+        schema = self.schema()
+        positions = schema._name_locs
+
+        for new_name, expr in itertools.zip_longest(
+            kwargs.keys(), self._fast_bind(*kwargs.values(), *columns)
         ):
-            for pos in sel.positions(self):
-                renamed = name is not None
-                if pos in sels and renamed:
-                    # **only when renaming**: make sure the last duplicate
-                    # column wins by reinserting the position if it already
-                    # exists
-                    del sels[pos]
-                sels[pos] = name if renamed else table_columns[pos]
+            expr_name = expr.get_name()
+            pos = positions[expr_name]
+            renamed = new_name is not None
+            if renamed and pos in sels:
+                # **only when renaming**: make sure the last duplicate
+                # column wins by reinserting the position if it already
+                # exists
+                #
+                # to do that, we first delete the existing one, which causes
+                # the subsequent insertion to be at the end
+                del sels[pos]
+            sels[pos] = new_name if renamed else expr_name
 
-        ncols = len(table_columns)
+        ncols = len(schema)
 
         if before is not None:
-            where = min(s._to_selector(before).positions(self), default=0)
+            where = min(
+                (positions[expr.get_name()] for expr in self._fast_bind(before)),
+                default=0,
+            )
         elif after is not None:
-            where = max(s._to_selector(after).positions(self), default=ncols - 1) + 1
+            where = (
+                max(
+                    (positions[expr.get_name()] for expr in self._fast_bind(after)),
+                    default=ncols - 1,
+                )
+                + 1
+            )
         else:
             assert before is None and after is None
             where = 0
 
-        # all columns that should come BEFORE the matched selectors
-        front = [self[left] for left in range(where) if left not in sels]
+        columns = schema.names
 
-        # all columns that should come AFTER the matched selectors
-        back = [self[right] for right in range(where, ncols) if right not in sels]
+        fields = self.op().fields
+
+        # all columns that should come BEFORE the matched selectors
+        exprs = {
+            name: fields[name]
+            for name in (columns[left] for left in range(where) if left not in sels)
+        }
 
         # selected columns
-        middle = [self[i].name(name) for i, name in sels.items()]
+        exprs.update((name, fields[columns[i]]) for i, name in sels.items())
 
-        relocated = self.select(*front, *middle, *back)
+        # all columns that should come AFTER the matched selectors
+        exprs.update(
+            (name, fields[name])
+            for name in (
+                columns[right] for right in range(where, ncols) if right not in sels
+            )
+        )
 
-        assert len(relocated.columns) == ncols
+        return ops.Project(self, exprs).to_expr()
 
-        return relocated
+    def window_by(self, time_col: str | ir.Value, /) -> WindowedTable:
+        from ibis.expr.types.temporal_windows import WindowedTable
 
-    def window_by(self, time_col: ir.Value) -> WindowedTable:
-        """Create a windowing table-valued function (TVF) expression.
+        time_col = next(self.bind(time_col))
 
-        Windowing table-valued functions (TVF) assign rows of a table to windows
-        based on a time attribute column in the table.
+        # validate time_col is a timestamp column
+        if not isinstance(time_col, TimestampColumn):
+            raise com.IbisInputError(
+                f"`time_col` must be a timestamp column, got {time_col.type()}"
+            )
+
+        return WindowedTable(self, time_col)
+
+    def value_counts(self, *, name: str | None = None) -> ir.Table:
+        """Compute a frequency table of this table's values.
+
+        ::: {.callout-note title="Changed in version 10.0.0"}
+        Added `name` parameter.
+        :::
 
         Parameters
         ----------
-        time_col
-            Column of the table that will be mapped to windows.
+        name
+            The name to use for the frequency column.
+            If not provided, a suitable name will be generated.
 
         Returns
         -------
-        WindowedTable
-            WindowedTable expression.
-        """
-        from ibis.expr.types.temporal_windows import WindowedTable
+        Table
+            Frequency table of this table's values.
 
-        return WindowedTable(self, time_col)
+        See Also
+        --------
+        [`Table.topk`](./expression-tables.qmd#ibis.expr.types.relations.Table.topk)
+        [`Column.value_counts`](./expression-generic.qmd#ibis.expr.types.generic.Column.value_counts)
+        [`Column.topk`](./expression-generic.qmd#ibis.expr.types.generic.Column.topk)
+
+        Examples
+        --------
+        >>> from ibis import examples
+        >>> ibis.options.interactive = True
+        >>> t = examples.penguins.fetch()
+        >>> t.head()
+        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
+        ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
+        │ string  │ string    │ float64        │ float64       │ int64             │ … │
+        ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
+        │ Adelie  │ Torgersen │           39.1 │          18.7 │               181 │ … │
+        │ Adelie  │ Torgersen │           39.5 │          17.4 │               186 │ … │
+        │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
+        │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
+        │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
+        └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
+        >>> t.year.value_counts(name="n").order_by("year")
+        ┏━━━━━━━┳━━━━━━━┓
+        ┃ year  ┃ n     ┃
+        ┡━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64 │
+        ├───────┼───────┤
+        │  2007 │   110 │
+        │  2008 │   114 │
+        │  2009 │   120 │
+        └───────┴───────┘
+        >>> t[["year", "island"]].value_counts().order_by("year", "island")
+        ┏━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+        ┃ year  ┃ island    ┃ year_island_count ┃
+        ┡━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+        │ int64 │ string    │ int64             │
+        ├───────┼───────────┼───────────────────┤
+        │  2007 │ Biscoe    │                44 │
+        │  2007 │ Dream     │                46 │
+        │  2007 │ Torgersen │                20 │
+        │  2008 │ Biscoe    │                64 │
+        │  2008 │ Dream     │                34 │
+        │  2008 │ Torgersen │                16 │
+        │  2009 │ Biscoe    │                60 │
+        │  2009 │ Dream     │                44 │
+        │  2009 │ Torgersen │                16 │
+        └───────┴───────────┴───────────────────┘
+        """
+        columns = self.columns
+        if name is None:
+            name = "_".join(columns) + "_count"
+        return self.group_by(columns).agg(lambda t: t.count().name(name))
+
+    def topk(self, k: int | None = None, *, name: str | None = None) -> ir.Table:
+        """Get the most frequent values of this table.
+
+        Parameters
+        ----------
+        k
+            Number of top values to return.
+            If `None`, all values are returned in descending order.
+        name
+            The name to use for the frequency column.
+            If not provided, a suitable name will be generated.
+
+        Returns
+        -------
+        Table
+            Frequency table of this table's values.
+
+        See Also
+        --------
+        [`Table.value_counts`](./expression-tables.qmd#ibis.expr.types.relations.Table.value_counts)
+        [`Column.topk`](./expression-generic.qmd#ibis.expr.types.generic.Column.topk)
+        [`Column.value_counts`](./expression-generic.qmd#ibis.expr.types.generic.Column.value_counts)
+
+        Examples
+        --------
+        >>> from ibis import examples, selectors as s
+        >>> ibis.options.interactive = True
+        >>> t = examples.penguins.fetch().select("species", "island", "sex", "year")
+        >>> t.head()
+        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┓
+        ┃ species ┃ island    ┃ sex    ┃ year  ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━┩
+        │ string  │ string    │ string │ int64 │
+        ├─────────┼───────────┼────────┼───────┤
+        │ Adelie  │ Torgersen │ male   │  2007 │
+        │ Adelie  │ Torgersen │ female │  2007 │
+        │ Adelie  │ Torgersen │ female │  2007 │
+        │ Adelie  │ Torgersen │ NULL   │  2007 │
+        │ Adelie  │ Torgersen │ female │  2007 │
+        └─────────┴───────────┴────────┴───────┘
+        >>> t.topk().order_by(ibis.desc("species_island_sex_year_count"), s.all() & ~s.index[-1])
+        ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ species   ┃ island ┃ sex    ┃ year  ┃ species_island_sex_year_count ┃
+        ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string    │ string │ string │ int64 │ int64                         │
+        ├───────────┼────────┼────────┼───────┼───────────────────────────────┤
+        │ Gentoo    │ Biscoe │ male   │  2008 │                            23 │
+        │ Gentoo    │ Biscoe │ female │  2008 │                            22 │
+        │ Gentoo    │ Biscoe │ male   │  2009 │                            21 │
+        │ Gentoo    │ Biscoe │ female │  2009 │                            20 │
+        │ Gentoo    │ Biscoe │ male   │  2007 │                            17 │
+        │ Gentoo    │ Biscoe │ female │  2007 │                            16 │
+        │ Chinstrap │ Dream  │ female │  2007 │                            13 │
+        │ Chinstrap │ Dream  │ male   │  2007 │                            13 │
+        │ Chinstrap │ Dream  │ female │  2009 │                            12 │
+        │ Chinstrap │ Dream  │ male   │  2009 │                            12 │
+        │ …         │ …      │ …      │     … │                             … │
+        └───────────┴────────┴────────┴───────┴───────────────────────────────┘
+        >>> t.topk(3, name="n")
+        ┏━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+        ┃ species ┃ island ┃ sex    ┃ year  ┃ n     ┃
+        ┡━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+        │ string  │ string │ string │ int64 │ int64 │
+        ├─────────┼────────┼────────┼───────┼───────┤
+        │ Gentoo  │ Biscoe │ male   │  2008 │    23 │
+        │ Gentoo  │ Biscoe │ female │  2008 │    22 │
+        │ Gentoo  │ Biscoe │ male   │  2009 │    21 │
+        └─────────┴────────┴────────┴───────┴───────┘
+        """
+        columns = self.columns
+        if name is None:
+            name = "_".join(columns) + "_count"
+        in_desc = (
+            self.group_by(columns)
+            .agg(lambda t: t.count().name(name))
+            .order_by(ibis.desc(name))
+        )
+        if k is not None:
+            in_desc = in_desc.limit(k)
+        return in_desc
+
+    def unnest(
+        self, column, /, *, offset: str | None = None, keep_empty: bool = False
+    ) -> Table:
+        """Unnest an array `column` from a table.
+
+        When unnesting an existing column the newly unnested column replaces
+        the existing column.
+
+        Parameters
+        ----------
+        column
+            Array column to unnest.
+        offset
+            Name of the resulting index column.
+        keep_empty
+            Keep empty array values as `NULL` in the output table, as well as
+            existing `NULL` values.
+
+        Returns
+        -------
+        Table
+            Table with the array column `column` unnested.
+
+        See Also
+        --------
+        [`ArrayValue.unnest`](./expression-collections.qmd#ibis.expr.types.arrays.ArrayValue.unnest)
+
+        Examples
+        --------
+        >>> import ibis
+        >>> from ibis import _
+        >>> ibis.options.interactive = True
+
+        Construct a table expression with an array column.
+
+        >>> t = ibis.memtable({"x": [[1, 2], [], None, [3, 4, 5]], "y": [1, 2, 3, 4]})
+        >>> t
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ x                    ┃ y     ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+        │ array<int64>         │ int64 │
+        ├──────────────────────┼───────┤
+        │ [1, 2]               │     1 │
+        │ []                   │     2 │
+        │ NULL                 │     3 │
+        │ [3, 4, ... +1]       │     4 │
+        └──────────────────────┴───────┘
+
+        Unnest the array column `x`, replacing the **existing** `x` column.
+
+        >>> t.unnest("x").order_by(_.x)
+        ┏━━━━━━━┳━━━━━━━┓
+        ┃ x     ┃ y     ┃
+        ┡━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64 │
+        ├───────┼───────┤
+        │     1 │     1 │
+        │     2 │     1 │
+        │     3 │     4 │
+        │     4 │     4 │
+        │     5 │     4 │
+        └───────┴───────┘
+
+        Unnest the array column `x` with an offset. The `offset` parameter is
+        the name of the resulting index column.
+
+        >>> t.unnest(t.x, offset="idx").order_by(_.x)
+        ┏━━━━━━━┳━━━━━━━┳━━━━━━━┓
+        ┃ x     ┃ y     ┃ idx   ┃
+        ┡━━━━━━━╇━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64 │ int64 │
+        ├───────┼───────┼───────┤
+        │     1 │     1 │     0 │
+        │     2 │     1 │     1 │
+        │     3 │     4 │     0 │
+        │     4 │     4 │     1 │
+        │     5 │     4 │     2 │
+        └───────┴───────┴───────┘
+
+        Unnest the array column `x` keep empty array values as `NULL` in the
+        output table.
+
+        >>> t.unnest(_.x, offset="idx", keep_empty=True).order_by(_.x, _.y)
+        ┏━━━━━━━┳━━━━━━━┳━━━━━━━┓
+        ┃ x     ┃ y     ┃ idx   ┃
+        ┡━━━━━━━╇━━━━━━━╇━━━━━━━┩
+        │ int64 │ int64 │ int64 │
+        ├───────┼───────┼───────┤
+        │     1 │     1 │     0 │
+        │     2 │     1 │     1 │
+        │     3 │     4 │     0 │
+        │     4 │     4 │     1 │
+        │     5 │     4 │     2 │
+        │  NULL │     2 │  NULL │
+        │  NULL │     3 │  NULL │
+        └───────┴───────┴───────┘
+
+        If you need to preserve the row order of the preserved empty arrays or
+        null values use
+        [`row_number`](./expression-tables.qmd#ibis.row_number) to
+        create an index column before calling `unnest`.
+
+        >>> (
+        ...     t.mutate(original_row=ibis.row_number())
+        ...     .unnest("x", offset="idx", keep_empty=True)
+        ...     .relocate("original_row")
+        ...     .order_by("original_row", "idx")
+        ... )
+        ┏━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┓
+        ┃ original_row ┃ x     ┃ y     ┃ idx   ┃
+        ┡━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━┩
+        │ int64        │ int64 │ int64 │ int64 │
+        ├──────────────┼───────┼───────┼───────┤
+        │            0 │     1 │     1 │     0 │
+        │            0 │     2 │     1 │     1 │
+        │            1 │  NULL │     2 │  NULL │
+        │            2 │  NULL │     3 │  NULL │
+        │            3 │     3 │     4 │     0 │
+        │            3 │     4 │     4 │     1 │
+        │            3 │     5 │     4 │     2 │
+        └──────────────┴───────┴───────┴───────┘
+
+        You can also unnest more complex expressions, and the resulting column
+        will be projected as the last expression in the result.
+
+        >>> t.unnest(_.x.map(lambda v: v + 1).name("plus_one")).order_by(_.plus_one)
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━━┓
+        ┃ x                    ┃ y     ┃ plus_one ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━━┩
+        │ array<int64>         │ int64 │ int64    │
+        ├──────────────────────┼───────┼──────────┤
+        │ [1, 2]               │     1 │        2 │
+        │ [1, 2]               │     1 │        3 │
+        │ [3, 4, ... +1]       │     4 │        4 │
+        │ [3, 4, ... +1]       │     4 │        5 │
+        │ [3, 4, ... +1]       │     4 │        6 │
+        └──────────────────────┴───────┴──────────┘
+        """
+        (column,) = self.bind(column)
+        return ops.TableUnnest(
+            parent=self,
+            column=column,
+            column_name=column.get_name(),
+            offset=offset,
+            keep_empty=keep_empty,
+        ).to_expr()
 
 
 @public
 class CachedTable(Table):
-    def __exit__(self, *_):
+    def __exit__(self, *_) -> None:
         self.release()
 
-    def __enter__(self):
+    def __enter__(self) -> CachedTable:
         return self
 
-    def release(self):
+    def release(self) -> None:
         """Release the underlying expression from the cache."""
         current_backend = self._find_backend(use_default=True)
-        return current_backend._release_cached(self)
+        return current_backend._finalize_cached_table(self.op().name)
 
 
 public(Table=Table, CachedTable=CachedTable)

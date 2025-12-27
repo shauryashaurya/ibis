@@ -1,3 +1,5 @@
+"""Reduction operations."""
+
 from __future__ import annotations
 
 from typing import Literal, Optional
@@ -7,13 +9,17 @@ from public import public
 import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
-from ibis.common.annotations import attribute
+from ibis.common.annotations import ValidationError, attribute
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Column, Value
-from ibis.expr.operations.relations import Relation  # noqa: TCH001
+from ibis.expr.operations.relations import Relation  # noqa: TC001
+from ibis.expr.operations.sortkeys import SortKey  # noqa: TC001
 
 
 @public
 class Reduction(Value):
+    """Base class for reduction operations."""
+
     shape = ds.scalar
 
 
@@ -24,6 +30,8 @@ class Filterable(Value):
 
 @public
 class Count(Filterable, Reduction):
+    """Count the number of non-null elements of a column."""
+
     arg: Column[dt.Any]
 
     dtype = dt.int64
@@ -31,6 +39,8 @@ class Count(Filterable, Reduction):
 
 @public
 class CountStar(Filterable, Reduction):
+    """Count the number of rows of a relation."""
+
     arg: Relation
 
     dtype = dt.int64
@@ -42,6 +52,8 @@ class CountStar(Filterable, Reduction):
 
 @public
 class CountDistinctStar(Filterable, Reduction):
+    """Count the number of distinct rows of a relation."""
+
     arg: Relation
 
     dtype = dt.int64
@@ -68,6 +80,8 @@ class First(Filterable, Reduction):
     """Retrieve the first element."""
 
     arg: Column[dt.Any]
+    order_by: VarTuple[SortKey] = ()
+    include_null: bool = False
 
     dtype = rlz.dtype_like("arg")
 
@@ -77,6 +91,8 @@ class Last(Filterable, Reduction):
     """Retrieve the last element."""
 
     arg: Column[dt.Any]
+    order_by: VarTuple[SortKey] = ()
+    include_null: bool = False
 
     dtype = rlz.dtype_like("arg")
 
@@ -89,8 +105,8 @@ class BitAnd(Filterable, Reduction):
 
     This can be used to determine which bit flags are set on all elements.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_AND`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_and)
     * MySQL [`BIT_AND`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-and)
     """
@@ -107,8 +123,8 @@ class BitOr(Filterable, Reduction):
     All elements in an integer column are ORed together. This can be used
     to determine which bit flags are set on any element.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_OR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_or)
     * MySQL [`BIT_OR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-or)
     """
@@ -125,8 +141,8 @@ class BitXor(Filterable, Reduction):
     All elements in an integer column are XORed together. This can be used
     as a parity checksum of element values.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_XOR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_xor)
     * MySQL [`BIT_XOR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-xor)
     """
@@ -138,6 +154,8 @@ class BitXor(Filterable, Reduction):
 
 @public
 class Sum(Filterable, Reduction):
+    """Compute the sum of a column."""
+
     arg: Column[dt.Numeric | dt.Boolean]
 
     @attribute
@@ -164,6 +182,8 @@ class Sum(Filterable, Reduction):
 
 @public
 class Mean(Filterable, Reduction):
+    """Compute the mean of a column."""
+
     arg: Column[dt.Numeric | dt.Boolean]
 
     @attribute
@@ -187,16 +207,32 @@ class QuantileBase(Filterable, Reduction):
 
 @public
 class Median(QuantileBase):
-    pass
+    """Compute the median of a column."""
+
+
+@public
+class ApproxMedian(Median):
+    """Compute the approximate median of a column."""
 
 
 @public
 class Quantile(QuantileBase):
+    """Compute the quantile of a column."""
+
     quantile: Value[dt.Numeric]
 
 
 @public
+class ApproxQuantile(Quantile):
+    """Compute the approximate quantile of a column."""
+
+    arg: Column[dt.Numeric]
+
+
+@public
 class MultiQuantile(Filterable, Reduction):
+    """Compute multiple quantiles of a column."""
+
     arg: Column
     quantile: Value[dt.Array[dt.Numeric]]
 
@@ -209,7 +245,15 @@ class MultiQuantile(Filterable, Reduction):
 
 
 @public
+class ApproxMultiQuantile(MultiQuantile):
+    """Compute multiple approximate quantiles of a column."""
+
+    arg: Column[dt.Numeric]
+
+
 class VarianceBase(Filterable, Reduction):
+    """Base class for variance and standard deviation."""
+
     arg: Column[dt.Numeric | dt.Boolean]
     how: Literal["sample", "pop"]
 
@@ -223,17 +267,17 @@ class VarianceBase(Filterable, Reduction):
 
 @public
 class StandardDev(VarianceBase):
-    pass
+    """Compute the standard deviation of a column."""
 
 
 @public
 class Variance(VarianceBase):
-    pass
+    """Compute the variance of a column."""
 
 
 @public
 class Correlation(Filterable, Reduction):
-    """Coefficient of correlation of a set of number pairs."""
+    """Correlation coefficient of two columns."""
 
     left: Column[dt.Numeric | dt.Boolean]
     right: Column[dt.Numeric | dt.Boolean]
@@ -244,7 +288,7 @@ class Correlation(Filterable, Reduction):
 
 @public
 class Covariance(Filterable, Reduction):
-    """Covariance of a set of number pairs."""
+    """Covariance of two columns."""
 
     left: Column[dt.Numeric | dt.Boolean]
     right: Column[dt.Numeric | dt.Boolean]
@@ -254,7 +298,24 @@ class Covariance(Filterable, Reduction):
 
 
 @public
+class Kurtosis(Filterable, Reduction):
+    """Compute the kurtosis of a column."""
+
+    arg: Column[dt.Numeric | dt.Boolean]
+    how: Literal["sample", "pop"]
+
+    @attribute
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
+        else:
+            return dt.float64
+
+
+@public
 class Mode(Filterable, Reduction):
+    """Compute the mode of a column."""
+
     arg: Column
 
     dtype = rlz.dtype_like("arg")
@@ -262,6 +323,8 @@ class Mode(Filterable, Reduction):
 
 @public
 class Max(Filterable, Reduction):
+    """Compute the maximum of a column."""
+
     arg: Column
 
     dtype = rlz.dtype_like("arg")
@@ -269,6 +332,8 @@ class Max(Filterable, Reduction):
 
 @public
 class Min(Filterable, Reduction):
+    """Compute the minimum of a column."""
+
     arg: Column
 
     dtype = rlz.dtype_like("arg")
@@ -276,6 +341,8 @@ class Min(Filterable, Reduction):
 
 @public
 class ArgMax(Filterable, Reduction):
+    """Compute the index of the maximum value in a column."""
+
     arg: Column
     key: Column
 
@@ -284,6 +351,8 @@ class ArgMax(Filterable, Reduction):
 
 @public
 class ArgMin(Filterable, Reduction):
+    """Compute the index of the minimum value in a column."""
+
     arg: Column
     key: Column
 
@@ -291,45 +360,46 @@ class ArgMin(Filterable, Reduction):
 
 
 @public
-class ApproxCountDistinct(Filterable, Reduction):
-    """Approximate number of unique values using HyperLogLog algorithm.
-
-    Impala offers the NDV built-in function for this.
-    """
-
-    arg: Column
-
-    # Impala 2.0 and higher returns a DOUBLE
-    dtype = dt.int64
-
-
-@public
-class ApproxMedian(Filterable, Reduction):
-    """Compute the approximate median of a set of comparable values."""
-
-    arg: Column
-
-    dtype = rlz.dtype_like("arg")
-
-
-@public
 class GroupConcat(Filterable, Reduction):
+    """Concatenate strings in a group with a given separator character."""
+
     arg: Column
     sep: Value[dt.String]
+    order_by: VarTuple[SortKey] = ()
 
     dtype = dt.string
 
 
 @public
 class CountDistinct(Filterable, Reduction):
+    """Count the number of distinct values in a column."""
+
     arg: Column
 
     dtype = dt.int64
 
 
 @public
+class ApproxCountDistinct(CountDistinct):
+    """Approximate number of unique values."""
+
+
+@public
 class ArrayCollect(Filterable, Reduction):
+    """Collect values into an array."""
+
     arg: Column
+    order_by: VarTuple[SortKey] = ()
+    include_null: bool = False
+    distinct: bool = False
+
+    def __init__(self, arg, order_by, distinct, **kwargs):
+        if distinct and order_by and [arg] != [key.expr for key in order_by]:
+            raise ValidationError(
+                "`collect` with `order_by` and `distinct=True` and may only "
+                "order by the collected column"
+            )
+        super().__init__(arg=arg, order_by=order_by, distinct=distinct, **kwargs)
 
     @attribute
     def dtype(self):
@@ -338,6 +408,8 @@ class ArrayCollect(Filterable, Reduction):
 
 @public
 class All(Filterable, Reduction):
+    """Check if all values in a column are true."""
+
     arg: Column[dt.Boolean]
 
     dtype = dt.boolean
@@ -345,6 +417,8 @@ class All(Filterable, Reduction):
 
 @public
 class Any(Filterable, Reduction):
+    """Check if any value in a column is true."""
+
     arg: Column[dt.Boolean]
 
     dtype = dt.boolean

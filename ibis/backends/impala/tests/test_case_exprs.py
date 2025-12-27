@@ -14,13 +14,13 @@ def table(mockcon):
 
 @pytest.fixture
 def simple_case(table):
-    return table.g.case().when("foo", "bar").when("baz", "qux").else_("default").end()
+    return table.g.cases(("foo", "bar"), ("baz", "qux"), else_="default")
 
 
 @pytest.fixture
 def search_case(table):
     t = table
-    return ibis.case().when(t.f > 0, t.d * 2).when(t.c < 0, t.a * 2).end()
+    return ibis.cases((t.f > 0, t.d * 2), (t.c < 0, t.a * 2))
 
 
 @pytest.fixture
@@ -76,16 +76,17 @@ def test_nullif_ifnull(tpch_lineitem, expr_fn, snapshot):
 @pytest.mark.parametrize(
     "expr_fn",
     [
-        pytest.param(lambda t: t.l_quantity.fillna(0), id="fillna_l_quantity"),
+        pytest.param(lambda t: t.l_quantity.fill_null(0), id="fill_null_l_quantity"),
         pytest.param(
-            lambda t: t.l_extendedprice.fillna(0), id="fillna_l_extendedprice"
+            lambda t: t.l_extendedprice.fill_null(0), id="fill_null_l_extendedprice"
         ),
         pytest.param(
-            lambda t: t.l_extendedprice.fillna(0.0), id="fillna_l_extendedprice_double"
+            lambda t: t.l_extendedprice.fill_null(0.0),
+            id="fill_null_l_extendedprice_double",
         ),
     ],
 )
-def test_decimal_fillna_cast_arg(tpch_lineitem, expr_fn, snapshot):
+def test_decimal_fill_null_cast_arg(tpch_lineitem, expr_fn, snapshot):
     expr = expr_fn(tpch_lineitem)
     result = translate(expr)
     snapshot.assert_match(result, "out.sql")
@@ -99,6 +100,6 @@ def test_identical_to(mockcon, snapshot):
 
 
 def test_identical_to_special_case(snapshot):
-    expr = ibis.NA.cast("int64").identical_to(ibis.NA.cast("int64")).name("tmp")
+    expr = ibis.null().cast("int64").identical_to(ibis.null().cast("int64")).name("tmp")
     result = ibis.to_sql(expr, dialect="impala")
     snapshot.assert_match(result, "out.sql")

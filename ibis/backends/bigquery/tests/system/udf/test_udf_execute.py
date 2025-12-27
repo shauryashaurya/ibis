@@ -5,6 +5,7 @@ import os
 import pandas as pd
 import pandas.testing as tm
 import pytest
+from google.api_core.exceptions import Forbidden
 from pytest import param
 
 import ibis
@@ -18,7 +19,7 @@ DATASET_ID = "testing"
 @pytest.fixture(scope="module")
 def alltypes(con):
     t = con.table("functional_alltypes")
-    expr = t[t.bigint_col.isin([10, 20])].limit(10)
+    expr = t.filter(t.bigint_col.isin([10, 20])).limit(10)
     return expr
 
 
@@ -44,7 +45,7 @@ def test_udf(alltypes, df):
     )
 
 
-def test_udf_with_struct(alltypes, df, snapshot):
+def test_udf_with_struct(alltypes, df):
     @udf.scalar.python
     def my_struct_thing(a: float, b: float) -> dt.Struct(
         {"width": float, "height": float}
@@ -101,6 +102,11 @@ def test_multiple_calls_has_one_definition(con):
     assert con.execute(expr) == 8.0
 
 
+@pytest.mark.xfail(
+    condition=os.environ.get("GITHUB_ACTIONS") is not None,
+    raises=Forbidden,
+    reason="WIF auth not entirely worked out yet",
+)
 def test_udf_libraries(con):
     @udf.scalar.python(
         # whatever symbols are exported in the library are visible inside the

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
+import sqlglot as sg
 
 import ibis
 from ibis.backends.conftest import TEST_TABLES
@@ -48,6 +50,7 @@ class TestConf(BackendTest):
     deps = ("duckdb",)
     stateful = False
     supports_tpch = True
+    supports_tpcds = True
     driver_supports_multiple_statements = True
 
     def preload(self):
@@ -64,7 +67,7 @@ class TestConf(BackendTest):
             yield (
                 f"""
                 CREATE OR REPLACE TABLE {table} AS
-                SELECT * FROM read_parquet('{parquet_dir / f'{table}.parquet'}')
+                SELECT * FROM read_parquet('{parquet_dir / f"{table}.parquet"}')
                 """
             )
         if not SANDBOXED:
@@ -72,7 +75,7 @@ class TestConf(BackendTest):
                 yield (
                     f"""
                     CREATE OR REPLACE TABLE {table} AS
-                    SELECT * FROM st_read('{geojson_dir / f'{table}.geojson'}')
+                    SELECT * FROM st_read('{geojson_dir / f"{table}.geojson"}')
                     """
                 )
             for table in TEST_TABLE_GEO_PARQUET:
@@ -80,7 +83,7 @@ class TestConf(BackendTest):
                 yield (
                     f"""
                 CREATE OR REPLACE TABLE {table} AS
-                SELECT * FROM read_parquet('{parquet_dir / f'{table}.parquet'}')
+                SELECT * FROM read_parquet('{parquet_dir / f"{table}.parquet"}')
                 """
                 )
             yield (
@@ -105,17 +108,42 @@ class TestConf(BackendTest):
             extension_directory = tmpdir.getbasetemp().joinpath("duckdb_extensions")
             extension_directory.mkdir(exist_ok=True)
             kw["extension_directory"] = extension_directory
+
+        kw["threads"] = 1 if worker_id != "master" else os.cpu_count() // 2
         return ibis.duckdb.connect(**kw)
 
-    def load_tpch(self) -> None:
-        """Load the TPC-H dataset."""
-        with self.connection._safe_raw_sql("CALL dbgen(sf=0.17)"):
-            pass
+    def _load_tpc(self, *, suite, scale_factor):
+        con = self.connection
+        schema = f"tpc{suite}"
+        con.create_database(schema, force=True)
+        parquet_dir = self.data_dir.joinpath(schema, f"sf={scale_factor}", "parquet")
+        assert parquet_dir.exists(), parquet_dir
+        for path in parquet_dir.glob("*.parquet"):
+            table_name = path.with_suffix("").name
+            # duckdb automatically infers the sf= as a hive partition so we
+            # need to disable it
+            con.create_table(
+                table_name,
+                con.read_parquet(path, hive_partitioning=False),
+                database=schema,
+            )
+
+    def _transform_tpc_sql(self, parsed, *, suite, leaves):
+        def add_catalog_and_schema(node):
+            if isinstance(node, sg.exp.Table) and node.name in leaves:
+                return node.__class__(
+                    catalog=f"tpc{suite}",
+                    **{k: v for k, v in node.args.items() if k != "catalog"},
+                )
+            return node
+
+        return parsed.transform(add_catalog_and_schema)
 
 
 @pytest.fixture(scope="session")
-def con(data_dir, tmp_path_factory, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+def con(tmp_path_factory, data_dir, worker_id):
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
 @pytest.fixture(scope="session")
@@ -125,12 +153,12 @@ def gpd():
 
 
 @pytest.fixture(scope="session")
-def zones(con, data_dir, gpd):
+def zones(con, data_dir):
     return con.read_geo(data_dir / "geojson" / "zones.geojson")
 
 
 @pytest.fixture(scope="session")
-def lines(con, data_dir, gpd):
+def lines(con, data_dir):
     return con.read_geo(data_dir / "geojson" / "lines.geojson")
 
 
@@ -145,7 +173,7 @@ def lines_gdf(data_dir, gpd):
 
 
 @pytest.fixture(scope="session")
-def geotable(con, gpd):
+def geotable(con):
     return con.table("geo")
 
 

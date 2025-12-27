@@ -8,9 +8,10 @@ import pytest
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
+from ibis.backends.tests.errors import PyAthenaOperationalError
 
-RAW_TEST_UUID = "08f48812-7948-4718-96c7-27fa6a398db6"
-TEST_UUID = uuid.UUID(RAW_TEST_UUID)
+TEST_UUID_STR = "08f48812-7948-4718-96c7-27fa6a398db6"
+TEST_UUID = uuid.UUID(TEST_UUID_STR)
 
 UUID_BACKEND_TYPE = {
     "bigquery": "STRING",
@@ -25,14 +26,30 @@ UUID_BACKEND_TYPE = {
     "snowflake": "VARCHAR",
     "sqlite": "text",
     "trino": "uuid",
+    "databricks": "string",
 }
 
 
 @pytest.mark.notimpl(["polars"], raises=NotImplementedError)
-def test_uuid_literal(con, backend):
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(
+            lambda: ibis.literal(TEST_UUID_STR, type=dt.uuid), id="literal_str"
+        ),
+        pytest.param(
+            lambda: ibis.literal(TEST_UUID, type=dt.uuid), id="literal_uuid_typed"
+        ),
+        pytest.param(lambda: ibis.literal(TEST_UUID), id="literal_uuid_untyped"),
+        pytest.param(lambda: ibis.uuid(TEST_UUID_STR), id="uuid_str"),
+        pytest.param(lambda: ibis.uuid(TEST_UUID), id="uuid_uuid"),
+    ],
+)
+def test_uuid_literal(con, backend, value):
     backend_name = backend.name()
 
-    expr = ibis.literal(RAW_TEST_UUID, type=dt.uuid)
+    expr = value()
     result = con.execute(expr)
 
     assert result == TEST_UUID
@@ -42,10 +59,11 @@ def test_uuid_literal(con, backend):
 
 
 @pytest.mark.notimpl(
-    ["druid", "exasol", "oracle", "polars", "pyspark", "risingwave", "pandas", "dask"],
+    ["druid", "exasol", "oracle", "polars", "risingwave", "pyspark"],
     raises=com.OperationNotDefinedError,
 )
-@pytest.mark.broken(
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
+@pytest.mark.never(
     ["mysql"], raises=AssertionError, reason="MySQL generates version 1 UUIDs"
 )
 def test_uuid_function(con):
@@ -55,7 +73,7 @@ def test_uuid_function(con):
 
 
 @pytest.mark.notimpl(
-    ["druid", "exasol", "oracle", "polars", "pyspark", "risingwave", "pandas", "dask"],
+    ["druid", "exasol", "oracle", "polars", "risingwave", "pyspark"],
     raises=com.OperationNotDefinedError,
 )
 def test_uuid_unique_each_row(con):

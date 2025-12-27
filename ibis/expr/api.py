@@ -23,6 +23,7 @@ from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.exceptions import IbisInputError
 from ibis.common.grounds import Concrete
 from ibis.common.temporal import normalize_datetime, normalize_timezone
+from ibis.expr.datatypes import DataType
 from ibis.expr.decompile import decompile
 from ibis.expr.schema import Schema
 from ibis.expr.sql import parse_sql, to_sql
@@ -44,20 +45,23 @@ from ibis.expr.types import (
 from ibis.util import experimental
 
 if TYPE_CHECKING:
+    import uuid as pyuuid
     from collections.abc import Iterable, Sequence
     from pathlib import Path
 
+    import geopandas as gpd
     import pandas as pd
     import polars as pl
     import pyarrow as pa
+    import pyarrow.dataset as ds
 
     from ibis.expr.schema import SchemaLike
 
 __all__ = (
     "Column",
+    "DataType",
     "Deferred",
     "Expr",
-    "NA",
     "Scalar",
     "Schema",
     "Table",
@@ -67,7 +71,7 @@ __all__ = (
     "and_",
     "array",
     "asc",
-    "case",
+    "cases",
     "coalesce",
     "connect",
     "cross_join",
@@ -82,58 +86,6 @@ __all__ = (
     "dtype",
     "e",
     "following",
-    "geo_area",
-    "geo_as_binary",
-    "geo_as_ewkb",
-    "geo_as_ewkt",
-    "geo_as_text",
-    "geo_azimuth",
-    "geo_buffer",
-    "geo_centroid",
-    "geo_contains",
-    "geo_contains_properly",
-    "geo_covered_by",
-    "geo_covers",
-    "geo_crosses",
-    "geo_d_fully_within",
-    "geo_d_within",
-    "geo_difference",
-    "geo_disjoint",
-    "geo_distance",
-    "geo_end_point",
-    "geo_envelope",
-    "geo_equals",
-    "geo_geometry_n",
-    "geo_geometry_type",
-    "geo_intersection",
-    "geo_intersects",
-    "geo_is_valid",
-    "geo_length",
-    "geo_line_locate_point",
-    "geo_line_merge",
-    "geo_line_substring",
-    "geo_max_distance",
-    "geo_n_points",
-    "geo_n_rings",
-    "geo_ordering_equals",
-    "geo_overlaps",
-    "geo_perimeter",
-    "geo_point",
-    "geo_point_n",
-    "geo_simplify",
-    "geo_srid",
-    "geo_start_point",
-    "geo_touches",
-    "geo_transform",
-    "geo_unary_union",
-    "geo_union",
-    "geo_within",
-    "geo_x",
-    "geo_x_max",
-    "geo_x_min",
-    "geo_y",
-    "geo_y_max",
-    "geo_y_min",
     "get_backend",
     "greatest",
     "ifelse",
@@ -146,7 +98,6 @@ __all__ = (
     "literal",
     "map",
     "memtable",
-    "negate",
     "now",
     "ntile",
     "null",
@@ -180,7 +131,6 @@ __all__ = (
     "union",
     "uuid",
     "watermark",
-    "where",
     "window",
 )
 
@@ -196,17 +146,6 @@ asof_join = ir.Table.asof_join
 e = ops.E().to_expr()
 pi = ops.Pi().to_expr()
 
-
-NA = null()
-"""The NULL scalar.
-
-Examples
---------
->>> import ibis
->>> my_null = ibis.NA
->>> my_null.isnull()
-True
-"""
 
 deferred = _
 """Deferred expression object.
@@ -238,7 +177,7 @@ ibis.Schema {
 """
 
 
-def param(type: dt.DataType) -> ir.Scalar:
+def param(type: dt.DataType, /) -> ir.Scalar:
     """Create a deferred parameter of a given type.
 
     Parameters
@@ -269,13 +208,14 @@ def param(type: dt.DataType) -> ir.Scalar:
     5.0
     >>> expr.execute(params={start: date(2013, 1, 3)})
     3.0
-
     """
     return ops.ScalarParameter(type).to_expr()
 
 
 def schema(
     pairs: SchemaLike | None = None,
+    /,
+    *,
     names: Iterable[str] | None = None,
     types: Iterable[str | dt.DataType] | None = None,
 ) -> sch.Schema:
@@ -301,6 +241,7 @@ def schema(
     >>> from ibis import schema, Schema
     >>> sc = schema([("foo", "string"), ("bar", "int64"), ("baz", "boolean")])
     >>> sc = schema(names=["foo", "bar", "baz"], types=["string", "int64", "boolean"])
+    >>> sc = schema({"nullable-str": "string", "non-nullable-str": "!string"})
     >>> sc = schema(dict(foo="string"))
     >>> sc = schema(Schema(dict(foo="string")))  # no-op
 
@@ -388,10 +329,10 @@ def table(
 
 def memtable(
     data,
+    /,
     *,
     columns: Iterable[str] | None = None,
     schema: SchemaLike | None = None,
-    name: str | None = None,
 ) -> Table:
     """Construct an ibis table expression from in-memory data.
 
@@ -413,8 +354,6 @@ def memtable(
     schema
         Optional [`Schema`](./schemas.qmd#ibis.expr.schema.Schema).
         The functions use `data` to infer a schema if not passed.
-    name
-        Optional name of the table.
 
     Returns
     -------
@@ -472,47 +411,73 @@ def memtable(
             "passing `columns` and schema` is ambiguous; "
             "pass one or the other but not both"
         )
-    return _memtable(data, name=name, schema=schema, columns=columns)
+
+    if schema is not None:
+        import ibis
+
+        schema = ibis.schema(schema)
+
+    return _memtable(data, schema=schema, columns=columns)
 
 
 @lazy_singledispatch
 def _memtable(
-    data: pd.DataFrame | Any,
+    data: Any,
     *,
     columns: Iterable[str] | None = None,
     schema: SchemaLike | None = None,
-    name: str | None = None,
 ) -> Table:
-    import pandas as pd
+    import ibis
 
+    if hasattr(data, "__arrow_c_stream__"):
+        # Support objects exposing arrow's PyCapsule interface
+        import pyarrow as pa
+
+        data = pa.table(
+            data,
+            schema=ibis.schema(schema).to_pyarrow() if schema is not None else None,
+        )
+    else:
+        import pandas as pd
+
+        data = pd.DataFrame(
+            data,
+            columns=columns
+            or (ibis.schema(schema).names if schema is not None else None),
+        )
+    return _memtable(data, columns=columns, schema=schema)
+
+
+@_memtable.register("pandas.DataFrame")
+def _memtable_from_pandas_dataframe(
+    data: pd.DataFrame,
+    *,
+    columns: Iterable[str] | None = None,
+    schema: SchemaLike | None = None,
+) -> Table:
     from ibis.formats.pandas import PandasDataFrameProxy
 
-    if not isinstance(data, pd.DataFrame):
-        df = pd.DataFrame(data, columns=columns)
-    else:
-        df = data
-
-    if df.columns.inferred_type != "string":
-        cols = df.columns
+    if data.columns.inferred_type != "string":
+        cols = data.columns
         newcols = getattr(
             schema,
             "names",
             (f"col{i:d}" for i in builtins.range(len(cols))),
         )
-        df = df.rename(columns=dict(zip(cols, newcols)))
+        data = data.rename(columns=dict(zip(cols, newcols)))
 
     if columns is not None:
-        if (provided_col := len(columns)) != (exist_col := len(df.columns)):
+        if (provided_col := len(columns)) != (exist_col := len(data.columns)):
             raise ValueError(
                 "Provided `columns` must have an entry for each column in `data`.\n"
                 f"`columns` has {provided_col} elements but `data` has {exist_col} columns."
             )
 
-        df = df.rename(columns=dict(zip(df.columns, columns)))
+        data = data.rename(columns=dict(zip(data.columns, columns)))
 
     # verify that the DataFrame has no duplicate column names because ibis
     # doesn't allow that
-    cols = df.columns
+    cols = data.columns
     dupes = [name for name, count in Counter(cols).items() if count > 1]
     if dupes:
         raise IbisInputError(
@@ -520,9 +485,9 @@ def _memtable(
         )
 
     op = ops.InMemoryTable(
-        name=name if name is not None else util.gen_name("pandas_memtable"),
-        schema=sch.infer(df) if schema is None else schema,
-        data=PandasDataFrameProxy(df),
+        name=util.gen_name("pandas_memtable"),
+        schema=sch.infer(data) if schema is None else schema,
+        data=PandasDataFrameProxy(data),
     )
     return op.to_expr()
 
@@ -531,7 +496,6 @@ def _memtable(
 def _memtable_from_pyarrow_table(
     data: pa.Table,
     *,
-    name: str | None = None,
     schema: SchemaLike | None = None,
     columns: Iterable[str] | None = None,
 ):
@@ -541,10 +505,40 @@ def _memtable_from_pyarrow_table(
         assert schema is None, "if `columns` is not `None` then `schema` must be `None`"
         schema = sch.Schema(dict(zip(columns, sch.infer(data).values())))
     return ops.InMemoryTable(
-        name=name if name is not None else util.gen_name("pyarrow_memtable"),
+        name=util.gen_name("pyarrow_memtable"),
         schema=sch.infer(data) if schema is None else schema,
         data=PyArrowTableProxy(data),
     ).to_expr()
+
+
+@_memtable.register("pyarrow.dataset.Dataset")
+def _memtable_from_pyarrow_dataset(
+    data: ds.Dataset,
+    *,
+    schema: SchemaLike | None = None,
+    columns: Iterable[str] | None = None,
+):
+    from ibis.formats.pyarrow import PyArrowDatasetProxy
+
+    return ops.InMemoryTable(
+        name=util.gen_name("pyarrow_dataset_memtable"),
+        schema=Schema.from_pyarrow(data.schema),
+        data=PyArrowDatasetProxy(data),
+    ).to_expr()
+
+
+@_memtable.register("pyarrow.RecordBatchReader")
+def _memtable_from_pyarrow_RecordBatchReader(
+    data: pa.Table,
+    *,
+    schema: SchemaLike | None = None,
+    columns: Iterable[str] | None = None,
+):
+    raise TypeError(
+        "Creating an `ibis.memtable` from a `pyarrow.RecordBatchReader` would "
+        "load _all_ data into memory. If you want to do this, please do so "
+        "explicitly like `ibis.memtable(reader.read_all())`"
+    )
 
 
 @_memtable.register("polars.LazyFrame")
@@ -556,7 +550,6 @@ def _memtable_from_polars_lazyframe(data: pl.LazyFrame, **kwargs):
 def _memtable_from_polars_dataframe(
     data: pl.DataFrame,
     *,
-    name: str | None = None,
     schema: SchemaLike | None = None,
     columns: Iterable[str] | None = None,
 ):
@@ -566,14 +559,30 @@ def _memtable_from_polars_dataframe(
         assert schema is None, "if `columns` is not `None` then `schema` must be `None`"
         schema = sch.Schema(dict(zip(columns, sch.infer(data).values())))
     return ops.InMemoryTable(
-        name=name if name is not None else util.gen_name("polars_memtable"),
+        name=util.gen_name("polars_memtable"),
         schema=sch.infer(data) if schema is None else schema,
         data=PolarsDataFrameProxy(data),
     ).to_expr()
 
 
-def _deferred_method_call(expr, method_name):
-    method = operator.methodcaller(method_name)
+@_memtable.register("geopandas.geodataframe.GeoDataFrame")
+def _memtable_from_geopandas_geodataframe(
+    data: gpd.GeoDataFrame,
+    *,
+    schema: SchemaLike | None = None,
+    columns: Iterable[str] | None = None,
+):
+    # The Pandas data proxy and the `to_arrow` method on it can't handle
+    # geopandas geometry columns. But if we first make the geometry columns WKB,
+    # then the geo column gets treated (correctly) as just a binary blob, and
+    # DuckDB can cast it to a proper geometry column after import.
+    wkb_df = data.to_wkb()
+
+    return _memtable(wkb_df, schema=schema, columns=columns)
+
+
+def _deferred_method_call(expr, method_name, **kwargs):
+    method = operator.methodcaller(method_name, **kwargs)
     if isinstance(expr, str):
         value = _[expr]
     elif isinstance(expr, Deferred):
@@ -585,13 +594,15 @@ def _deferred_method_call(expr, method_name):
     return method(value)
 
 
-def desc(expr: ir.Column | str) -> ir.Value:
+def desc(expr: ir.Column | str, /, *, nulls_first: bool = False) -> ir.Value:
     """Create a descending sort key from `expr` or column name.
 
     Parameters
     ----------
     expr
         The expression or column name to use for sorting
+    nulls_first
+        Bool to indicate whether to put NULL values first or not.
 
     See Also
     --------
@@ -621,16 +632,18 @@ def desc(expr: ir.Column | str) -> ir.Value:
         An expression
 
     """
-    return _deferred_method_call(expr, "desc")
+    return _deferred_method_call(expr, "desc", nulls_first=nulls_first)
 
 
-def asc(expr: ir.Column | str) -> ir.Value:
+def asc(expr: ir.Column | str, /, *, nulls_first: bool = False) -> ir.Value:
     """Create a ascending sort key from `asc` or column name.
 
     Parameters
     ----------
     expr
         The expression or column name to use for sorting
+    nulls_first
+        Bool to indicate whether to put NULL values first or not.
 
     See Also
     --------
@@ -660,14 +673,14 @@ def asc(expr: ir.Column | str) -> ir.Value:
         An expression
 
     """
-    return _deferred_method_call(expr, "asc")
+    return _deferred_method_call(expr, "asc", nulls_first=nulls_first)
 
 
-def preceding(value) -> ir.Value:
+def preceding(value, /) -> ir.Value:
     return ops.WindowBoundary(value, preceding=True).to_expr()
 
 
-def following(value) -> ir.Value:
+def following(value, /) -> ir.Value:
     return ops.WindowBoundary(value, preceding=False).to_expr()
 
 
@@ -720,7 +733,7 @@ def random() -> ir.FloatingScalar:
     ## Repeated use of `random`
 
     `ibis.random()` will generate a column of distinct random numbers even if
-    the same instance of `ibis.random()` is re-used.
+    the same instance of `ibis.random()` is reused.
 
     When Ibis compiles an expression to SQL, each place where `random` is used
     will render as a separate call to the given backend's random number
@@ -754,22 +767,33 @@ def random() -> ir.FloatingScalar:
     return ops.RandomScalar().to_expr()
 
 
-def uuid() -> ir.UUIDScalar:
-    """Return a random UUID version 4 value.
+def uuid(value: str | pyuuid.UUID | None = None, /) -> ir.UUIDScalar:
+    """Return or generate a UUID value.
 
-    Similar to [('uuid.uuid4`) in the Python standard library.
+    Parameters
+    ----------
+    value
+        A `uuid.UUID` object or a UUID str such as
+        'b41c7dfd-1513-4358-917e-9ea322b0d3c5'.
+        If `None`, a random UUIDv4 is generated, similar to
+        [`uuid.uuid4()`](https://docs.python.org/3/library/uuid.html#uuid.uuid4)
+        from the Python standard library.
 
     Examples
     --------
     >>> from ibis.interactive import *
     >>> ibis.uuid()  # doctest: +SKIP
     UUID('e57e927b-aed2-483b-9140-dc32a26cad95')
+    >>> ibis.uuid("b41c7dfd-1513-4358-917e-9ea322b0d3c5")  # doctest: +SKIP
+    UUID('b41c7dfd-1513-4358-917e-9ea322b0d3c5')
 
     Returns
     -------
     UUIDScalar
         Random UUID value expression
     """
+    if value is not None:
+        return literal(value, type=dt.UUID())
     return ops.RandomUUID().to_expr()
 
 
@@ -834,12 +858,16 @@ def timestamp(
     Create a timestamp scalar from a string
 
     >>> ibis.timestamp("2023-01-02T03:04:05")
-    Timestamp('2023-01-02 03:04:05')
+    ┌─────────────────────┐
+    │ 2023-01-02 03:04:05 │
+    └─────────────────────┘
 
     Create a timestamp scalar from components
 
     >>> ibis.timestamp(2023, 1, 2, 3, 4, 5)
-    Timestamp('2023-01-02 03:04:05')
+    ┌─────────────────────┐
+    │ 2023-01-02 03:04:05 │
+    └─────────────────────┘
 
     Create a timestamp column from components
 
@@ -865,7 +893,7 @@ def timestamp(
             )
         return ops.TimestampFromYMDHMS(*args).to_expr()
     elif isinstance(value_or_year, (numbers.Real, ir.IntegerValue)):
-        raise TypeError("Use ibis.literal(...).to_timestamp() instead")
+        raise TypeError("Use ibis.literal(...).as_timestamp() instead")
     elif isinstance(value_or_year, ir.Expr):
         return value_or_year.cast(dt.Timestamp(timezone=timezone))
     else:
@@ -915,12 +943,16 @@ def date(value_or_year, month=None, day=None, /):
     Create a date scalar from a string
 
     >>> ibis.date("2023-01-02")
-    datetime.date(2023, 1, 2)
+    ┌────────────┐
+    │ 2023-01-02 │
+    └────────────┘
 
     Create a date scalar from year, month, and day
 
     >>> ibis.date(2023, 1, 2)
-    datetime.date(2023, 1, 2)
+    ┌────────────┐
+    │ 2023-01-02 │
+    └────────────┘
 
     Create a date column from year, month, and day
 
@@ -984,12 +1016,16 @@ def time(value_or_hour, minute=None, second=None, /):
     Create a time scalar from a string
 
     >>> ibis.time("01:02:03")
-    datetime.time(1, 2, 3)
+    ┌──────────┐
+    │ 01:02:03 │
+    └──────────┘
 
     Create a time scalar from hour, minute, and second
 
     >>> ibis.time(1, 2, 3)
-    datetime.time(1, 2, 3)
+    ┌──────────┐
+    │ 01:02:03 │
+    └──────────┘
 
     Create a time column from hour, minute, and second
 
@@ -1065,6 +1101,57 @@ def interval(
     IntervalScalar
         An interval expression
 
+    Examples
+    --------
+    >>> from datetime import datetime
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> t = ibis.memtable(
+    ...     {
+    ...         "timestamp_col": [
+    ...             datetime(2020, 10, 5, 8, 0, 0),
+    ...             datetime(2020, 11, 10, 10, 2, 15),
+    ...             datetime(2020, 12, 15, 12, 4, 30),
+    ...         ]
+    ...     },
+    ... )
+
+    Add and subtract ten days from a timestamp column.
+
+    >>> ten_days = ibis.interval(days=10)
+    >>> ten_days
+    ┌────────────────────────────────────────────────┐
+    │ MonthDayNano(months=0, days=10, nanoseconds=0) │
+    └────────────────────────────────────────────────┘
+    >>> t.mutate(
+    ...     plus_ten_days=t.timestamp_col + ten_days,
+    ...     minus_ten_days=t.timestamp_col - ten_days,
+    ... )
+    ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ timestamp_col       ┃ plus_ten_days       ┃ minus_ten_days      ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+    │ timestamp           │ timestamp           │ timestamp           │
+    ├─────────────────────┼─────────────────────┼─────────────────────┤
+    │ 2020-10-05 08:00:00 │ 2020-10-15 08:00:00 │ 2020-09-25 08:00:00 │
+    │ 2020-11-10 10:02:15 │ 2020-11-20 10:02:15 │ 2020-10-31 10:02:15 │
+    │ 2020-12-15 12:04:30 │ 2020-12-25 12:04:30 │ 2020-12-05 12:04:30 │
+    └─────────────────────┴─────────────────────┴─────────────────────┘
+
+    Intervals provide more granularity with date arithmetic.
+
+    >>> t.mutate(
+    ...     added_interval=t.timestamp_col
+    ...     + ibis.interval(weeks=1, days=2, hours=3, minutes=4, seconds=5)
+    ... )
+    ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ timestamp_col       ┃ added_interval      ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+    │ timestamp           │ timestamp           │
+    ├─────────────────────┼─────────────────────┤
+    │ 2020-10-05 08:00:00 │ 2020-10-14 11:04:05 │
+    │ 2020-11-10 10:02:15 │ 2020-11-19 13:06:20 │
+    │ 2020-12-15 12:04:30 │ 2020-12-24 15:08:35 │
+    └─────────────────────┴─────────────────────┘
     """
     keyword_value_unit = [
         ("nanoseconds", nanoseconds, "ns"),
@@ -1105,56 +1192,79 @@ def interval(
     return functools.reduce(operator.add, intervals)
 
 
-def case() -> bl.SearchedCaseBuilder:
-    """Begin constructing a case expression.
+@deferrable
+def cases(
+    branch: tuple[Any, Any], *branches: tuple[Any, Any], else_: Any | None = None
+) -> ir.Value:
+    """Create a multi-branch if-else expression.
 
-    Use the `.when` method on the resulting object followed by `.end` to create a
-    complete case expression.
+    Equivalent to a SQL `CASE` statement.
+
+    ::: {.callout-note title="Added in version 10.0.0"}
+    :::
+
+    Parameters
+    ----------
+    branch
+        First (`condition`, `result`) pair. Required.
+    branches
+        Additional (`condition`, `result`) pairs. We look through the test
+        values in order and return the result corresponding to the first
+        test value that matches `self`. If none match, we return `else_`.
+    else_
+        Value to return if none of the case conditions evaluate to `True`.
+        Defaults to `NULL`.
 
     Returns
     -------
-    SearchedCaseBuilder
-        A builder object to use for constructing a case expression.
+    Value
+        A value expression
 
     See Also
     --------
-    [`Value.case()`](./expression-generic.qmd#ibis.expr.types.generic.Value.case)
+    [`Value.cases()`](./expression-generic.qmd#ibis.expr.types.generic.Value.cases)
+    [`Value.substitute()`](./expression-generic.qmd#ibis.expr.types.generic.Value.substitute)
 
     Examples
     --------
     >>> import ibis
-    >>> from ibis import _
     >>> ibis.options.interactive = True
-    >>> t = ibis.memtable(
-    ...     {
-    ...         "left": [1, 2, 3, 4],
-    ...         "symbol": ["+", "-", "*", "/"],
-    ...         "right": [5, 6, 7, 8],
-    ...     }
-    ... )
-    >>> t.mutate(
-    ...     result=(
-    ...         ibis.case()
-    ...         .when(_.symbol == "+", _.left + _.right)
-    ...         .when(_.symbol == "-", _.left - _.right)
-    ...         .when(_.symbol == "*", _.left * _.right)
-    ...         .when(_.symbol == "/", _.left / _.right)
-    ...         .end()
-    ...     )
-    ... )
-    ┏━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━┓
-    ┃ left  ┃ symbol ┃ right ┃ result  ┃
-    ┡━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━━┩
-    │ int64 │ string │ int64 │ float64 │
-    ├───────┼────────┼───────┼─────────┤
-    │     1 │ +      │     5 │     6.0 │
-    │     2 │ -      │     6 │    -4.0 │
-    │     3 │ *      │     7 │    21.0 │
-    │     4 │ /      │     8 │     0.5 │
-    └───────┴────────┴───────┴─────────┘
-
+    >>> v = ibis.memtable({"values": [1, 2, 1, 2, 3, 2, 4]}).values
+    >>> ibis.cases((v == 1, "a"), (v > 2, "b"), else_="unk").name("cases")
+    ┏━━━━━━━━┓
+    ┃ cases  ┃
+    ┡━━━━━━━━┩
+    │ string │
+    ├────────┤
+    │ a      │
+    │ unk    │
+    │ a      │
+    │ unk    │
+    │ b      │
+    │ unk    │
+    │ b      │
+    └────────┘
+    >>> ibis.cases(
+    ...     (v % 2 == 0, "divisible by 2"),
+    ...     (v % 3 == 0, "divisible by 3"),
+    ...     (v % 4 == 0, "shadowed by the 2 case"),
+    ... ).name("cases")
+    ┏━━━━━━━━━━━━━━━━┓
+    ┃ cases          ┃
+    ┡━━━━━━━━━━━━━━━━┩
+    │ string         │
+    ├────────────────┤
+    │ NULL           │
+    │ divisible by 2 │
+    │ NULL           │
+    │ divisible by 2 │
+    │ divisible by 3 │
+    │ divisible by 2 │
+    │ divisible by 2 │
+    └────────────────┘
     """
-    return bl.SearchedCaseBuilder()
+    cases, results = zip(branch, *branches)
+    return ops.SearchedCase(cases=cases, results=results, default=else_).to_expr()
 
 
 def now() -> ir.TimestampScalar:
@@ -1311,7 +1421,7 @@ def cume_dist() -> ir.FloatingColumn:
     return ops.CumeDist().to_expr()
 
 
-def ntile(buckets: int | ir.IntegerValue) -> ir.IntegerColumn:
+def ntile(buckets: int | ir.IntegerValue, /) -> ir.IntegerColumn:
     """Return the integer number of a partitioning of the column values.
 
     Parameters
@@ -1378,7 +1488,9 @@ def row_number() -> ir.IntegerColumn:
 
 
 def read_csv(
-    sources: str | Path | Sequence[str | Path],
+    paths: str | Path | Sequence[str | Path],
+    /,
+    *,
     table_name: str | None = None,
     **kwargs: Any,
 ) -> ir.Table:
@@ -1389,7 +1501,7 @@ def read_csv(
 
     Parameters
     ----------
-    sources
+    paths
         A filesystem path or URL or list of same.  Supports CSV and TSV files.
     table_name
         A name to refer to the table.  If not provided, a name will be generated.
@@ -1426,17 +1538,18 @@ def read_csv(
     │     2 │ NULL   │
     │  NULL │ f      │
     └───────┴────────┘
-
     """
     from ibis.config import _default_backend
 
     con = _default_backend()
-    return con.read_csv(sources, table_name=table_name, **kwargs)
+    return con.read_csv(paths, table_name=table_name, **kwargs)
 
 
 @experimental
 def read_json(
-    sources: str | Path | Sequence[str | Path],
+    paths: str | Path | Sequence[str | Path],
+    /,
+    *,
     table_name: str | None = None,
     **kwargs: Any,
 ) -> ir.Table:
@@ -1447,7 +1560,7 @@ def read_json(
 
     Parameters
     ----------
-    sources
+    paths
         A filesystem path or URL or list of same.
     table_name
         A name to refer to the table.  If not provided, a name will be generated.
@@ -1482,16 +1595,17 @@ def read_json(
     │     2 │ NULL   │
     │  NULL │ f      │
     └───────┴────────┘
-
     """
     from ibis.config import _default_backend
 
     con = _default_backend()
-    return con.read_json(sources, table_name=table_name, **kwargs)
+    return con.read_json(paths, table_name=table_name, **kwargs)
 
 
 def read_parquet(
-    sources: str | Path | Sequence[str | Path],
+    paths: str | Path | Sequence[str | Path],
+    /,
+    *,
     table_name: str | None = None,
     **kwargs: Any,
 ) -> ir.Table:
@@ -1502,7 +1616,7 @@ def read_parquet(
 
     Parameters
     ----------
-    sources
+    paths
         A filesystem path or URL or list of same.
     table_name
         A name to refer to the table.  If not provided, a name will be generated.
@@ -1540,22 +1654,21 @@ def read_parquet(
     │     2 │ h      │
     │     3 │ i      │
     └───────┴────────┘
-
     """
     from ibis.config import _default_backend
 
     con = _default_backend()
-    return con.read_parquet(sources, table_name=table_name, **kwargs)
+    return con.read_parquet(paths, table_name=table_name, **kwargs)
 
 
 def read_delta(
-    source: str | Path, table_name: str | None = None, **kwargs: Any
+    path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
 ) -> ir.Table:
     """Lazily load a Delta Lake table.
 
     Parameters
     ----------
-    source
+    path
         A filesystem path or URL.
     table_name
         A name to refer to the table.  If not provided, a name will be generated.
@@ -1581,7 +1694,7 @@ def read_delta(
     >>> import deltalake as dl
     >>> dl.write_deltalake("/tmp/data.delta", df, mode="overwrite")
     >>> t = ibis.read_delta("/tmp/data.delta")
-    >>> t
+    >>> t.order_by("a")
     ┏━━━━━━━┳━━━━━━━━┓
     ┃ a     ┃ b      ┃
     ┡━━━━━━━╇━━━━━━━━┩
@@ -1596,10 +1709,10 @@ def read_delta(
     from ibis.config import _default_backend
 
     con = _default_backend()
-    return con.read_delta(source, table_name=table_name, **kwargs)
+    return con.read_delta(path, table_name=table_name, **kwargs)
 
 
-def set_backend(backend: str | BaseBackend) -> None:
+def set_backend(backend: str | BaseBackend, /) -> None:
     """Set the default Ibis backend.
 
     Parameters
@@ -1640,9 +1753,11 @@ def set_backend(backend: str | BaseBackend) -> None:
     ibis.options.default_backend = backend
 
 
-def get_backend(expr: Expr | None = None) -> BaseBackend:
+def get_backend(expr: Expr | None = None, /) -> BaseBackend:
     """Get the current Ibis backend to use for a given expression.
 
+    Parameters
+    ----------
     expr
         An expression to get the backend from. If not passed, the default
         backend is returned.
@@ -1652,6 +1767,25 @@ def get_backend(expr: Expr | None = None) -> BaseBackend:
     BaseBackend
         The Ibis backend.
 
+    Examples
+    --------
+    >>> import ibis
+
+    Get the default backend.
+
+    >>> ibis.get_backend()  # doctest: +ELLIPSIS
+    <ibis.backends.duckdb.Backend object at 0x...>
+
+    Get the backend for a specific expression.
+
+    >>> polars_con = ibis.polars.connect()
+    >>> t = polars_con.create_table("t", ibis.memtable({"a": [1, 2, 3]}))
+    >>> ibis.get_backend(t)  # doctest: +ELLIPSIS
+    <ibis.backends.polars.Backend object at 0x...>
+
+    See Also
+    --------
+    [`get_backend()`](./expression-tables.qmd#ibis.expr.types.relations.Table.get_backend)
     """
     if expr is None:
         from ibis.config import _default_backend
@@ -1879,8 +2013,8 @@ def trailing_range_window(preceding, order_by, group_by=None):
     )
 
 
-def union(table: ir.Table, *rest: ir.Table, distinct: bool = False) -> ir.Table:
-    """Compute the set union of multiple table expressions.
+def union(table: ir.Table, /, *rest: ir.Table, distinct: bool = False) -> ir.Table:
+    """Compute the multiset (or set) union of multiple table expressions.
 
     The input tables must have identical schemas.
 
@@ -1891,7 +2025,7 @@ def union(table: ir.Table, *rest: ir.Table, distinct: bool = False) -> ir.Table:
     *rest
         Additional table expressions
     distinct
-        Only return distinct rows
+        Use multiset union (False) or set union (True). See examples.
 
     Returns
     -------
@@ -1944,68 +2078,27 @@ def union(table: ir.Table, *rest: ir.Table, distinct: bool = False) -> ir.Table:
     │     3 │
     └───────┘
 
-    """
-    return table.union(*rest, distinct=distinct) if rest else table
+    You can union more than two tables at once.
 
-
-def intersect(table: ir.Table, *rest: ir.Table, distinct: bool = True) -> ir.Table:
-    """Compute the set intersection of multiple table expressions.
-
-    The input tables must have identical schemas.
-
-    Parameters
-    ----------
-    table
-        A table expression
-    *rest
-        Additional table expressions
-    distinct
-        Only return distinct rows
-
-    Returns
-    -------
-    Table
-        A new table containing the intersection of all input tables.
-
-    Examples
-    --------
-    >>> import ibis
-    >>> ibis.options.interactive = True
-    >>> t1 = ibis.memtable({"a": [1, 2]})
-    >>> t1
+    >>> ibis.union(t1, t1, t1).order_by("a")
     ┏━━━━━━━┓
     ┃ a     ┃
     ┡━━━━━━━┩
     │ int64 │
     ├───────┤
     │     1 │
+    │     1 │
+    │     1 │
+    │     2 │
+    │     2 │
     │     2 │
     └───────┘
-    >>> t2 = ibis.memtable({"a": [2, 3]})
-    >>> t2
-    ┏━━━━━━━┓
-    ┃ a     ┃
-    ┡━━━━━━━┩
-    │ int64 │
-    ├───────┤
-    │     2 │
-    │     3 │
-    └───────┘
-    >>> ibis.intersect(t1, t2)
-    ┏━━━━━━━┓
-    ┃ a     ┃
-    ┡━━━━━━━┩
-    │ int64 │
-    ├───────┤
-    │     2 │
-    └───────┘
-
     """
-    return table.intersect(*rest, distinct=distinct) if rest else table
+    return table.union(*rest, distinct=distinct) if rest else table
 
 
-def difference(table: ir.Table, *rest: ir.Table, distinct: bool = True) -> ir.Table:
-    """Compute the set difference of multiple table expressions.
+def intersect(table: ir.Table, /, *rest: ir.Table, distinct: bool = True) -> ir.Table:
+    """Compute the set (or multiset) intersection of multiple table expressions.
 
     The input tables must have identical schemas.
 
@@ -2016,7 +2109,97 @@ def difference(table: ir.Table, *rest: ir.Table, distinct: bool = True) -> ir.Ta
     *rest
         Additional table expressions
     distinct
-        Only diff distinct rows not occurring in the calling table
+        Use set intersect (True) or multiset intersect (False). See examples.
+
+    Returns
+    -------
+    Table
+        A new table containing the intersection of all input tables.
+
+    See Also
+    --------
+    [`Table.intersect`](./expression-tables.qmd#ibis.expr.types.relations.Table.intersect)
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> two_a = ibis.memtable({"x": ["a", "a", "b"]})
+    >>> three_a = ibis.memtable({"x": ["a", "a", "a", "b"]})
+    >>> four_a = ibis.memtable({"x": ["a", "a", "a", "a", "c"]})
+
+    With `distinct=True`, the intersection will return one row for each row that appears in all input tables.
+    This is equivalent to a set intersection.
+    So even though the source tables have multiple `"a"` values, the result will only have one:
+
+    >>> ibis.intersect(two_a, three_a).order_by("x")
+    ┏━━━━━━━━┓
+    ┃ x      ┃
+    ┡━━━━━━━━┩
+    │ string │
+    ├────────┤
+    │      a │
+    │      b │
+    └────────┘
+
+    With `distinct=False`, the intersection will return all rows that appear in all input tables.
+    This is equivalent to a multiset intersection.
+    Since the smallest number of appearances of `"a"` is 2, the result will have two `"a"` values:
+
+    >>> ibis.intersect(two_a, three_a, distinct=False).order_by("x")
+    ┏━━━━━━━━┓
+    ┃ x      ┃
+    ┡━━━━━━━━┩
+    │ string │
+    ├────────┤
+    │      a │
+    │      a │
+    │      b │
+    └────────┘
+
+    More than two table expressions can be intersected at once.
+    - Since `"a"` appears at minimum one time, it appears once in the result.
+    - Since `"b"` doesn't appear in `two_a` or `three_a`, it is not included.
+    - Since `"c"` does not appear in `one_a`, it is not included.
+
+    >>> ibis.intersect(two_a, three_a, four_a)
+    ┏━━━━━━━━┓
+    ┃ x      ┃
+    ┡━━━━━━━━┩
+    │ string │
+    ├────────┤
+    │      a │
+    └────────┘
+    >>> ibis.intersect(two_a, three_a, four_a, distinct=False)
+    ┏━━━━━━━━┓
+    ┃ x      ┃
+    ┡━━━━━━━━┩
+    │ string │
+    ├────────┤
+    │      a │
+    │      a │
+    └────────┘
+    """
+    return table.intersect(*rest, distinct=distinct) if rest else table
+
+
+def difference(table: ir.Table, /, *rest: ir.Table, distinct: bool = True) -> ir.Table:
+    """Compute the set (or multiset) difference of multiple table expressions.
+
+    The input tables must have identical schemas.
+
+    Parameters
+    ----------
+    table
+        A table expression
+    *rest
+        Additional table expressions
+    distinct
+        Use set difference (True) or multiset difference (False). See examples.
+
+    See Also
+    --------
+    [`ibis.difference`](./expression-tables.qmd#ibis.difference)
 
     Returns
     -------
@@ -2027,35 +2210,50 @@ def difference(table: ir.Table, *rest: ir.Table, distinct: bool = True) -> ir.Ta
     --------
     >>> import ibis
     >>> ibis.options.interactive = True
-    >>> t1 = ibis.memtable({"a": [1, 2]})
-    >>> t1
+    >>> t1 = ibis.memtable({"a": [7, 8, 8, 9, 9, 9]})
+    >>> t2 = ibis.memtable({"a": [8, 9]})
+
+    With `distinct=True`, if a row ever appears in any of `*rest`,
+    it will not appear in the result.
+    So here, all appearances of 8 and 9 are removed:
+
+    >>> t1.difference(t2)
     ┏━━━━━━━┓
     ┃ a     ┃
     ┡━━━━━━━┩
     │ int64 │
     ├───────┤
-    │     1 │
-    │     2 │
-    └───────┘
-    >>> t2 = ibis.memtable({"a": [2, 3]})
-    >>> t2
-    ┏━━━━━━━┓
-    ┃ a     ┃
-    ┡━━━━━━━┩
-    │ int64 │
-    ├───────┤
-    │     2 │
-    │     3 │
-    └───────┘
-    >>> ibis.difference(t1, t2)
-    ┏━━━━━━━┓
-    ┃ a     ┃
-    ┡━━━━━━━┩
-    │ int64 │
-    ├───────┤
-    │     1 │
+    │     7 │
     └───────┘
 
+    With `distinct=False`, the algorithm is a [multiset](https://en.wikipedia.org/wiki/Multiset) difference.
+    This means, that since 8 and 9 each appear once in `t2`,
+    the result will be the input with a single instance of each removed:
+
+    >>> t1.difference(t2, distinct=False).order_by("a")
+    ┏━━━━━━━┓
+    ┃ a     ┃
+    ┡━━━━━━━┩
+    │ int64 │
+    ├───────┤
+    │     7 │
+    │     8 │
+    │     9 │
+    │     9 │
+    └───────┘
+
+    With multiple tables in `*rest`, we apply the operation consecutively.
+    Here, we remove two eights and two nines:
+
+    >>> t1.difference(t2, t2, distinct=False).order_by("a")
+    ┏━━━━━━━┓
+    ┃ a     ┃
+    ┡━━━━━━━┩
+    │ int64 │
+    ├───────┤
+    │     7 │
+    │     9 │
+    └───────┘
     """
     return table.difference(*rest, distinct=distinct) if rest else table
 
@@ -2091,8 +2289,8 @@ def range(start, stop, step) -> ir.ArrayValue:
     Integer ranges are supported, as well as timestamp ranges.
 
     ::: {.callout-note}
-    `start` is inclucive and `stop` is exclusive, just like Python's builtin
-    [`range`](range).
+    `start` is inclusive and `stop` is exclusive, just like Python's builtin
+    [](`range`).
 
     When `step` equals 0, however, this function will return an empty array.
 
@@ -2121,33 +2319,45 @@ def range(start, stop, step) -> ir.ArrayValue:
     Range using only a stop argument
 
     >>> ibis.range(5)
-    [0, 1, ... +3]
+    ┌────────────────┐
+    │ [0, 1, ... +3] │
+    └────────────────┘
 
     Simple range using start and stop
 
     >>> ibis.range(1, 5)
-    [1, 2, ... +2]
+    ┌────────────────┐
+    │ [1, 2, ... +2] │
+    └────────────────┘
 
     Generate an empty range
 
     >>> ibis.range(0)
-    []
+    ┌────┐
+    │ [] │
+    └────┘
 
     Negative step values are supported
 
     >>> ibis.range(10, 4, -2)
-    [10, 8, ... +1]
+    ┌─────────────────┐
+    │ [10, 8, ... +1] │
+    └─────────────────┘
 
     `ibis.range` behaves the same as Python's range ...
 
     >>> ibis.range(0, 7, -1)
-    []
+    ┌────┐
+    │ [] │
+    └────┘
 
     ... except when the step is zero, in which case `ibis.range` returns an
     empty array
 
     >>> ibis.range(0, 5, 0)
-    []
+    ┌────┐
+    │ [] │
+    └────┘
 
     Because the resulting expression is array, you can unnest the values
 
@@ -2168,11 +2378,13 @@ def range(start, stop, step) -> ir.ArrayValue:
 
     >>> expr = ibis.range("2002-01-01", "2002-02-01", ibis.interval(days=2)).name("ts")
     >>> expr
-    [
-        datetime.datetime(2002, 1, 1, 0, 0),
-        datetime.datetime(2002, 1, 3, 0, 0),
-        ... +14
-    ]
+    ┌──────────────────────────────────────────┐
+    │ [                                        │
+    │     datetime.datetime(2002, 1, 1, 0, 0), │
+    │     datetime.datetime(2002, 1, 3, 0, 0), │
+    │     ... +14                              │
+    │ ]                                        │
+    └──────────────────────────────────────────┘
     >>> expr.unnest()
     ┏━━━━━━━━━━━━━━━━━━━━━┓
     ┃ ts                  ┃
@@ -2220,86 +2432,14 @@ def _timestamp_range(
     step: datetime.timedelta | ir.IntervalValue,
 ) -> ir.ArrayValue:
     return ops.TimestampRange(
-        start=normalize_datetime(start), stop=normalize_datetime(stop), step=step
+        start=normalize_datetime(start) if isinstance(start, str) else start,
+        stop=normalize_datetime(stop) if isinstance(stop, str) else stop,
+        step=step,
     ).to_expr()
 
 
-def _wrap_deprecated(fn, prefix=""):
-    """Deprecate the top-level geo function."""
-
-    @functools.wraps(fn)
-    def wrapper(self, *args, **kwargs):
-        if isinstance(self, Deferred):
-            method = getattr(self, fn.__name__)
-            return method(*args, **kwargs)
-        return fn(self, *args, **kwargs)
-
-    wrapper.__module__ = "ibis.expr.api"
-    wrapper.__qualname__ = wrapper.__name__ = prefix + fn.__name__
-    dec = util.deprecated(
-        instead=f"use the `{fn.__qualname__}` method instead", as_of="7.0"
-    )
-    return dec(wrapper)
-
-
-geo_area = _wrap_deprecated(ir.GeoSpatialValue.area, "geo_")
-geo_as_binary = _wrap_deprecated(ir.GeoSpatialValue.as_binary, "geo_")
-geo_as_ewkb = _wrap_deprecated(ir.GeoSpatialValue.as_ewkb, "geo_")
-geo_as_ewkt = _wrap_deprecated(ir.GeoSpatialValue.as_ewkt, "geo_")
-geo_as_text = _wrap_deprecated(ir.GeoSpatialValue.as_text, "geo_")
-geo_azimuth = _wrap_deprecated(ir.GeoSpatialValue.azimuth, "geo_")
-geo_buffer = _wrap_deprecated(ir.GeoSpatialValue.buffer, "geo_")
-geo_centroid = _wrap_deprecated(ir.GeoSpatialValue.centroid, "geo_")
-geo_contains = _wrap_deprecated(ir.GeoSpatialValue.contains, "geo_")
-geo_contains_properly = _wrap_deprecated(ir.GeoSpatialValue.contains_properly, "geo_")
-geo_covers = _wrap_deprecated(ir.GeoSpatialValue.covers, "geo_")
-geo_covered_by = _wrap_deprecated(ir.GeoSpatialValue.covered_by, "geo_")
-geo_crosses = _wrap_deprecated(ir.GeoSpatialValue.crosses, "geo_")
-geo_d_fully_within = _wrap_deprecated(ir.GeoSpatialValue.d_fully_within, "geo_")
-geo_difference = _wrap_deprecated(ir.GeoSpatialValue.difference, "geo_")
-geo_disjoint = _wrap_deprecated(ir.GeoSpatialValue.disjoint, "geo_")
-geo_distance = _wrap_deprecated(ir.GeoSpatialValue.distance, "geo_")
-geo_d_within = _wrap_deprecated(ir.GeoSpatialValue.d_within, "geo_")
-geo_end_point = _wrap_deprecated(ir.GeoSpatialValue.end_point, "geo_")
-geo_envelope = _wrap_deprecated(ir.GeoSpatialValue.envelope, "geo_")
-geo_equals = _wrap_deprecated(ir.GeoSpatialValue.geo_equals, "geo_")
-geo_geometry_n = _wrap_deprecated(ir.GeoSpatialValue.geometry_n, "geo_")
-geo_geometry_type = _wrap_deprecated(ir.GeoSpatialValue.geometry_type, "geo_")
-geo_intersection = _wrap_deprecated(ir.GeoSpatialValue.intersection, "geo_")
-geo_intersects = _wrap_deprecated(ir.GeoSpatialValue.intersects, "geo_")
-geo_is_valid = _wrap_deprecated(ir.GeoSpatialValue.is_valid, "geo_")
-geo_line_locate_point = _wrap_deprecated(ir.GeoSpatialValue.line_locate_point, "geo_")
-geo_line_merge = _wrap_deprecated(ir.GeoSpatialValue.line_merge, "geo_")
-geo_line_substring = _wrap_deprecated(ir.GeoSpatialValue.line_substring, "geo_")
-geo_length = _wrap_deprecated(ir.GeoSpatialValue.length, "geo_")
-geo_max_distance = _wrap_deprecated(ir.GeoSpatialValue.max_distance, "geo_")
-geo_n_points = _wrap_deprecated(ir.GeoSpatialValue.n_points, "geo_")
-geo_n_rings = _wrap_deprecated(ir.GeoSpatialValue.n_rings, "geo_")
-geo_ordering_equals = _wrap_deprecated(ir.GeoSpatialValue.ordering_equals, "geo_")
-geo_overlaps = _wrap_deprecated(ir.GeoSpatialValue.overlaps, "geo_")
-geo_perimeter = _wrap_deprecated(ir.GeoSpatialValue.perimeter, "geo_")
-geo_point = _wrap_deprecated(ir.NumericValue.point, "geo_")
-geo_point_n = _wrap_deprecated(ir.GeoSpatialValue.point_n, "geo_")
-geo_set_srid = _wrap_deprecated(ir.GeoSpatialValue.set_srid, "geo_")
-geo_simplify = _wrap_deprecated(ir.GeoSpatialValue.simplify, "geo_")
-geo_srid = _wrap_deprecated(ir.GeoSpatialValue.srid, "geo_")
-geo_start_point = _wrap_deprecated(ir.GeoSpatialValue.start_point, "geo_")
-geo_touches = _wrap_deprecated(ir.GeoSpatialValue.touches, "geo_")
-geo_transform = _wrap_deprecated(ir.GeoSpatialValue.transform, "geo_")
-geo_union = _wrap_deprecated(ir.GeoSpatialValue.union, "geo_")
-geo_within = _wrap_deprecated(ir.GeoSpatialValue.within, "geo_")
-geo_x = _wrap_deprecated(ir.GeoSpatialValue.x, "geo_")
-geo_x_max = _wrap_deprecated(ir.GeoSpatialValue.x_max, "geo_")
-geo_x_min = _wrap_deprecated(ir.GeoSpatialValue.x_min, "geo_")
-geo_y = _wrap_deprecated(ir.GeoSpatialValue.y, "geo_")
-geo_y_max = _wrap_deprecated(ir.GeoSpatialValue.y_max, "geo_")
-geo_y_min = _wrap_deprecated(ir.GeoSpatialValue.y_min, "geo_")
-geo_unary_union = _wrap_deprecated(ir.GeoSpatialColumn.unary_union, "geo_")
-negate = _wrap_deprecated(ir.NumericValue.negate)
-
-
 @deferrable
-def ifelse(condition: Any, true_expr: Any, false_expr: Any) -> ir.Value:
+def ifelse(condition: Any, true_expr: Any, false_expr: Any, /) -> ir.Value:
     """Construct a ternary conditional expression.
 
     Parameters
@@ -2345,34 +2485,14 @@ def ifelse(condition: Any, true_expr: Any, false_expr: Any) -> ir.Value:
     return condition.ifelse(true_expr, false_expr)
 
 
-@util.deprecated(instead="use `ibis.ifelse` instead", as_of="7.0")
-def where(cond, true_expr, false_expr) -> ir.Value:
-    """Construct a ternary conditional expression.
-
-    Parameters
-    ----------
-    cond
-        Boolean conditional expression
-    true_expr
-        Expression to return if `cond` evaluates to `True`
-    false_expr
-        Expression to return if `cond` evaluates to `False` or `NULL`
-
-    Returns
-    -------
-    Value : ir.Value
-        The value of `true_expr` if `arg` is `True` else `false_expr`
-
-    """
-    return ifelse(cond, true_expr, false_expr)
-
-
 @deferrable
-def coalesce(*args: Any) -> ir.Value:
+def coalesce(arg: Any, /, *args: Any) -> ir.Value:
     """Return the first non-null value from `args`.
 
     Parameters
     ----------
+    arg
+        First argument from which to choose the first non-null value
     args
         Arguments from which to choose the first non-null value
 
@@ -2384,27 +2504,30 @@ def coalesce(*args: Any) -> ir.Value:
     See Also
     --------
     [`Value.coalesce()`](#ibis.expr.types.generic.Value.coalesce)
-    [`Value.fillna()`](#ibis.expr.types.generic.Value.fillna)
+    [`Value.fill_null()`](#ibis.expr.types.generic.Value.fill_null)
 
     Examples
     --------
     >>> import ibis
     >>> ibis.options.interactive = True
     >>> ibis.coalesce(None, 4, 5)
-    4
-
+    ┌───┐
+    │ 4 │
+    └───┘
     """
-    return ops.Coalesce(args).to_expr()
+    return ops.Coalesce((arg, *args)).to_expr()
 
 
 @deferrable
-def greatest(*args: Any) -> ir.Value:
+def greatest(arg: Any, /, *args: Any) -> ir.Value:
     """Compute the largest value among the supplied arguments.
 
     Parameters
     ----------
+    arg
+        First argument
     args
-        Arguments to choose from
+        Remaining arguments
 
     Returns
     -------
@@ -2416,20 +2539,23 @@ def greatest(*args: Any) -> ir.Value:
     >>> import ibis
     >>> ibis.options.interactive = True
     >>> ibis.greatest(None, 4, 5)
-    5
-
+    ┌───┐
+    │ 5 │
+    └───┘
     """
-    return ops.Greatest(args).to_expr()
+    return ops.Greatest((arg, *args)).to_expr()
 
 
 @deferrable
-def least(*args: Any) -> ir.Value:
+def least(arg: Any, /, *args: Any) -> ir.Value:
     """Compute the smallest value among the supplied arguments.
 
     Parameters
     ----------
+    arg
+        First argument
     args
-        Arguments to choose from
+        Remaining arguments
 
     Returns
     -------
@@ -2441,7 +2567,8 @@ def least(*args: Any) -> ir.Value:
     >>> import ibis
     >>> ibis.options.interactive = True
     >>> ibis.least(None, 4, 5)
-    4
-
+    ┌───┐
+    │ 4 │
+    └───┘
     """
-    return ops.Least(args).to_expr()
+    return ops.Least((arg, *args)).to_expr()

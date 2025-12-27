@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import random
 
-import pandas as pd
 import pytest
 from pytest import param
 
 import ibis
-import ibis.common.exceptions as com
 import ibis.expr.types as ir
 from ibis import _
 from ibis.backends.tests.errors import PsycoPg2InternalError, PyDruidProgrammingError
 
+pd = pytest.importorskip("pandas")
+
 
 @pytest.fixture
 def union_subsets(alltypes, df):
-    cols_a, cols_b, cols_c = (alltypes.columns.copy() for _ in range(3))
+    cols_a, cols_b, cols_c = (list(alltypes.columns) for _ in range(3))
 
     random.seed(89)
     random.shuffle(cols_a)
@@ -35,9 +35,9 @@ def union_subsets(alltypes, df):
 
 
 @pytest.mark.parametrize("distinct", [False, True], ids=["all", "distinct"])
-@pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notimpl(["druid"], raises=PyDruidProgrammingError)
 def test_union(backend, union_subsets, distinct):
-    (a, b, c), (da, db, dc) = union_subsets
+    (a, b, _), (da, db, _) = union_subsets
 
     expr = ibis.union(a, b, distinct=distinct).order_by("id")
     result = expr.execute()
@@ -49,7 +49,7 @@ def test_union(backend, union_subsets, distinct):
     backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notimpl(["druid"], raises=PyDruidProgrammingError)
 def test_union_mixed_distinct(backend, union_subsets):
     (a, b, c), (da, db, dc) = union_subsets
 
@@ -69,16 +69,7 @@ def test_union_mixed_distinct(backend, union_subsets):
             False,
             marks=[
                 pytest.mark.notyet(
-                    [
-                        "impala",
-                        "bigquery",
-                        "dask",
-                        "pandas",
-                        "sqlite",
-                        "snowflake",
-                        "mssql",
-                        "exasol",
-                    ],
+                    ["impala", "bigquery", "sqlite", "snowflake", "mssql", "exasol"],
                     reason="backend doesn't support INTERSECT ALL",
                 ),
                 pytest.mark.notimpl(
@@ -92,8 +83,7 @@ def test_union_mixed_distinct(backend, union_subsets):
         param(True, id="distinct"),
     ],
 )
-@pytest.mark.notimpl(["polars"])
-@pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notimpl(["druid"], raises=PyDruidProgrammingError)
 def test_intersect(backend, alltypes, df, distinct):
     a = alltypes.filter((_.id >= 5200) & (_.id <= 5210))
     b = alltypes.filter((_.id >= 5205) & (_.id <= 5215))
@@ -123,16 +113,7 @@ def test_intersect(backend, alltypes, df, distinct):
             False,
             marks=[
                 pytest.mark.notyet(
-                    [
-                        "impala",
-                        "bigquery",
-                        "dask",
-                        "pandas",
-                        "sqlite",
-                        "snowflake",
-                        "mssql",
-                        "exasol",
-                    ],
+                    ["impala", "bigquery", "sqlite", "snowflake", "mssql", "exasol"],
                     reason="backend doesn't support EXCEPT ALL",
                 ),
                 pytest.mark.notimpl(
@@ -146,8 +127,7 @@ def test_intersect(backend, alltypes, df, distinct):
         param(True, id="distinct"),
     ],
 )
-@pytest.mark.notimpl(["polars"])
-@pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notimpl(["druid"], raises=PyDruidProgrammingError)
 def test_difference(backend, alltypes, df, distinct):
     a = alltypes.filter((_.id >= 5200) & (_.id <= 5210))
     b = alltypes.filter((_.id >= 5205) & (_.id <= 5215))
@@ -187,15 +167,15 @@ def test_table_set_operations_api(alltypes, method):
     "distinct",
     [
         param(
-            True, marks=pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+            True, marks=pytest.mark.notyet(["druid"], raises=PyDruidProgrammingError)
         ),
-        False,
+        param(False, marks=[pytest.mark.notyet(["polars"], strict=False)]),
     ],
 )
 @pytest.mark.parametrize(
     "ordered",
     [
-        False,
+        param(False, marks=[pytest.mark.notyet(["polars"], strict=False)]),
         param(
             True,
             marks=pytest.mark.notyet(
@@ -224,16 +204,7 @@ def test_top_level_union(backend, con, alltypes, distinct, ordered):
             False,
             marks=[
                 pytest.mark.notimpl(
-                    [
-                        "impala",
-                        "bigquery",
-                        "dask",
-                        "mssql",
-                        "pandas",
-                        "snowflake",
-                        "sqlite",
-                        "exasol",
-                    ]
+                    ["impala", "bigquery", "mssql", "snowflake", "sqlite", "exasol"]
                 ),
                 pytest.mark.notimpl(
                     ["risingwave"],
@@ -264,8 +235,7 @@ def test_top_level_union(backend, con, alltypes, distinct, ordered):
         ),
     ],
 )
-@pytest.mark.notimpl(["polars"], raises=com.OperationNotDefinedError)
-@pytest.mark.broken(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notimpl(["druid"], raises=PyDruidProgrammingError)
 def test_top_level_intersect_difference(
     backend, con, alltypes, distinct, opname, expected, ordered
 ):

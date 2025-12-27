@@ -1,20 +1,24 @@
 from __future__ import annotations
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.csv as pcsv
+from operator import methodcaller
+
 import pytest
+from packaging.version import parse as vparse
 from pytest import param
 
 import ibis
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis import util
 from ibis.backends.tests.errors import (
+    DatabricksServerOperationError,
     DuckDBNotImplementedException,
     DuckDBParserException,
     ExaQueryError,
     MySQLOperationalError,
     OracleDatabaseError,
+    Py4JJavaError,
+    PyAthenaOperationalError,
     PyDeltaTableError,
     PyDruidProgrammingError,
     PyODBCProgrammingError,
@@ -23,25 +27,33 @@ from ibis.backends.tests.errors import (
     SnowflakeProgrammingError,
     TrinoUserError,
 )
-from ibis.formats.pyarrow import PyArrowType
+from ibis.conftest import IS_SPARK_REMOTE
 
-limit = [
-    param(
-        42,
-        id="limit",
-        # limit not implemented for pandas-family backends
-        marks=[pytest.mark.notimpl(["dask", "pandas"])],
-    ),
-]
+pd = pytest.importorskip("pandas")
+pa = pytest.importorskip("pyarrow")
+pat = pytest.importorskip("pyarrow.types")
 
-no_limit = [
-    param(
-        None,
-        id="nolimit",
-    )
-]
+limit = [param(42, id="limit")]
+
+no_limit = [param(None, id="nolimit")]
 
 limit_no_limit = limit + no_limit
+
+
+@pytest.mark.skipif(
+    vparse(pa.__version__) < vparse("14"), reason="pyarrow >= 14 required"
+)
+def test_table___arrow_c_stream__(awards_players):
+    sol = awards_players.to_pyarrow()
+    res = pa.table(awards_players)
+    assert res.schema.equals(sol.schema)
+    assert len(res) == len(sol)
+
+    # With explicit schema
+    schema = awards_players.schema().to_pyarrow()
+    res = pa.table(awards_players, schema=schema)
+    assert res.schema.equals(sol.schema)
+    assert len(res) == len(sol)
 
 
 @pytest.mark.parametrize("limit", limit_no_limit)
@@ -51,7 +63,7 @@ def test_table_to_pyarrow_batches(limit, awards_players):
         batch = batch_reader.read_next_batch()
         assert isinstance(batch, pa.RecordBatch)
         if limit is not None:
-            assert len(batch) == limit
+            assert len(batch) <= limit
         util.consume(batch_reader)
 
 
@@ -62,7 +74,7 @@ def test_column_to_pyarrow_batches(limit, awards_players):
         batch = batch_reader.read_next_batch()
         assert isinstance(batch, pa.RecordBatch)
         if limit is not None:
-            assert len(batch) == limit
+            assert len(batch) <= limit
         util.consume(batch_reader)
 
 
@@ -129,11 +141,11 @@ def test_column_to_pyarrow_table_schema(awards_players):
     assert array.type == pa.string() or array.type == pa.large_string()
 
 
-@pytest.mark.notimpl(["pandas", "dask", "datafusion", "flink"])
+@pytest.mark.notimpl(["datafusion", "flink"])
 @pytest.mark.notyet(
-    ["clickhouse"],
+    ["clickhouse", "athena"],
     raises=AssertionError,
-    reason="clickhouse connect doesn't seem to respect `max_block_size` parameter",
+    reason="backend doesn't respect chunk_size parameter",
 )
 def test_table_pyarrow_batch_chunk_size(awards_players):
     with awards_players.to_pyarrow_batches(limit=2050, chunk_size=2048) as batch_reader:
@@ -144,11 +156,11 @@ def test_table_pyarrow_batch_chunk_size(awards_players):
         util.consume(batch_reader)
 
 
-@pytest.mark.notimpl(["pandas", "dask", "datafusion", "flink"])
+@pytest.mark.notimpl(["datafusion", "flink"])
 @pytest.mark.notyet(
-    ["clickhouse"],
+    ["clickhouse", "athena"],
     raises=AssertionError,
-    reason="clickhouse connect doesn't seem to respect `max_block_size` parameter",
+    reason="backend doesn't respect chunk_size parameter",
 )
 def test_column_pyarrow_batch_chunk_size(awards_players):
     with awards_players.awardID.to_pyarrow_batches(
@@ -161,8 +173,7 @@ def test_column_pyarrow_batch_chunk_size(awards_players):
         util.consume(batch_reader)
 
 
-@pytest.mark.notimpl(["pandas", "dask"])
-@pytest.mark.broken(
+@pytest.mark.notimpl(
     ["sqlite"],
     raises=pa.ArrowException,
     reason="Test data has empty strings in columns typed as int64",
@@ -170,11 +181,12 @@ def test_column_pyarrow_batch_chunk_size(awards_players):
 def test_to_pyarrow_batches_borked_types(batting):
     """This is a temporary test to expose an(other) issue with sqlite typing
     shenanigans."""
-    with batting.to_pyarrow_batches(limit=42) as batch_reader:
+    limit = 42
+    with batting.to_pyarrow_batches(limit=limit) as batch_reader:
         assert isinstance(batch_reader, pa.ipc.RecordBatchReader)
         batch = batch_reader.read_next_batch()
         assert isinstance(batch, pa.RecordBatch)
-        assert len(batch) == 42
+        assert len(batch) <= limit
         util.consume(batch_reader)
 
 
@@ -196,6 +208,8 @@ def test_to_pyarrow_batches_memtable(con):
 
 
 def test_table_to_parquet(tmp_path, backend, awards_players):
+    if backend.name() == "pyspark" and IS_SPARK_REMOTE:
+        pytest.skip("writes to remote output directory")
     outparquet = tmp_path / "out.parquet"
     awards_players.to_parquet(outparquet)
 
@@ -204,6 +218,36 @@ def test_table_to_parquet(tmp_path, backend, awards_players):
     backend.assert_frame_equal(
         awards_players.to_pandas().fillna(pd.NA), df.fillna(pd.NA)
     )
+
+
+def test_table_to_parquet_dir(tmp_path, backend, awards_players):
+    outparquet_dir = tmp_path / "out"
+
+    if backend.name() == "pyspark":
+        if IS_SPARK_REMOTE:
+            pytest.skip("writes to remote output directory")
+        # pyspark already writes more than one file
+        awards_players.to_parquet_dir(outparquet_dir)
+    else:
+        # max_ force pyarrow to write more than one parquet file
+        awards_players.to_parquet_dir(
+            outparquet_dir, max_rows_per_file=3000, max_rows_per_group=3000
+        )
+
+    parquet_files = sorted(
+        outparquet_dir.glob("*.parquet"),
+        key=lambda path: int(path.with_suffix("").name.split("-")[1]),
+    )
+
+    sort_keys = list(awards_players.columns)
+
+    expected = (
+        pd.concat(map(pd.read_parquet, parquet_files))
+        .sort_values(sort_keys)
+        .reset_index(drop=True)
+    )
+    result = awards_players.to_pandas().sort_values(sort_keys).reset_index(drop=True)
+    backend.assert_frame_equal(result, expected)
 
 
 @pytest.mark.notimpl(
@@ -216,28 +260,43 @@ def test_table_to_parquet_writer_kwargs(version, tmp_path, backend, awards_playe
     outparquet = tmp_path / "out.parquet"
     awards_players.to_parquet(outparquet, version=version)
 
-    df = pd.read_parquet(outparquet)
+    if backend.name() == "pyspark":
+        if IS_SPARK_REMOTE:
+            pytest.skip("writes to remote output directory")
+        # Pyspark will write more than one parquet file under outparquet as directory
+        parquet_files = sorted(outparquet.glob("*.parquet"))
+        df = (
+            pd.concat(map(pd.read_parquet, parquet_files))
+            .sort_values(list(awards_players.columns))
+            .reset_index(drop=True)
+        )
+        result = (
+            awards_players.to_pandas()
+            .sort_values(list(awards_players.columns))
+            .reset_index(drop=True)
+        )
+        backend.assert_frame_equal(result, df)
+    else:
+        df = pd.read_parquet(outparquet)
 
-    backend.assert_frame_equal(
-        awards_players.to_pandas().fillna(pd.NA), df.fillna(pd.NA)
-    )
+        backend.assert_frame_equal(
+            awards_players.to_pandas().fillna(pd.NA), df.fillna(pd.NA)
+        )
 
-    md = pa.parquet.read_metadata(outparquet)
+        md = pa.parquet.read_metadata(outparquet)
 
-    assert md.format_version == version
+        assert md.format_version == version
 
 
 @pytest.mark.notimpl(
     [
         "bigquery",
         "clickhouse",
-        "dask",
         "datafusion",
         "impala",
         "mssql",
         "mysql",
         "oracle",
-        "pandas",
         "polars",
         "postgres",
         "risingwave",
@@ -245,6 +304,8 @@ def test_table_to_parquet_writer_kwargs(version, tmp_path, backend, awards_playe
         "snowflake",
         "sqlite",
         "trino",
+        "databricks",
+        "athena",
     ],
     reason="no partitioning support",
 )
@@ -262,15 +323,17 @@ def test_roundtrip_partitioned_parquet(tmp_path, con, backend, awards_players):
 
     # Reingest and compare schema
     reingest = con.read_parquet(outparquet / "*" / "*")
-    reingest = reingest.cast({"yearID": "int64"})
 
     # avoid type comparison to appease duckdb: as of 0.8.0 it returns large_string
-    assert reingest.schema().names == awards_players.schema().names
+    assert reingest.schema().keys() == awards_players.schema().keys()
 
     reingest = reingest.order_by(["yearID", "playerID", "awardID", "lgID"])
     awards_players = awards_players.order_by(["yearID", "playerID", "awardID", "lgID"])
 
-    backend.assert_frame_equal(reingest.to_pandas(), awards_players.to_pandas())
+    # reorder columns to match the partitioning
+    backend.assert_frame_equal(
+        reingest.to_pandas(), awards_players[reingest.columns].to_pandas()
+    )
 
 
 @pytest.mark.parametrize("ftype", ["csv", "parquet"])
@@ -290,7 +353,12 @@ def test_memtable_to_file(tmp_path, con, ftype, monkeypatch):
 
     getattr(con, f"to_{ftype}")(memtable, outfile)
 
-    assert outfile.is_file()
+    if con.name == "pyspark" and ftype == "parquet":
+        if IS_SPARK_REMOTE:
+            pytest.skip("writes to remote output directory")
+        assert outfile.is_dir()
+    else:
+        assert outfile.is_file()
 
 
 def test_table_to_csv(tmp_path, backend, awards_players):
@@ -307,12 +375,46 @@ def test_table_to_csv(tmp_path, backend, awards_players):
 
 
 @pytest.mark.notimpl(
+    [
+        "athena",
+        "bigquery",
+        "clickhouse",
+        "databricks",
+        "datafusion",
+        "druid",
+        "exasol",
+        "flink",
+        "impala",
+        "mssql",
+        "mysql",
+        "oracle",
+        "polars",
+        "postgres",
+        "pyspark",
+        "risingwave",
+        "snowflake",
+        "sqlite",
+        "trino",
+    ],
+    reason="haven't gotten to them yet. Might be easy!",
+    raises=NotImplementedError,
+)
+def test_to_json(backend, tmp_path, awards_players):
+    out_path = tmp_path / "out.json"
+    awards_players.to_json(out_path)
+    df = pd.read_json(out_path, orient="records")
+    backend.assert_frame_equal(awards_players.to_pandas(), df)
+
+
+@pytest.mark.notimpl(
     ["duckdb"],
     reason="cannot inline WriteOptions objects",
     raises=DuckDBParserException,
 )
 @pytest.mark.parametrize("delimiter", [";", "\t"], ids=["semicolon", "tab"])
 def test_table_to_csv_writer_kwargs(delimiter, tmp_path, awards_players):
+    import pyarrow.csv as pcsv
+
     outcsv = tmp_path / "out.csv"
     # avoid pandas NaNonense
     awards_players = awards_players.select("playerID", "awardID", "yearID", "lgID")
@@ -341,6 +443,7 @@ def test_table_to_csv_writer_kwargs(delimiter, tmp_path, awards_players):
                 pytest.mark.notyet(["mssql"], raises=PyODBCProgrammingError),
                 pytest.mark.notyet(["snowflake"], raises=SnowflakeProgrammingError),
                 pytest.mark.notyet(["trino"], raises=TrinoUserError),
+                pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError),
                 pytest.mark.notyet(["oracle"], raises=OracleDatabaseError),
                 pytest.mark.notyet(["mysql"], raises=MySQLOperationalError),
                 pytest.mark.notyet(
@@ -349,11 +452,17 @@ def test_table_to_csv_writer_kwargs(delimiter, tmp_path, awards_players):
                     reason="precision is out of range",
                 ),
                 pytest.mark.notyet(["exasol"], raises=ExaQueryError),
+                pytest.mark.notyet(
+                    ["databricks"], raises=DatabricksServerOperationError
+                ),
             ],
         ),
     ],
 )
 def test_to_pyarrow_decimal(backend, dtype, pyarrow_dtype):
+    if backend.name() == "polars":
+        pytest.skip("polars crashes the interpreter")
+
     result = (
         backend.functional_alltypes.limit(1)
         .double_col.cast(dtype)
@@ -375,21 +484,22 @@ def test_to_pyarrow_decimal(backend, dtype, pyarrow_dtype):
         "snowflake",
         "sqlite",
         "bigquery",
-        "dask",
         "trino",
         "exasol",
         "druid",
+        "databricks",  # feels a bit weird given it's their format ¯\_(ツ)_/¯
+        "athena",
     ],
     raises=NotImplementedError,
     reason="read_delta not yet implemented",
 )
 @pytest.mark.notyet(["clickhouse"], raises=Exception)
-@pytest.mark.notyet(["mssql", "pandas"], raises=PyDeltaTableError)
+@pytest.mark.notyet(["mssql"], raises=PyDeltaTableError)
 def test_roundtrip_delta(backend, con, alltypes, tmp_path, monkeypatch):
     if con.name == "pyspark":
         pytest.importorskip("delta")
     else:
-        pytest.importorskip("deltalake")
+        pytest.importorskip("deltalake", exc_type=ImportError)
 
     t = alltypes.head()
     expected = t.to_pandas()
@@ -400,13 +510,24 @@ def test_roundtrip_delta(backend, con, alltypes, tmp_path, monkeypatch):
     dt = ibis.read_delta(path)
     result = dt.to_pandas()
 
-    backend.assert_frame_equal(result, expected)
+    backend.assert_frame_equal(
+        result.sort_values(["id"]).reset_index(drop=True),
+        expected.sort_values(["id"]).reset_index(drop=True),
+    )
 
 
 @pytest.mark.notimpl(
-    ["druid"], raises=AttributeError, reason="string type is used for timestamp_col"
+    ["druid"],
+    raises=PyDruidProgrammingError,
+    reason="Invalid SQL generated; druid doesn't know about TIMESTAMPTZ",
 )
+@pytest.mark.notimpl(
+    ["databricks"], raises=AssertionError, reason="Only the devil knows"
+)
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
 def test_arrow_timestamp_with_time_zone(alltypes):
+    from ibis.formats.pyarrow import PyArrowType
+
     t = alltypes.select(
         tz=alltypes.timestamp_col.cast(
             alltypes.timestamp_col.type().copy(timezone="UTC")
@@ -484,9 +605,8 @@ def test_to_pandas_batches_column(backend, con, n):
     assert sum(map(len, t.to_pandas_batches())) == n
 
 
-@pytest.mark.notimpl(["druid"])
 def test_to_pandas_batches_scalar(backend, con):
-    t = backend.functional_alltypes.timestamp_col.max()
+    t = backend.functional_alltypes.int_col.max()
     expected = t.execute()
 
     result1 = list(con.to_pandas_batches(t))
@@ -519,20 +639,106 @@ def test_table_to_polars(limit, awards_players):
 
 
 @pytest.mark.parametrize("limit", limit_no_limit)
-def test_column_to_polars(limit, awards_players):
-    pl = pytest.importorskip("polars")
-    res = awards_players.awardID.to_polars(limit=limit)
-    assert isinstance(res, pl.Series)
-    if limit is not None:
-        assert len(res) == limit
+@pytest.mark.parametrize(
+    ("output_format", "expected_column_type"),
+    [("pyarrow", "ChunkedArray"), ("polars", "Series")],
+    ids=["pyarrow", "polars"],
+)
+def test_column_to_memory(limit, awards_players, output_format, expected_column_type):
+    mod = pytest.importorskip(output_format)
+    method = methodcaller(f"to_{output_format}", limit=limit)
+    res = method(awards_players.awardID)
+    assert isinstance(res, getattr(mod, expected_column_type))
+    assert (
+        (len(res) == limit)
+        if limit is not None
+        else len(res) == awards_players.count().execute()
+    )
+
+
+@pytest.mark.parametrize("limit", limit_no_limit)
+def test_column_to_list(limit, awards_players):
+    res = awards_players.awardID.to_list(limit=limit)
+    assert isinstance(res, list)
+    assert (
+        (len(res) == limit)
+        if limit is not None
+        else len(res) == awards_players.count().execute()
+    )
 
 
 @pytest.mark.parametrize("limit", no_limit)
-def test_scalar_to_polars(limit, awards_players):
-    pytest.importorskip("polars")
-    scalar = awards_players.yearID.min().to_polars(limit=limit)
-    assert isinstance(scalar, int)
+@pytest.mark.parametrize(
+    ("output_format", "converter"),
+    [("pyarrow", methodcaller("as_py")), ("polars", lambda x: x)],
+    ids=["pyarrow", "polars"],
+)
+def test_scalar_to_memory(limit, awards_players, output_format, converter):
+    pytest.importorskip(output_format)
+    method = methodcaller(f"to_{output_format}", limit=limit)
+    scalar = method(awards_players.yearID.min())
+    assert isinstance(converter(scalar), int)
 
     expr = awards_players.filter(awards_players.awardID == "DEADBEEF").yearID.min()
-    res = expr.to_polars(limit=limit)
-    assert res is None
+    res = method(expr)
+
+    assert converter(res) is None
+
+
+mark_notyet_nulls = pytest.mark.notyet(
+    [
+        "clickhouse",
+        "exasol",
+        "flink",
+        "impala",
+        "mssql",
+        "mysql",
+        "oracle",
+        "postgres",
+        "risingwave",
+        "trino",
+    ],
+    raises=com.IbisTypeError,
+    reason="unable to handle null types as input",
+)
+
+
+@mark_notyet_nulls
+@pytest.mark.notyet(["snowflake"], raises=SnowflakeProgrammingError)
+@pytest.mark.notyet(["bigquery"], raises=UserWarning)
+@pytest.mark.notyet(["databricks"], raises=pa.ArrowNotImplementedError)
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
+def test_all_null_table(con):
+    t = ibis.memtable({"a": [None]})
+    result = con.to_pyarrow(t)
+    assert pat.is_null(result["a"].type)
+
+
+@mark_notyet_nulls
+@pytest.mark.notyet(["snowflake"], raises=SnowflakeProgrammingError)
+@pytest.mark.notyet(["bigquery"], raises=UserWarning)
+@pytest.mark.notyet(["databricks"], raises=pa.ArrowNotImplementedError)
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
+def test_all_null_column(con):
+    t = ibis.memtable({"a": [None]})
+    result = con.to_pyarrow(t.a)
+    assert pat.is_null(result.type)
+
+
+@pytest.mark.notyet(["flink"], raises=Py4JJavaError)
+@pytest.mark.notyet(
+    ["snowflake", "bigquery", "databricks"], raises=pa.ArrowNotImplementedError
+)
+@pytest.mark.notyet(["athena"], raises=PyAthenaOperationalError)
+def test_all_null_scalar(con):
+    e = ibis.literal(None)
+    result = con.to_pyarrow(e)
+    assert pat.is_null(result.type)
+
+
+def test_cast_non_null(con):
+    new_ids = ibis.memtable({"id": ["my_id"]}).cast({"id": "!string"})
+    assert not new_ids.schema()["id"].nullable
+
+    table = con.to_pyarrow(new_ids)
+    assert not table.schema.field("id").nullable

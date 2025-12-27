@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import datetime  # noqa: TCH003
-import decimal  # noqa: TCH003
+import datetime  # noqa: TC003
+import decimal  # noqa: TC003
 import sys
-import uuid  # noqa: TCH003
+import uuid  # noqa: TC003
 from dataclasses import dataclass
-from typing import Annotated, NamedTuple
+from typing import Annotated, NamedTuple, Optional, Union
 
 import pytest
 from pytest import param
@@ -14,6 +14,7 @@ import ibis.expr.datatypes as dt
 from ibis.common.annotations import ValidationError
 from ibis.common.patterns import As, Attrs, NoMatch, Pattern
 from ibis.common.temporal import TimestampUnit, TimeUnit
+from ibis.util import get_subclasses
 
 
 def test_validate_type():
@@ -51,6 +52,38 @@ def test_validate_type():
 )
 def test_dtype(spec, expected):
     assert dt.dtype(spec) == expected
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (lambda: (int,), dt.Int64(nullable=True)),
+        (lambda: (int, False), dt.Int64(nullable=False)),
+        (lambda: (Union[int, None],), dt.Int64(nullable=True)),
+        (lambda: (Union[int, None], False), dt.Int64(nullable=False)),
+        (lambda: (Optional[int],), dt.Int64(nullable=True)),
+        (lambda: (Optional[int], False), dt.Int64(nullable=False)),
+        pytest.param(
+            lambda: (int | None,),
+            dt.Int64(nullable=True),
+            marks=pytest.mark.xfail(sys.version_info < (3, 10), reason="python 3.9"),
+        ),
+        pytest.param(
+            lambda: (int | None, False),
+            dt.Int64(nullable=False),
+            marks=pytest.mark.xfail(sys.version_info < (3, 10), reason="python 3.9"),
+        ),
+        (lambda: ("!int",), dt.Int64(nullable=False)),
+        (lambda: ("!int", True), dt.Int64(nullable=False)),  # "!" overrides `nullable`
+    ],
+)
+def test_nullable_dtype(args, expected):
+    assert dt.dtype(*args()) == expected
+
+
+def test_bogus_union():
+    with pytest.raises(TypeError):
+        dt.dtype(Union[int, str])
 
 
 @pytest.mark.parametrize(
@@ -323,7 +356,6 @@ def test_dtype_from_typehints(hint, expected):
 
 
 @pytest.mark.parametrize(("hint", "expected"), [(PyStruct2, py_struct_2)])
-@pytest.mark.skipif(sys.version_info < (3, 9), reason="requires python3.9 or higher")
 def test_dtype_from_newer_typehints(hint, expected):
     assert dt.dtype(hint) == expected
 
@@ -419,6 +451,18 @@ def test_struct_set_operations():
     assert c < d
     assert d >= c
     assert d > c
+
+
+def test_struct_equality():
+    st1 = dt.Struct({"a": dt.int64, "b": dt.string})
+    st2 = dt.Struct({"a": dt.int64, "b": dt.string})
+    st3 = dt.Struct({"b": dt.string, "a": dt.int64})
+    st4 = dt.Struct({"a": dt.int64, "b": dt.string, "c": dt.float64})
+
+    assert st1 == st2
+    assert st1 != st3
+    assert st1 != st4
+    assert st3 != st2
 
 
 def test_singleton_null():
@@ -531,15 +575,9 @@ def test_timestamp_from_unit():
     )
 
 
-def get_leaf_classes(op):
-    for child_class in op.__subclasses__():
-        yield child_class
-        yield from get_leaf_classes(child_class)
-
-
 @pytest.mark.parametrize(
     "dtype_class",
-    set(get_leaf_classes(dt.DataType))
+    set(get_subclasses(dt.DataType))
     - {
         # these require special case tests
         dt.Array,
@@ -564,6 +602,14 @@ def test_is_methods(dtype_class):
     dtype = getattr(dt, name)
     is_dtype = getattr(dtype, f"is_{name}")()
     assert is_dtype is True
+
+
+def test_is_fixed_length_array():
+    dtype = dt.Array(dt.int8)
+    assert not dtype.is_fixed_length_array()
+
+    dtype = dt.Array(dt.int8, 10)
+    assert dtype.is_fixed_length_array()
 
 
 def test_is_array():

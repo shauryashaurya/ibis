@@ -19,7 +19,7 @@ PG_PASS = os.environ.get(
 PG_HOST = os.environ.get(
     "IBIS_TEST_RISINGWAVE_HOST", os.environ.get("PGHOST", "localhost")
 )
-PG_PORT = os.environ.get("IBIS_TEST_RISINGWAVE_PORT", os.environ.get("PGPORT", 4566))
+PG_PORT = os.environ.get("IBIS_TEST_RISINGWAVE_PORT", os.environ.get("PGPORT", "4566"))
 IBIS_TEST_RISINGWAVE_DB = os.environ.get(
     "IBIS_TEST_RISINGWAVE_DATABASE", os.environ.get("PGDATABASE", "dev")
 )
@@ -53,7 +53,7 @@ class TestConf(ServiceBackendTest):
             pass
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, port: int | None = None, **kw):
+    def connect(*, tmpdir, worker_id, port: int | None = None, **kw):  # noqa: ARG004
         con = ibis.risingwave.connect(
             host=PG_HOST,
             port=port or PG_PORT,
@@ -69,7 +69,8 @@ class TestConf(ServiceBackendTest):
 
 @pytest.fixture(scope="session")
 def con(tmp_path_factory, data_dir, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
 @pytest.fixture(scope="module")
@@ -80,8 +81,3 @@ def alltypes(con):
 @pytest.fixture(scope="module")
 def df(alltypes):
     return alltypes.execute()
-
-
-@pytest.fixture(scope="module")
-def intervals(con):
-    return con.table("intervals")

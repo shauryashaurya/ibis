@@ -56,6 +56,20 @@ module.exports = {
               }
             ],
             countMatches: true
+          },
+          {
+            files: ["CITATION.cff"],
+            from: "^version: .*",
+            to: "version: ${nextRelease.version}",
+            results: [
+              {
+                file: "CITATION.cff",
+                hasChanged: true,
+                numMatches: 1,
+                numReplacements: 1
+              }
+            ],
+            countMatches: true
           }
         ]
       }
@@ -63,11 +77,9 @@ module.exports = {
     [
       "@semantic-release/exec",
       {
-        verifyConditionsCmd:
-          "ci/release/verify_conditions.sh ${options.dryRun}",
+        verifyConditionsCmd: "ci/release/verify_conditions.sh",
         verifyReleaseCmd: "ci/release/verify_release.sh ${nextRelease.version}",
-        prepareCmd: "ci/release/prepare.sh ${nextRelease.version}",
-        publishCmd: "ci/release/publish.sh"
+        prepareCmd: "ci/release/prepare.sh ${nextRelease.version}"
       }
     ],
     [
@@ -82,8 +94,10 @@ module.exports = {
       {
         assets: [
           "pyproject.toml",
+          "uv.lock",
           "docs/release_notes_generated.qmd",
-          "ibis/__init__.py"
+          "ibis/__init__.py",
+          "CITATION.cff"
         ],
         message: "chore(release): ${nextRelease.version}"
       }

@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
-import functools
 from collections import defaultdict
-from collections.abc import Mapping
+from typing import TYPE_CHECKING, Optional
 
 import toolz
+from typing_extensions import Self
 
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.common.collections import FrozenDict  # noqa: TCH001
+from ibis.common.collections import FrozenDict  # noqa: TC001
 from ibis.common.deferred import Item, _, deferred, var
 from ibis.common.exceptions import ExpressionError, IbisInputError
 from ibis.common.graph import Node as Traversable
-from ibis.common.grounds import Concrete
+from ibis.common.graph import traverse
+from ibis.common.grounds import Annotable
 from ibis.common.patterns import Check, pattern, replace
-from ibis.common.typing import VarTuple  # noqa: TCH001
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.util import Namespace, promote_list
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
+
+    import ibis.expr.types as ir
 
 p = Namespace(pattern, module=ops)
 d = Namespace(deferred, module=ops)
@@ -28,7 +33,7 @@ y = var("y")
 name = var("name")
 
 
-class DerefMap(Concrete, Traversable):
+class DerefMap(Annotable, Traversable):
     """Trace and replace fields from earlier relations in the hierarchy.
 
     In order to provide a nice user experience, we need to allow expressions
@@ -54,16 +59,22 @@ class DerefMap(Concrete, Traversable):
     """
 
     """The relations we want the values to point to."""
-    rels: VarTuple[ops.Relation]
+    rels: frozenset[ops.Relation]
+
+    """Extra substitutions to be added to the dereference map. Stored on the
+    instance to facilitate lazy dereferencing."""
+    extra: Optional[FrozenDict[ops.Node, ops.Node]]
 
     """Substitution mapping from values of earlier relations to the fields of `rels`."""
-    subs: FrozenDict[ops.Value, ops.Field]
+    subs: Optional[FrozenDict[ops.Value, ops.Field]] = None
 
     """Ambiguous field references."""
-    ambigs: FrozenDict[ops.Value, VarTuple[ops.Value]]
+    ambigs: Optional[FrozenDict[ops.Value, VarTuple[ops.Value]]] = None
 
     @classmethod
-    def from_targets(cls, rels, extra=None):
+    def from_targets(
+        cls, rels, extra: Mapping[ops.Node, ops.Node] | None = None
+    ) -> Self:
         """Create a dereference map from a list of target relations.
 
         Usually a single relation is passed except for joins where multiple
@@ -71,40 +82,19 @@ class DerefMap(Concrete, Traversable):
 
         Parameters
         ----------
-        rels : list of ops.Relation
+        rels
             The target relations to dereference to.
-        extra : dict, optional
+        extra
             Extra substitutions to be added to the dereference map.
 
         Returns
         -------
         DerefMap
         """
-        rels = promote_list(rels)
-        mapping = defaultdict(dict)
-        for rel in rels:
-            for field in rel.fields.values():
-                for value, distance in cls.backtrack(field):
-                    mapping[value][field] = distance
-
-        subs, ambigs = {}, {}
-        for from_, to in mapping.items():
-            mindist = min(to.values())
-            minkeys = [k for k, v in to.items() if v == mindist]
-            # if all the closest fields are from the same relation, then we
-            # can safely substitute them and we pick the first one arbitrarily
-            if all(minkeys[0].relations == k.relations for k in minkeys):
-                subs[from_] = minkeys[0]
-            else:
-                ambigs[from_] = minkeys
-
-        if extra is not None:
-            subs.update(extra)
-
-        return cls(rels, subs, ambigs)
+        return cls(rels=frozenset(promote_list(rels)), extra=extra)
 
     @classmethod
-    def backtrack(cls, value):
+    def backtrack(cls, value) -> Iterator[tuple[ops.Field, int]]:
         """Backtrack the field in the relation hierarchy.
 
         The field is traced back until no modification is made, so only follow
@@ -127,31 +117,105 @@ class DerefMap(Concrete, Traversable):
             yield value, distance
             value = value.rel.values.get(value.name)
             distance += 1
-        if value is not None and not value.find(ops.Impure, filter=ops.Value):
+        if (
+            value is not None
+            and value.relations
+            and not value.find(ops.Impure, filter=ops.Value)
+        ):
             yield value, distance
 
-    def dereference(self, value):
-        """Dereference a value to the target relations.
+    def _fill_substitution_mappings(self) -> None:
+        if self.subs is not None and self.ambigs is not None:
+            return
+
+        mapping = defaultdict(dict)
+
+        for rel in self.rels:
+            for field in rel.fields.values():
+                for val, distance in self.__class__.backtrack(field):
+                    mapping[val][field] = distance
+
+        subs, ambigs = {}, {}
+        for from_, to in mapping.items():
+            mindist = min(to.values())
+            minkeys = [k for k, v in to.items() if v == mindist]
+            # if all the closest fields are from the same relation, then we
+            # can safely substitute them and we pick the first one arbitrarily
+            if all(minkeys[0].relations == k.relations for k in minkeys):
+                subs[from_] = minkeys[0]
+            else:
+                ambigs[from_] = minkeys
+
+        if extra := self.extra:
+            subs.update(extra)
+
+        self.subs = subs
+        self.ambigs = ambigs
+
+    def dereference(self, *values: ir.Value) -> Iterator[ops.Value]:
+        """Dereference values to target relations.
 
         Also check for ambiguous field references. If a field reference is found
         which is marked as ambiguous, then raise an error.
 
         Parameters
         ----------
-        value : ops.Value
-            The value to dereference.
+        values
+            Expression values to dereference.
 
         Returns
         -------
-        ops.Value
-            The dereferenced value.
+        tuple[ops.Value]
+            The dereferenced values.
         """
-        ambigs = value.find(lambda x: x in self.ambigs, filter=ops.Value)
-        if ambigs:
-            raise IbisInputError(
-                f"Ambiguous field reference {ambigs!r} in expression {value!r}"
-            )
-        return value.replace(self.subs, filter=ops.Value)
+        for v in values:
+            if (rels := v.relations) and rels != self.rels:
+                # called on every iteration but only does work once per
+                # instance
+                self._fill_substitution_mappings()
+
+                if ambigs := v.find(self.ambigs.__contains__, filter=ops.Value):
+                    raise IbisInputError(
+                        f"Ambiguous field reference {ambigs!r} in expression {v!r}"
+                    )
+                yield v.replace(self.subs, filter=ops.Value)
+            else:
+                yield v
+
+
+def flatten_predicates(node):
+    """Yield the expressions corresponding to the `And` nodes of a predicate.
+
+    Examples
+    --------
+    >>> import ibis
+    >>> t = ibis.table([("a", "int64"), ("b", "string")], name="t")
+    >>> filt = (t.a == 1) & (t.b == "foo")
+    >>> predicates = flatten_predicates(filt.op())
+    >>> len(predicates)
+    2
+    >>> predicates[0].to_expr().name("left")
+    r0 := UnboundTable: t
+      a int64
+      b string
+    left: r0.a == 1
+    >>> predicates[1].to_expr().name("right")
+    r0 := UnboundTable: t
+      a int64
+      b string
+    right: r0.b == 'foo'
+
+    """
+
+    def predicate(node):
+        if isinstance(node, ops.And):
+            # proceed and don't yield the node
+            return True, None
+        else:
+            # halt and yield the node
+            return False, node
+
+    return list(traverse(predicate, node))
 
 
 @replace(p.Field(p.JoinChain))
@@ -165,56 +229,8 @@ def replace_parameter(_, params, **kwargs):
     return ops.Literal(value=params[_], dtype=_.dtype)
 
 
-@replace(p.FillNa)
-def rewrite_fillna(_):
-    """Rewrite FillNa expressions to use more common operations."""
-    if isinstance(_.replacements, Mapping):
-        mapping = _.replacements
-    else:
-        mapping = {
-            name: _.replacements
-            for name, type in _.parent.schema.items()
-            if type.nullable
-        }
-
-    if not mapping:
-        return _.parent
-
-    selections = []
-    for name in _.parent.schema.names:
-        col = ops.Field(_.parent, name)
-        if (value := mapping.get(name)) is not None:
-            col = ops.Alias(ops.Coalesce((col, value)), name)
-        selections.append(col)
-
-    return ops.Project(_.parent, selections)
-
-
-@replace(p.DropNa)
-def rewrite_dropna(_):
-    """Rewrite DropNa expressions to use more common operations."""
-    if _.subset is None:
-        columns = [ops.Field(_.parent, name) for name in _.parent.schema.names]
-    else:
-        columns = _.subset
-
-    if columns:
-        preds = [
-            functools.reduce(
-                ops.And if _.how == "any" else ops.Or,
-                [ops.NotNull(c) for c in columns],
-            )
-        ]
-    elif _.how == "all":
-        preds = [ops.Literal(False, dtype=dt.bool)]
-    else:
-        return _.parent
-
-    return ops.Filter(_.parent, tuple(preds))
-
-
 @replace(p.StringSlice)
-def rewrite_stringslice(_, **kwargs):
+def lower_stringslice(_, **kwargs):
     """Rewrite StringSlice in terms of Substring."""
     if _.end is None:
         return ops.Substring(_.arg, start=_.start)
@@ -234,7 +250,7 @@ def rewrite_stringslice(_, **kwargs):
 
 
 @replace(p.Analytic)
-def project_wrap_analytic(_, rel):
+def wrap_analytic(_, **__):
     # Wrap analytic functions in a window function
     return ops.WindowFunction(_)
 
@@ -245,7 +261,7 @@ def project_wrap_reduction(_, rel):
     if _.relations == {rel}:
         # The reduction is fully originating from the `rel`, so turn
         # it into a window function of `rel`
-        return ops.WindowFunction(_)
+        return ops.WindowFunction(_, order_by=getattr(_, "order_by", ()))
     else:
         # 1. The reduction doesn't depend on any table, constructed from
         #    scalar values, so turn it into a scalar subquery.
@@ -261,7 +277,7 @@ def rewrite_project_input(value, relation):
     # or scalar subqueries depending on whether they are originating from the
     # relation
     return value.replace(
-        project_wrap_analytic | project_wrap_reduction,
+        wrap_analytic | project_wrap_reduction,
         filter=p.Value & ~p.WindowFunction,
         context={"rel": relation},
     )
@@ -283,7 +299,9 @@ def filter_wrap_reduction(_):
 
 
 def rewrite_filter_input(value):
-    return value.replace(filter_wrap_reduction, filter=p.Value & ~p.WindowFunction)
+    return value.replace(
+        wrap_analytic | filter_wrap_reduction, filter=p.Value & ~p.WindowFunction
+    )
 
 
 @replace(p.Analytic | p.Reduction)
@@ -320,9 +338,12 @@ def window_merge_frames(_, window):
 
     order_keys = {}
     for sort_key in window.orderings + _.order_by:
-        order_keys[sort_key.expr] = sort_key.ascending
-    order_by = (ops.SortKey(k, v) for k, v in order_keys.items())
+        order_keys[sort_key.expr] = sort_key.ascending, sort_key.nulls_first
 
+    order_by = (
+        ops.SortKey(expr, ascending=ascending, nulls_first=nulls_first)
+        for expr, (ascending, nulls_first) in order_keys.items()
+    )
     return _.copy(start=start, end=end, group_by=group_by, order_by=order_by)
 
 
@@ -337,59 +358,6 @@ def rewrite_window_input(value, window):
     # if self is already a window function, merge the existing window frame
     # with the requested window frame
     return node.replace(window_merge_frames, filter=p.Value, context=context)
-
-
-@replace(p.Bucket)
-def replace_bucket(_):
-    cases = []
-    results = []
-
-    if _.closed == "left":
-        l_cmp = ops.LessEqual
-        r_cmp = ops.Less
-    else:
-        l_cmp = ops.Less
-        r_cmp = ops.LessEqual
-
-    user_num_buckets = len(_.buckets) - 1
-
-    bucket_id = 0
-    if _.include_under:
-        if user_num_buckets > 0:
-            cmp = ops.Less if _.close_extreme else r_cmp
-        else:
-            cmp = ops.LessEqual if _.closed == "right" else ops.Less
-        cases.append(cmp(_.arg, _.buckets[0]))
-        results.append(bucket_id)
-        bucket_id += 1
-
-    for j, (lower, upper) in enumerate(zip(_.buckets, _.buckets[1:])):
-        if _.close_extreme and (
-            (_.closed == "right" and j == 0)
-            or (_.closed == "left" and j == (user_num_buckets - 1))
-        ):
-            cases.append(
-                ops.And(ops.LessEqual(lower, _.arg), ops.LessEqual(_.arg, upper))
-            )
-            results.append(bucket_id)
-        else:
-            cases.append(ops.And(l_cmp(lower, _.arg), r_cmp(_.arg, upper)))
-            results.append(bucket_id)
-        bucket_id += 1
-
-    if _.include_over:
-        if user_num_buckets > 0:
-            cmp = ops.Less if _.close_extreme else l_cmp
-        else:
-            cmp = ops.Less if _.closed == "right" else ops.LessEqual
-
-        cases.append(cmp(_.buckets[-1], _.arg))
-        results.append(bucket_id)
-        bucket_id += 1
-
-    return ops.SearchedCase(
-        cases=tuple(cases), results=tuple(results), default=ops.NULL
-    )
 
 
 # TODO(kszucs): schema comparison should be updated to not distinguish between

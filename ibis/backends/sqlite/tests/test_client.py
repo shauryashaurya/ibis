@@ -15,20 +15,23 @@ from ibis.conftest import not_windows
 def test_attach_file(tmp_path):
     dbpath = str(tmp_path / "attached.db")
     path_client = ibis.sqlite.connect(dbpath)
-    path_client.create_table("test", schema=ibis.schema(dict(a="int")))
-
     client = ibis.sqlite.connect()
+    try:
+        path_client.create_table("test", schema=ibis.schema(dict(a="int")))
 
-    assert not client.list_tables()
+        assert not client.list_tables()
 
-    client.attach("baz", Path(dbpath))
-    client.attach("bar", dbpath)
+        client.attach("baz", Path(dbpath))
+        client.attach("bar", dbpath)
 
-    foo_tables = client.list_tables(database="baz")
-    bar_tables = client.list_tables(database="bar")
+        foo_tables = client.list_tables(database="baz")
+        bar_tables = client.list_tables(database="bar")
 
-    assert foo_tables == ["test"]
-    assert foo_tables == bar_tables
+        assert foo_tables == ["test"]
+        assert foo_tables == bar_tables
+    finally:
+        client.disconnect()
+        path_client.disconnect()
 
 
 def test_builtin_scalar_udf(con):
@@ -47,7 +50,7 @@ def test_builtin_agg_udf(con):
     def total(x) -> float:
         """Totally total."""
 
-    expr = total(con.tables.functional_alltypes.limit(2).select(n=ibis.NA).n)
+    expr = total(con.tables.functional_alltypes.limit(2).select(n=ibis.null()).n)
     result = con.execute(expr)
     assert result == 0.0
 
@@ -71,11 +74,14 @@ def test_builtin_agg_udf(con):
 )
 def test_connect(url, ext, tmp_path):
     path = os.path.abspath(tmp_path / f"test.{ext}")
-    with sqlite3.connect(path):
-        pass
+
+    sqlite3.connect(path).close()
+
     con = ibis.connect(url(path))
-    one = ibis.literal(1)
-    assert con.execute(one) == 1
+    try:
+        assert con.execute(ibis.literal(1)) == 1
+    finally:
+        con.disconnect()
 
 
 def test_has_operation(con):
@@ -88,3 +94,10 @@ def test_has_operation(con):
     assert con.has_operation(ops.Sample)
     # Handled by visit_* method
     assert con.has_operation(ops.Cast)
+
+
+def test_list_temp_tables_by_default(con):
+    name = ibis.util.gen_name("sqlite_temp_table")
+    con.create_table(name, schema={"a": "int"}, temp=True)
+    assert name in con.list_tables(database="temp")
+    assert name in con.list_tables()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import collections
 from keyword import iskeyword
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from public import public
 
@@ -16,13 +16,13 @@ if TYPE_CHECKING:
 
     import ibis.expr.datatypes as dt
     import ibis.expr.types as ir
-    from ibis.expr.types.typing import V
 
 
 @public
 @deferrable
 def struct(
-    value: Iterable[tuple[str, V]] | Mapping[str, V],
+    value: Iterable[tuple[str, Value | Any]] | Mapping[str, Value | Any],
+    *,
     type: str | dt.DataType | None = None,
 ) -> StructValue:
     """Create a struct expression.
@@ -52,26 +52,30 @@ def struct(
     >>> import ibis
     >>> ibis.options.interactive = True
     >>> ibis.struct(dict(a=1, b="foo"))
-    {'a': 1, 'b': 'foo'}
+    ┌──────────────────────┐
+    │ {'a': 1, 'b': 'foo'} │
+    └──────────────────────┘
 
     Specify a type (note the 1 is now a `float`):
 
     >>> ibis.struct(dict(a=1, b="foo"), type="struct<a: float, b: string>")
-    {'a': 1.0, 'b': 'foo'}
+    ┌────────────────────────┐
+    │ {'a': 1.0, 'b': 'foo'} │
+    └────────────────────────┘
 
     Create a struct column from a column and a scalar literal
 
     >>> t = ibis.memtable({"a": [1, 2, 3]})
     >>> ibis.struct([("a", t.a), ("b", "foo")])
-    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃ StructColumn()              ┃
-    ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-    │ struct<a: int64, b: string> │
-    ├─────────────────────────────┤
-    │ {'a': 1, 'b': 'foo'}        │
-    │ {'a': 2, 'b': 'foo'}        │
-    │ {'a': 3, 'b': 'foo'}        │
-    └─────────────────────────────┘
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ StructColumn({'a': a, 'b': 'foo'}) ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+    │ struct<a: int64, b: string>        │
+    ├────────────────────────────────────┤
+    │ {'a': 1, 'b': 'foo'}               │
+    │ {'a': 2, 'b': 'foo'}               │
+    │ {'a': 3, 'b': 'foo'}               │
+    └────────────────────────────────────┘
     """
     import ibis.expr.operations as ops
 
@@ -201,7 +205,21 @@ class StructValue(Value):
         """
         if name not in self.names:
             raise KeyError(name)
-        return ops.StructField(self, name).to_expr()
+
+        op = self.op()
+
+        # if the underlying operation is a simple struct column access, then
+        # just inline the underlying field access
+        if isinstance(op, ops.StructColumn):
+            return op.values[op.names.index(name)].to_expr()
+        # and then do the same if the underlying value is a field access
+        elif isinstance(op, ops.Literal):
+            return ops.Literal(
+                op.value[name] if op.value is not None else None,
+                dtype=self.fields[name],
+            ).to_expr()
+        else:
+            return ops.StructField(self, name).to_expr()
 
     def __setstate__(self, instance_dictionary):
         self.__dict__ = instance_dictionary
@@ -335,56 +353,6 @@ class StructValue(Value):
             raise IbisError("StructValue must depend on exactly one table")
 
         return table.to_expr().select([self[name] for name in self.names])
-
-    def destructure(self) -> list[ir.Value]:
-        """Destructure a ``StructValue`` into the corresponding struct fields.
-
-        When assigned, a destruct value will be destructured and assigned to
-        multiple columns.
-
-        Returns
-        -------
-        list[AnyValue]
-            Value expressions corresponding to the struct fields.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"s": [{"a": 1, "b": "foo"}, {"a": 3, "b": None}, None]})
-        >>> t
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ s                           ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ struct<a: int64, b: string> │
-        ├─────────────────────────────┤
-        │ {'a': 1, 'b': 'foo'}        │
-        │ {'a': 3, 'b': None}         │
-        │ NULL                        │
-        └─────────────────────────────┘
-        >>> a, b = t.s.destructure()
-        >>> a
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     1 │
-        │     3 │
-        │  NULL │
-        └───────┘
-        >>> b
-        ┏━━━━━━━━┓
-        ┃ b      ┃
-        ┡━━━━━━━━┩
-        │ string │
-        ├────────┤
-        │ foo    │
-        │ NULL   │
-        │ NULL   │
-        └────────┘
-        """
-        return [self[field_name] for field_name in self.type().names]
 
 
 @public

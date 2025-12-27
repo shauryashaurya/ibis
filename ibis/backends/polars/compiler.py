@@ -8,15 +8,15 @@ from collections.abc import Mapping
 from functools import partial, reduce, singledispatch
 from math import isnan
 
-import numpy as np
-import pandas as pd
 import polars as pl
-from packaging.version import parse as vparse
+import sqlglot as sg
 
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.pandas.rewrites import PandasAsofJoin, PandasJoin, PandasRename
+from ibis.backends.polars.rewrites import PandasAsofJoin, PandasJoin, PandasRename
+from ibis.backends.sql.compilers.base import STAR
+from ibis.backends.sql.dialects import Polars
 from ibis.expr.operations.udf import InputType
 from ibis.formats.polars import PolarsType
 from ibis.util import gen_name
@@ -46,13 +46,18 @@ def _literal_value(op, nan_as_none=False):
 
 
 @singledispatch
-def translate(expr, *, ctx):
+def translate(expr, **_):
     raise NotImplementedError(expr)
 
 
 @translate.register(ops.Node)
 def operation(op, **_):
     raise com.OperationNotDefinedError(f"No translation rule for {type(op)}")
+
+
+@translate.register(ops.Alias)
+def alias(op, **kw):
+    return translate(op.arg, **kw).alias(op.name)
 
 
 @translate.register(ops.DatabaseTable)
@@ -62,19 +67,14 @@ def table(op, **_):
 
 @translate.register(ops.DummyTable)
 def dummy_table(op, **kw):
-    selections = [translate(arg, **kw) for name, arg in op.values.items()]
+    selections = [translate(arg, **kw).alias(name) for name, arg in op.values.items()]
     return pl.DataFrame().lazy().select(selections)
 
 
 @translate.register(ops.InMemoryTable)
-def in_memory_table(op, **_):
-    return op.data.to_polars(op.schema).lazy()
-
-
-@translate.register(ops.Alias)
-def alias(op, **kw):
-    arg = translate(op.arg, **kw)
-    return arg.alias(op.name)
+def in_memory_table(op, *, ctx, **_):
+    sql = sg.select(STAR).from_(sg.to_identifier(op.name, quoted=True)).sql(Polars)
+    return ctx.execute(sql, eager=False)
 
 
 def _make_duration(value, dtype):
@@ -86,6 +86,9 @@ def _make_duration(value, dtype):
 def literal(op, **_):
     value = op.value
     dtype = op.dtype
+
+    if value is None:
+        return pl.lit(None, dtype=PolarsType.from_ibis(dtype))
 
     if dtype.is_array():
         value = pl.Series("", value)
@@ -100,9 +103,7 @@ def literal(op, **_):
         return pl.struct(values)
     elif dtype.is_interval():
         return _make_duration(value, dtype)
-    elif dtype.is_null():
-        return pl.lit(value)
-    elif dtype.is_binary():
+    elif dtype.is_null() or dtype.is_binary():
         return pl.lit(value)
     else:
         typ = PolarsType.from_ibis(dtype)
@@ -154,7 +155,7 @@ def _cast(op, strict=True, **kw):
         time_zone = to.timezone
         time_unit = _TIMESTAMP_SCALE_TO_UNITS.get(to.scale, "us")
 
-        if dtype.is_integer():
+        if dtype.is_numeric():
             typ = pl.Datetime(time_unit="us", time_zone=time_zone)
             arg = (arg * 1_000_000).cast(typ)
             if time_unit != "us":
@@ -174,16 +175,6 @@ def _cast(op, strict=True, **kw):
 @translate.register(ops.Field)
 def column(op, **_):
     return pl.col(op.name)
-
-
-@translate.register(ops.SortKey)
-def sort_key(op, **kw):
-    arg = translate(op.expr, **kw)
-    descending = op.descending
-    try:
-        return arg.sort(descending=descending)
-    except TypeError:  # pragma: no cover
-        return arg.sort(reverse=descending)  # pragma: no cover
 
 
 @translate.register(ops.Project)
@@ -237,10 +228,9 @@ def sort(op, **kw):
 
     by = list(newcols.keys())
     descending = [key.descending for key in op.keys]
-    try:
-        lf = lf.sort(by, descending=descending, nulls_last=True)
-    except TypeError:  # pragma: no cover
-        lf = lf.sort(by, reverse=descending, nulls_last=True)  # pragma: no cover
+    nulls_last = [not key.nulls_first for key in op.keys]
+
+    lf = lf.sort(by, descending=descending, nulls_last=nulls_last)
 
     return lf.drop(*by)
 
@@ -275,7 +265,7 @@ def aggregation(op, **kw):
 
     if op.groups:
         # project first to handle computed group by columns
-        lf = (
+        func = (
             lf.with_columns(
                 [translate(arg, **kw).alias(name) for name, arg in op.groups.items()]
             )
@@ -283,13 +273,16 @@ def aggregation(op, **kw):
             .agg
         )
     else:
-        lf = lf.select
+        func = lf.select
 
     if op.metrics:
-        metrics = [translate(arg, **kw).alias(name) for name, arg in op.metrics.items()]
-        lf = lf(metrics)
+        metrics = [
+            translate(arg, in_group_by=bool(op.groups), **kw).alias(name)
+            for name, arg in op.metrics.items()
+        ]
+        return func(metrics)
 
-    return lf
+    return func()
 
 
 @translate.register(PandasRename)
@@ -304,6 +297,9 @@ def join(op, **kw):
     left = translate(op.left, **kw)
     right = translate(op.right, **kw)
 
+    if how == "positional":
+        return pl.concat([left, right], how="horizontal")
+
     # workaround required for https://github.com/pola-rs/polars/issues/13130
     prefix = gen_name("on")
     left_on = {f"{prefix}_{i}": translate(v, **kw) for i, v in enumerate(op.left_on)}
@@ -315,14 +311,14 @@ def join(op, **kw):
     if how == "right":
         how = "left"
         left, right = right, left
+    elif how == "outer":
+        how = "full"
+    elif how == "cross":
+        # Cross joins don't use join keys
+        return left.join(right, how=how)
 
-    joined = left.join(right, on=on, how=how)
-
-    try:
-        joined = joined.drop(*on)
-    except TypeError:
-        joined = joined.drop(columns=on)
-
+    joined = left.join(right, on=on, how=how, coalesce=False)
+    joined = joined.drop(*on)
     return joined
 
 
@@ -354,16 +350,13 @@ def asof_join(op, **kw):
         raise NotImplementedError(f"Operator {operator} not supported for asof join")
 
     assert len(on) == 1
-    joined = left.join_asof(right, on=on[0], by=by, strategy=direction)
-    try:
-        joined = joined.drop(*(on + by))
-    except TypeError:
-        joined = joined.drop(columns=on + by)
+    joined = left.join_asof(right, on=on[0], by=by if by else None, strategy=direction)
+    joined = joined.drop(*on, *by)
     return joined
 
 
-@translate.register(ops.DropNa)
-def dropna(op, **kw):
+@translate.register(ops.DropNull)
+def drop_null(op, **kw):
     lf = translate(op.parent, **kw)
 
     if op.subset is None:
@@ -380,8 +373,8 @@ def dropna(op, **kw):
     return lf.drop_nulls(subset)
 
 
-@translate.register(ops.FillNa)
-def fillna(op, **kw):
+@translate.register(ops.FillNull)
+def fill_null(op, **kw):
     table = translate(op.parent, **kw)
 
     columns = []
@@ -487,9 +480,29 @@ def greatest(op, **kw):
 
 @translate.register(ops.InSubquery)
 def in_column(op, **kw):
-    value = translate(op.value, **kw)
+    if op.value.dtype.is_struct():
+        raise com.UnsupportedOperationError(
+            "polars doesn't support contains with struct elements"
+        )
+
     needle = translate(op.needle, **kw)
-    return needle.is_in(value)
+    value = translate(op.value, **kw)
+    (rel,) = op.value.relations
+    # The `collect` triggers computation, but there appears to be no way to
+    # spell this operation in a polars-native way that's
+    #
+    # 1. not deprecated
+    # 2. operates only using pl.Expr objects and methods
+    #
+    # In other words, we need to either rearchitect the polars compiler to
+    # operate only with DataFrames, or compute first. I chose computing first
+    # since it is less effort and we don't know how impactful it is.
+    value = translate(rel, **kw).select(value).collect().to_series()
+
+    return needle.map_batches(
+        lambda needle, value=value: needle.is_in(value),
+        return_dtype=pl.Boolean(),
+    )
 
 
 @translate.register(ops.InValues)
@@ -513,17 +526,15 @@ _string_unary = {
 @translate.register(ops.StringLength)
 def string_length(op, **kw):
     arg = translate(op.arg, **kw)
-    typ = PolarsType.from_ibis(op.dtype)
-    return arg.str.len_bytes().cast(typ)
+    return arg.str.len_bytes()
 
 
 @translate.register(ops.Capitalize)
 def capitalize(op, **kw):
     arg = translate(op.arg, **kw)
-    typ = PolarsType.from_ibis(op.dtype)
     first = arg.str.slice(0, 1).str.to_uppercase()
     rest = arg.str.slice(1, None).str.to_lowercase()
-    return (first + rest).cast(typ)
+    return first + rest
 
 
 @translate.register(ops.StringUnary)
@@ -540,7 +551,7 @@ def string_unary(op, **kw):
 @translate.register(ops.Reverse)
 def reverse(op, **kw):
     arg = translate(op.arg, **kw)
-    return arg.map_elements(lambda x: x[::-1])
+    return arg.str.reverse()
 
 
 @translate.register(ops.StringSplit)
@@ -583,6 +594,13 @@ def string_join(op, **kw):
     args = [translate(arg, **kw) for arg in op.arg]
     sep = _literal_value(op.sep)
     return pl.concat_str(args, separator=sep)
+
+
+@translate.register(ops.ArrayStringJoin)
+def array_string_join(op, **kw):
+    arg = translate(op.arg, **kw)
+    sep = _literal_value(op.sep)
+    return pl.when(arg.list.len() > 0).then(arg.list.join(sep)).otherwise(None)
 
 
 @translate.register(ops.Substring)
@@ -680,17 +698,7 @@ def clip(op, **kw):
     lower = _literal_value(op.lower)
     upper = _literal_value(op.upper)
 
-    if vparse(pl.__version__) >= vparse("0.19.12"):
-        if not (lower is None and upper is None):
-            return arg.clip(lower, upper)
-    elif lower is not None and upper is not None:
-        return arg.clip(lower, upper)
-    elif lower is not None:
-        return arg.clip_min(lower)
-    elif upper is not None:
-        return arg.clip_max(upper)
-
-    raise com.TranslationError("No lower or upper bound specified")
+    return arg.clip(lower, upper)
 
 
 @translate.register(ops.Log)
@@ -736,45 +744,105 @@ _reductions = {
     ops.All: "all",
     ops.Any: "any",
     ops.ApproxMedian: "median",
-    ops.Arbitrary: "first",
+    ops.ApproxCountDistinct: "approx_n_unique",
     ops.Count: "count",
     ops.CountDistinct: "n_unique",
-    ops.First: "first",
-    ops.Last: "last",
     ops.Max: "max",
     ops.Mean: "mean",
     ops.Median: "median",
     ops.Min: "min",
-    ops.Mode: "mode",
-    ops.StandardDev: "std",
     ops.Sum: "sum",
-    ops.Variance: "var",
+    ops.BitOr: "bitwise_or",
+    ops.BitAnd: "bitwise_and",
+    ops.BitXor: "bitwise_xor",
 }
 
-for reduction in _reductions.keys():
 
-    @translate.register(reduction)
-    def reduction(op, **kw):
-        args = [
-            translate(arg, **kw)
-            for name, arg in zip(op.argnames, op.args)
-            if name not in ("where", "how")
-        ]
+def execute_reduction(op, **kw):
+    arg = translate(op.arg, **kw)
 
-        agg = _reductions[type(op)]
+    if op.where is not None:
+        arg = arg.filter(translate(op.where, **kw))
 
-        predicates = [arg.is_not_null() for arg in args]
-        if (where := op.where) is not None:
-            predicates.append(translate(where, **kw))
+    method = _reductions[type(op)]
 
-        first, *rest = args
-        method = operator.methodcaller(agg, *rest)
-        return method(first.filter(reduce(operator.and_, predicates))).cast(
-            PolarsType.from_ibis(op.dtype)
-        )
+    return getattr(arg, method)()
+
+
+for cls in _reductions:
+    translate.register(cls, execute_reduction)
+
+
+@translate.register(ops.Sum)
+def execute_sum(op, **kw):
+    arg = translate(op.arg, **kw)
+    if (where := op.where) is not None:
+        arg = arg.filter(translate(where, **kw))
+    return pl.when(arg.count() > 0).then(arg.sum()).otherwise(None)
+
+
+@translate.register(ops.First)
+@translate.register(ops.Last)
+@translate.register(ops.Arbitrary)
+def execute_first_last(op, **kw):
+    arg = translate(op.arg, **kw)
+
+    predicate = True if getattr(op, "include_null", False) else arg.is_not_null()
+    if op.where is not None:
+        predicate &= translate(op.where, **kw)
+
+    arg = arg.filter(predicate)
+
+    if order_by := getattr(op, "order_by", ()):
+        keys = [translate(k.expr, **kw).filter(predicate) for k in order_by]
+        descending = [k.descending for k in order_by]
+        arg = arg.sort_by(keys, descending=descending)
+
+    return arg.last() if isinstance(op, ops.Last) else arg.first()
+
+
+@translate.register(ops.StandardDev)
+@translate.register(ops.Variance)
+def execute_std_var(op, **kw):
+    arg = translate(op.arg, **kw)
+
+    if op.where is not None:
+        arg = arg.filter(translate(op.where, **kw))
+
+    method = "std" if isinstance(op, ops.StandardDev) else "var"
+    ddof = 0 if op.how == "pop" else 1
+
+    return getattr(arg, method)(ddof=ddof)
+
+
+@translate.register(ops.Kurtosis)
+def execute_kurtosis(op, **kw):
+    arg = translate(op.arg, **kw)
+
+    if (where := op.where) is not None:
+        arg = arg.filter(translate(where, **kw))
+
+    return arg.kurtosis(bias=op.how == "pop")
+
+
+@translate.register(ops.Mode)
+def execute_mode(op, **kw):
+    arg = translate(op.arg, **kw)
+
+    predicate = arg.is_not_null()
+    if (where := op.where) is not None:
+        predicate &= translate(where, **kw)
+
+    # `mode` can return more than one value so the additional `get(0)` call is
+    # necessary to enforce aggregation behavior of a scalar value per group
+    #
+    # eventually we may want to support an Ibis API like `modes` that returns a
+    # list of all the modes per group.
+    return arg.filter(predicate).mode().get(0)
 
 
 @translate.register(ops.Quantile)
+@translate.register(ops.ApproxQuantile)
 def execute_quantile(op, **kw):
     arg = translate(op.arg, **kw)
     quantile = translate(op.quantile, **kw)
@@ -810,22 +878,37 @@ def distinct(op, **kw):
     return table.unique()
 
 
+@translate.register(ops.Sample)
+def sample(op, **kw):
+    if op.seed is not None:
+        raise com.UnsupportedOperationError(
+            "`Table.sample` with a random seed is unsupported"
+        )
+    table = translate(op.parent, **kw)
+    # Disable predicate pushdown since `t.filter(...).sample(...)` could have
+    # different statistical or performance characteristics than
+    # `t.sample(...).filter(...)`. Same for slice pushdown.
+    return table.map_batches(
+        lambda df: df.sample(fraction=op.fraction),
+        predicate_pushdown=False,
+        slice_pushdown=False,
+        streamable=True,
+    )
+
+
 @translate.register(ops.CountStar)
 def count_star(op, **kw):
     if (where := op.where) is not None:
         condition = translate(where, **kw)
         result = condition.sum()
     else:
-        try:
-            result = pl.len()
-        except AttributeError:
-            result = pl.count()
+        result = pl.len()
     return result.cast(PolarsType.from_ibis(op.dtype))
 
 
 @translate.register(ops.TimestampNow)
 def timestamp_now(op, **_):
-    return pl.lit(pd.Timestamp("now", tz="UTC").tz_localize(None))
+    return pl.lit(datetime.datetime.now())
 
 
 @translate.register(ops.DateNow)
@@ -852,7 +935,7 @@ def temporal_truncate(op, **kw):
     arg = translate(op.arg, **kw)
     unit = "mo" if op.unit.short == "M" else op.unit.short
     unit = f"1{unit.lower()}"
-    return arg.dt.truncate(unit).dt.offset_by("-1w")
+    return arg.dt.truncate(unit)
 
 
 def _compile_literal_interval(op):
@@ -894,20 +977,6 @@ def date_from_ymd(op, **kw):
     )
 
 
-@translate.register(ops.Atan2)
-def atan2(op, **kw):
-    left = translate(op.left, **kw)
-    right = translate(op.right, **kw)
-    return pl.map_batches([left, right], lambda cols: np.arctan2(cols[0], cols[1]))
-
-
-@translate.register(ops.Modulus)
-def modulus(op, **kw):
-    left = translate(op.left, **kw)
-    right = translate(op.right, **kw)
-    return pl.map_batches([left, right], lambda cols: np.mod(cols[0], cols[1]))
-
-
 @translate.register(ops.TimestampFromYMDHMS)
 def timestamp_from_ymdhms(op, **kw):
     return pl.datetime(
@@ -945,13 +1014,17 @@ def string_to_date(op, **kw):
     )
 
 
+@translate.register(ops.StringToTime)
+def string_to_time(op, **kw):
+    arg = translate(op.arg, **kw)
+    return arg.str.to_time(format=_literal_value(op.format_str))
+
+
 @translate.register(ops.StringToTimestamp)
 def string_to_timestamp(op, **kw):
     arg = translate(op.arg, **kw)
-    return arg.str.strptime(
-        dtype=pl.Datetime,
-        format=_literal_value(op.format_str),
-    )
+    format = _literal_value(op.format_str)
+    return arg.str.strptime(dtype=pl.Datetime, format=format)
 
 
 @translate.register(ops.TimestampDiff)
@@ -961,6 +1034,12 @@ def timestamp_diff(op, **kw):
     # TODO: truncating both to seconds is necessary to conform to the output
     # type of the operation
     return left.dt.truncate("1s") - right.dt.truncate("1s")
+
+
+@translate.register(ops.ArraySort)
+def array_sort(op, **kw):
+    arg = translate(op.arg, **kw)
+    return arg.list.sort()
 
 
 @translate.register(ops.ArrayLength)
@@ -982,26 +1061,60 @@ def array_concat(op, **kw):
 @translate.register(ops.Array)
 def array_column(op, **kw):
     cols = [translate(col, **kw) for col in op.exprs]
+    # Workaround for https://github.com/pola-rs/polars/issues/17294
+    # pl.concat_list(Iterable[T]) results in pl.List[T], EXCEPT when T is a
+    # pl.List, in which case pl.concat_list(Iterable[pl.List[T]]) results in pl.List[T].
+    # If polars ever supports a more consistent array constructor,
+    # we should switch to that.
+    if op.dtype.value_type.is_array():
+        cols = [c.implode() for c in cols]
     return pl.concat_list(cols)
 
 
 @translate.register(ops.ArrayCollect)
-def array_collect(op, **kw):
+def array_collect(op, in_group_by=False, **kw):
     arg = translate(op.arg, **kw)
-    if (where := op.where) is not None:
-        arg = arg.filter(translate(where, **kw))
-    return arg
+
+    predicate = True if op.include_null else arg.is_not_null()
+    if op.where is not None:
+        predicate &= translate(op.where, **kw)
+
+    arg = arg.filter(predicate)
+
+    if op.order_by:
+        keys = [translate(k.expr, **kw).filter(predicate) for k in op.order_by]
+        descending = [k.descending for k in op.order_by]
+        arg = arg.sort_by(keys, descending=descending, nulls_last=True)
+
+    if op.distinct:
+        arg = arg.unique(maintain_order=op.order_by is not None)
+
+    # Polars' behavior changes for `implode` within a `group_by` currently.
+    # See https://github.com/pola-rs/polars/issues/16756
+    return arg if in_group_by else arg.implode()
 
 
 @translate.register(ops.ArrayFlatten)
 def array_flatten(op, **kw):
-    return pl.concat_list(translate(op.arg, **kw))
+    result = translate(op.arg, **kw)
+    return (
+        pl.when(result.is_null())
+        .then(None)
+        .when(result.list.len() == 0)
+        .then([])
+        # polars doesn't have an efficient API (yet?) for removing one level of
+        # nesting from an array so we use elementwise evaluation
+        #
+        # https://github.com/ibis-project/ibis/issues/10135
+        .otherwise(result.list.eval(pl.element().flatten()))
+    )
 
 
 _date_methods = {
     ops.ExtractDay: "day",
     ops.ExtractMonth: "month",
     ops.ExtractYear: "year",
+    ops.ExtractIsoYear: "iso_year",
     ops.ExtractQuarter: "quarter",
     ops.ExtractDayOfYear: "ordinal_day",
     ops.ExtractWeekOfYear: "week",
@@ -1017,16 +1130,13 @@ _date_methods = {
 def extract_date_field(op, **kw):
     arg = translate(op.arg, **kw)
     method = operator.methodcaller(_date_methods[type(op)])
-    return method(arg.dt).cast(pl.Int32)
+    return method(arg.dt)
 
 
 @translate.register(ops.ExtractEpochSeconds)
 def extract_epoch_seconds(op, **kw):
     arg = translate(op.arg, **kw)
-    return arg.dt.epoch("s").cast(pl.Int32)
-
-
-_day_of_week_offset = vparse(pl.__version__) >= vparse("0.15.1")
+    return arg.dt.epoch("s")
 
 
 _unary = {
@@ -1038,9 +1148,7 @@ _unary = {
     ops.Ceil: lambda arg: arg.ceil().cast(pl.Int64),
     ops.Cos: operator.methodcaller("cos"),
     ops.Cot: lambda arg: 1.0 / arg.tan(),
-    ops.DayOfWeekIndex: (
-        lambda arg: arg.dt.weekday().cast(pl.Int16) - _day_of_week_offset
-    ),
+    ops.DayOfWeekIndex: lambda arg: arg.dt.weekday() - 1,
     ops.Exp: operator.methodcaller("exp"),
     ops.Floor: lambda arg: arg.floor().cast(pl.Int64),
     ops.IsInf: operator.methodcaller("is_infinite"),
@@ -1055,12 +1163,13 @@ _unary = {
     ops.Sin: operator.methodcaller("sin"),
     ops.Sqrt: operator.methodcaller("sqrt"),
     ops.Tan: operator.methodcaller("tan"),
+    ops.BitwiseNot: operator.invert,
 }
 
 
 @translate.register(ops.DayOfWeekName)
 def day_of_week_name(op, **kw):
-    index = translate(op.arg, **kw).dt.weekday() - _day_of_week_offset
+    index = translate(op.arg, **kw).dt.weekday() - 1
     arg = None
     for i, name in enumerate(calendar.day_name):
         arg = pl.when(index == i).then(pl.lit(name)).otherwise(arg)
@@ -1099,44 +1208,39 @@ def comparison(op, **kw):
 @translate.register(ops.Between)
 def between(op, **kw):
     op_arg = op.arg
+    arg_dtype = op_arg.dtype
+
     arg = translate(op_arg, **kw)
-    dtype = op_arg.dtype
-    lower = translate(ops.Cast(op.lower_bound, dtype), **kw)
-    upper = translate(ops.Cast(op.upper_bound, dtype), **kw)
+
+    dtype = PolarsType.from_ibis(arg_dtype)
+
+    lower_bound = op.lower_bound
+    lower = translate(lower_bound, **kw)
+
+    if lower_bound.dtype != arg_dtype:
+        lower = lower.cast(dtype)
+
+    upper_bound = op.upper_bound
+    upper = translate(upper_bound, **kw)
+
+    if upper_bound.dtype != arg_dtype:
+        upper = upper.cast(dtype)
+
     return arg.is_between(lower, upper, closed="both")
 
 
-_bitwise_binops = {
-    ops.BitwiseRightShift: np.right_shift,
-    ops.BitwiseLeftShift: np.left_shift,
-    ops.BitwiseOr: np.bitwise_or,
-    ops.BitwiseAnd: np.bitwise_and,
-    ops.BitwiseXor: np.bitwise_xor,
-}
-
-
-@translate.register(ops.BitwiseBinary)
-def bitwise_binops(op, **kw):
-    ufunc = _bitwise_binops.get(type(op))
-    if ufunc is None:
-        raise com.OperationNotDefinedError(f"{type(op).__name__} not supported")
+@translate.register(ops.BitwiseLeftShift)
+def bitwise_left_shift(op, **kw):
     left = translate(op.left, **kw)
     right = translate(op.right, **kw)
-
-    if isinstance(op.right, ops.Literal):
-        result = left.map_batches(lambda col: ufunc(col, op.right.value))
-    elif isinstance(op.left, ops.Literal):
-        result = right.map_batches(lambda col: ufunc(op.left.value, col))
-    else:
-        result = pl.map_batches([left, right], lambda cols: ufunc(cols[0], cols[1]))
-
-    return result.cast(PolarsType.from_ibis(op.dtype))
+    return left.cast(pl.Int64) * 2 ** right.cast(pl.Int64)
 
 
-@translate.register(ops.BitwiseNot)
-def bitwise_not(op, **kw):
-    arg = translate(op.arg, **kw)
-    return arg.map_batches(lambda x: np.invert(x))
+@translate.register(ops.BitwiseRightShift)
+def bitwise_right_shift(op, **kw):
+    left = translate(op.left, **kw)
+    right = translate(op.right, **kw)
+    return left.cast(pl.Int64) // 2 ** right.cast(pl.Int64)
 
 
 _binops = {
@@ -1154,6 +1258,11 @@ _binops = {
     ops.Or: operator.or_,
     ops.Xor: operator.xor,
     ops.Subtract: operator.sub,
+    ops.BitwiseOr: operator.or_,
+    ops.BitwiseXor: operator.xor,
+    ops.BitwiseAnd: operator.and_,
+    ops.Modulus: operator.mod,
+    ops.Atan2: pl.arctan2,
 }
 
 
@@ -1179,12 +1288,12 @@ def elementwise_udf(op, **kw):
 
 @translate.register(ops.E)
 def execute_e(op, **_):
-    return pl.lit(np.e)
+    return pl.lit(math.e)
 
 
 @translate.register(ops.Pi)
 def execute_pi(op, **_):
-    return pl.lit(np.pi)
+    return pl.lit(math.pi)
 
 
 @translate.register(ops.Time)
@@ -1203,26 +1312,72 @@ def execute_union(op, **kw):
     return result
 
 
+@translate.register(ops.Intersection)
+def execute_intersection(op, *, ctx, **kw):
+    left = gen_name("polars_intersect_left")
+    right = gen_name("polars_intersect_right")
+
+    ctx.register_many(
+        frames={
+            left: translate(op.left, ctx=ctx, **kw),
+            right: translate(op.right, ctx=ctx, **kw),
+        }
+    )
+
+    sql = (
+        sg.select(STAR)
+        .from_(sg.to_identifier(left, quoted=True))
+        .intersect(sg.select(STAR).from_(sg.to_identifier(right, quoted=True)))
+    )
+
+    result = ctx.execute(sql.sql(Polars), eager=False)
+
+    if op.distinct is True:
+        return result.unique()
+    return result
+
+
+@translate.register(ops.Difference)
+def execute_difference(op, *, ctx, **kw):
+    left = gen_name("polars_diff_left")
+    right = gen_name("polars_diff_right")
+
+    ctx.register_many(
+        frames={
+            left: translate(op.left, ctx=ctx, **kw),
+            right: translate(op.right, ctx=ctx, **kw),
+        }
+    )
+
+    sql = (
+        sg.select(STAR)
+        .from_(sg.to_identifier(left, quoted=True))
+        .except_(sg.select(STAR).from_(sg.to_identifier(right, quoted=True)))
+    )
+
+    result = ctx.execute(sql.sql(Polars), eager=False)
+
+    if op.distinct is True:
+        return result.unique()
+    return result
+
+
 @translate.register(ops.Hash)
 def execute_hash(op, **kw):
-    return translate(op.arg, **kw).hash()
+    # polars' hash() returns a uint64, but we want to return an int64
+    return translate(op.arg, **kw).hash().reinterpret(signed=True)
 
 
 def _arg_min_max(op, func, **kw):
-    key = op.key
-    arg = op.arg
+    key = translate(op.key, **kw)
+    arg = translate(op.arg, **kw)
 
-    if (op_where := op.where) is not None:
-        key = ops.IfElse(op_where, key, None)
-        arg = ops.IfElse(op_where, arg, None)
+    if op.where is not None:
+        where = translate(op.where, **kw)
+        arg = arg.filter(where)
+        key = key.filter(where)
 
-    translate_arg = translate(arg, **kw)
-    translate_key = translate(key, **kw)
-
-    not_null_mask = translate_arg.is_not_null() & translate_key.is_not_null()
-    return translate_arg.filter(not_null_mask).gather(
-        func(translate_key.filter(not_null_mask))
-    )
+    return arg.get(func(key))
 
 
 @translate.register(ops.ArgMax)
@@ -1265,16 +1420,18 @@ _UDF_INVOKERS = {
     # Convert polars series into a list
     #   -> map the function element by element
     #   -> convert back to a polars series
-    InputType.PYTHON: lambda func, dtype, args: pl.Series(
-        map(func, *(arg.to_list() for arg in args)),
+    InputType.PYTHON: lambda func, dtype, fields, args: pl.Series(
+        map(func, *(arg.to_list() for arg in map(args.struct.field, fields))),
         dtype=PolarsType.from_ibis(dtype),
     ),
     # Convert polars series into a pyarrow array
     #  -> invoke the function on the pyarrow array
     #  -> cast the result to match the ibis dtype
     #  -> convert back to a polars series
-    InputType.PYARROW: lambda func, dtype, args: pl.from_arrow(
-        func(*(arg.to_arrow() for arg in args)).cast(dtype.to_pyarrow()),
+    InputType.PYARROW: lambda func, dtype, fields, args: pl.from_arrow(
+        func(*(arg.to_arrow() for arg in map(args.struct.field, fields))).cast(
+            dtype.to_pyarrow()
+        ),
     ),
 }
 
@@ -1284,9 +1441,12 @@ def execute_scalar_udf(op, **kw):
     input_type = op.__input_type__
     if input_type in _UDF_INVOKERS:
         dtype = op.dtype
-        return pl.map_batches(
-            exprs=[translate(arg, **kw) for arg in op.args],
-            function=partial(_UDF_INVOKERS[input_type], op.__func__, dtype),
+        argnames = op.argnames
+        args = pl.struct(
+            **dict(zip(argnames, (translate(arg, **kw) for arg in op.args)))
+        )
+        return args.map_batches(
+            function=partial(_UDF_INVOKERS[input_type], op.__func__, dtype, argnames),
             return_dtype=PolarsType.from_ibis(dtype),
         )
     elif input_type == InputType.BUILTIN:
@@ -1359,3 +1519,163 @@ def execute_timestamp_range(op, **kw):
     start = translate(op.start, **kw)
     stop = translate(op.stop, **kw)
     return pl.datetime_ranges(start, stop, f"{step}{unit}", closed="left")
+
+
+@translate.register(ops.TimeFromHMS)
+def execute_time_from_hms(op, **kw):
+    return pl.time(
+        hour=translate(op.hours, **kw),
+        minute=translate(op.minutes, **kw),
+        second=translate(op.seconds, **kw),
+    )
+
+
+@translate.register(ops.DropColumns)
+def execute_drop_columns(op, **kw):
+    parent = translate(op.parent, **kw)
+    return parent.drop(op.columns_to_drop)
+
+
+@translate.register(ops.ArraySum)
+def execute_array_agg(op, **kw):
+    arg = translate(op.arg, **kw)
+    # workaround polars annoying sum([]) == 0 behavior
+    #
+    # the polars behavior is consistent with math, but inconsistent
+    # with every other query engine every built.
+    no_nulls = arg.list.drop_nulls()
+    return pl.when(no_nulls.list.len() == 0).then(None).otherwise(no_nulls.list.sum())
+
+
+@translate.register(ops.ArrayMean)
+def execute_array_mean(op, **kw):
+    return translate(op.arg, **kw).list.mean()
+
+
+@translate.register(ops.ArrayMin)
+def execute_array_min(op, **kw):
+    return translate(op.arg, **kw).list.min()
+
+
+@translate.register(ops.ArrayMax)
+def execute_array_max(op, **kw):
+    return translate(op.arg, **kw).list.max()
+
+
+@translate.register(ops.ArrayAny)
+def execute_array_any(op, **kw):
+    arg = translate(op.arg, **kw)
+    no_nulls = arg.list.drop_nulls()
+    return pl.when(no_nulls.list.len() == 0).then(None).otherwise(no_nulls.list.any())
+
+
+@translate.register(ops.ArrayAll)
+def execute_array_all(op, **kw):
+    arg = translate(op.arg, **kw)
+    no_nulls = arg.list.drop_nulls()
+    return pl.when(no_nulls.list.len() == 0).then(None).otherwise(no_nulls.list.all())
+
+
+@translate.register(ops.GroupConcat)
+def execute_group_concat(op, **kw):
+    arg = translate(op.arg, **kw)
+    sep = _literal_value(op.sep)
+
+    predicate = arg.is_not_null()
+
+    if (where := op.where) is not None:
+        predicate &= translate(where, **kw)
+
+    arg = arg.filter(predicate)
+
+    if order_by := op.order_by:
+        keys = [translate(k.expr, **kw).filter(predicate) for k in order_by]
+        descending = [k.descending for k in order_by]
+        arg = arg.sort_by(keys, descending=descending)
+
+    return pl.when(arg.count() > 0).then(arg.str.join(sep)).otherwise(None)
+
+
+@translate.register(ops.DateDelta)
+def execute_date_delta(op, **kw):
+    left = translate(op.left, **kw)
+    right = translate(op.right, **kw)
+    delta = left - right
+    method_name = f"total_{_literal_value(op.part)}s"
+    return getattr(delta.dt, method_name)()
+
+
+@translate.register(ops.ArrayIndex)
+def execute_array_index(op, **kw):
+    arg = translate(op.arg, **kw)
+    index = translate(op.index, **kw)
+    return arg.list.get(index)
+
+
+@translate.register(ops.ArraySlice)
+def visit_ArraySlice(op, **kw):
+    arg = translate(op.arg, **kw)
+    arg_length = arg.list.len()
+
+    start = translate(op.start, **kw) if op.start is not None else 0
+    stop = translate(op.stop, **kw) if op.stop is not None else arg_length
+
+    def normalize_index(index, length):
+        index = pl.when(index < 0).then(length + index).otherwise(index)
+        return (
+            pl.when(index < 0)
+            .then(0)
+            .when(index > length)
+            .then(length)
+            .otherwise(index)
+        )
+
+    start = normalize_index(start, arg_length)
+    stop = normalize_index(stop, arg_length)
+
+    slice_len = pl.when(stop > start).then(stop - start).otherwise(0)
+
+    return arg.list.slice(start, slice_len)
+
+
+@translate.register(ops.ArrayContains)
+def visit_ArrayContains(op, **kw):
+    arg = translate(op.arg, **kw)
+    value = translate(op.other, **kw)
+    return arg.list.contains(value)
+
+
+@translate.register(ops.ArrayRemove)
+def visit_ArrayRemove(op, **kw):
+    arg = translate(op.arg, **kw)
+    value = _literal_value(op.other)
+    return arg.list.set_difference(pl.lit([value]))
+
+
+@translate.register(ops.ArrayUnion)
+def visit_ArrayUnion(op, **kw):
+    left = translate(op.left, **kw)
+    right = translate(op.right, **kw)
+    return left.list.set_union(right)
+
+
+@translate.register(ops.ArrayDistinct)
+def visit_ArrayDistinct(op, **kw):
+    arg = translate(op.arg, **kw)
+    return arg.list.unique()
+
+
+@translate.register(ops.ArrayIntersect)
+def visit_ArrayIntersect(op, **kw):
+    left = translate(op.left, **kw)
+    right = translate(op.right, **kw)
+    return left.list.set_intersection(right)
+
+
+@translate.register(ops.StringFind)
+def visit_StringFind(op, **kw):
+    arg = translate(op.arg, **kw)
+    start = translate(op.start, **kw) if op.start is not None else 0
+    end = translate(op.end, **kw) if op.end is not None else None
+    expr = arg.str.slice(start, end).str.find(_literal_value(op.substr), literal=True)
+    return pl.when(expr.is_null()).then(-1).otherwise(expr + start)

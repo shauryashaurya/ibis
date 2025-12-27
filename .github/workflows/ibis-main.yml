@@ -37,34 +37,39 @@ env:
 
 jobs:
   test_core:
-    name: Test ${{ matrix.os }} python-${{ matrix.python-version }}
+    name: Test ${{ matrix.os }} python-${{ matrix.python-version }} pyarrow-${{ matrix.pyarrow }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest
+          - ubuntu-24.04-arm
           - windows-latest
         python-version:
           - "3.9"
           - "3.10"
           - "3.11"
           - "3.12"
+          - "3.13"
+        pyarrow:
+          - true
+          - false
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
       - name: install ${{ matrix.os }} system dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           set -euo pipefail
 
@@ -75,25 +80,30 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: choco install graphviz
 
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras "visualization decompiler"
+      - name: install numpy/pandas/pyarrow
+        if: matrix.pyarrow
+        run: pip install numpy pandas pyarrow pyarrow-hotfix
 
-      - uses: extractions/setup-just@v2
+      - name: check imports
+        if: matrix.pyarrow
+        run: python -c 'import numpy, pandas, pyarrow, pyarrow_hotfix'
+
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: run all core tests and run benchmarks once parallel
         if: matrix.os != 'windows-latest'
-        run: just ci-check -m "'core or benchmarks'" --numprocesses auto
+        run: just ci-check "--extra visualization --extra decompiler" -m "'core or benchmark'" --numprocesses auto -rfEs
 
       - name: run all core tests and run benchmarks once serial
         if: matrix.os == 'windows-latest'
-        run: just ci-check -m "'core or benchmarks'"
+        run: just ci-check "--extra visualization --extra decompiler" -m "'core or benchmark'" -rfEs
 
       - name: upload code coverage
         if: success()
         continue-on-error: true
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           flags: core,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -103,16 +113,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v5
-        id: install_python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.9"
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
       - name: install system dependencies
         run: |
@@ -121,16 +130,52 @@ jobs:
           sudo apt-get update -y -qq
           sudo apt-get install -y -q build-essential libgeos-dev
 
-      - name: install ibis
-        # install duckdb and geospatial because of https://github.com/ibis-project/ibis/issues/4856
-        run: poetry install --without dev --without docs --without test --extras duckdb --extras geospatial
-
       - name: check shapely and duckdb imports
-        run: poetry run python -c 'import shapely.geometry, duckdb'
+        run: uv run --extra duckdb --extra geospatial python -c 'import shapely.geometry, duckdb'
+
+  test_duckdb_sqlite3_import:
+    name: Test sqlite3 and duckdb import
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
+
+      - name: check duckdb doesn't import sqlite3
+        run: uv run --extra duckdb python -c 'import sys, ibis; assert "sqlite3" not in sys.modules; ibis.duckdb.connect(); assert "sqlite3" not in sys.modules'
+
+  test_scrapy_import:
+    name: Test import with twisted
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: install python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
+
+      - name: check scrapy import
+        run: uv run --with scrapy python -c 'import scrapy; import ibis'
+
+      - name: remove virtual env
+        run: rm -rf .venv
+
+      - name: check twisted import
+        run: uv run --with scrapy python -c 'import twisted.internet.ssl; import ibis'
 
   test_doctests:
-    # FIXME(kszucs): re-enable this build
-    if: false
     name: Doctests
     runs-on: ubuntu-latest
     steps:
@@ -142,31 +187,31 @@ jobs:
           sudo apt-get install -y -q build-essential graphviz libgeos-dev freetds-dev unixodbc-dev
 
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
-      - name: install ibis with all extras
-        run: poetry install --without dev --without docs --all-extras
-
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: run doctests
-        run: just ci-doctest --junitxml=junit.xml --cov=ibis --cov-report=xml:coverage.xml
+        run: just doctest --cov=ibis --cov-report=xml:coverage.xml
+
+      - name: check for dead fixtures
+        run: uv run --all-extras --group tests pytest --dead-fixtures -m 'not flink'
 
       - name: upload code coverage
         if: success()
         continue-on-error: true
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           flags: core,doctests,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
           token: ${{ secrets.CODECOV_TOKEN }}

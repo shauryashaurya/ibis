@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import os
 import platform
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,10 @@ SANDBOXED = (
 LINUX = platform.system() == "Linux"
 MACOS = platform.system() == "Darwin"
 WINDOWS = platform.system() == "Windows"
+ARM64 = platform.machine() in ("arm64", "aarch64")
 CI = os.environ.get("CI") is not None
+SPARK_REMOTE = os.environ.get("SPARK_REMOTE")
+IS_SPARK_REMOTE = bool(SPARK_REMOTE)
 
 
 @pytest.fixture(autouse=True)
@@ -41,3 +45,17 @@ not_windows = pytest.mark.skipif(
     condition=WINDOWS,
     reason="windows prevents two connections to the same file even in the same process",
 )
+
+
+@pytest.fixture(scope="session")
+def data_dir() -> Path:
+    """Return the test data directory.
+
+    Returns
+    -------
+    Path
+        Test data directory
+    """
+    root = Path(__file__).absolute().parents[1]
+
+    return root / "ci" / "ibis-testing-data"

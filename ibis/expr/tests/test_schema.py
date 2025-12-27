@@ -1,24 +1,17 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import NamedTuple
 
-import numpy as np
-import pyarrow as pa
 import pytest
+import sqlglot as sg
+import sqlglot.expressions as sge
 
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis.common.exceptions import IntegrityError
 from ibis.common.grounds import Annotable
 from ibis.common.patterns import CoercedTo
-
-has_pandas = False
-with contextlib.suppress(ImportError):
-    import pandas as pd
-
-    has_pandas = True
 
 
 def test_whole_schema():
@@ -168,11 +161,6 @@ def test_nullable_output():
     assert "baz  !boolean" not in sch_str
 
 
-@pytest.fixture
-def df():
-    return pd.DataFrame({"A": pd.Series([1], dtype="int8"), "b": ["x"]})
-
-
 def test_api_accepts_schema_objects():
     s1 = sch.schema(dict(a="int", b="str"))
     s2 = sch.schema(s1)
@@ -201,6 +189,18 @@ def test_schema_mapping_api():
     assert tuple(s.keys()) == s.names
     assert tuple(s.values()) == s.types
     assert tuple(s.items()) == tuple(zip(s.names, s.types))
+
+
+def test_schema_equality():
+    s1 = sch.schema({"a": "int64", "b": "string"})
+    s2 = sch.schema({"a": "int64", "b": "string"})
+    s3 = sch.schema({"b": "string", "a": "int64"})
+    s4 = sch.schema({"a": "int64", "b": "int64", "c": "string"})
+
+    assert s1 == s2
+    assert s1 != s3
+    assert s1 != s4
+    assert s3 != s2
 
 
 class BarSchema:
@@ -352,34 +352,6 @@ def test_schema_set_operations():
     assert d > c
 
 
-def test_schema_infer_pyarrow_table():
-    table = pa.Table.from_arrays(
-        [
-            pa.array([1, 2, 3]),
-            pa.array(["a", "b", "c"]),
-            pa.array([True, False, True]),
-        ],
-        ["a", "b", "c"],
-    )
-    s = sch.infer(table)
-    assert s == sch.Schema({"a": dt.int64, "b": dt.string, "c": dt.boolean})
-
-
-def test_schema_from_to_pyarrow_schema():
-    pyarrow_schema = pa.schema(
-        [
-            pa.field("a", pa.int64()),
-            pa.field("b", pa.string()),
-            pa.field("c", pa.bool_()),
-        ]
-    )
-    ibis_schema = sch.schema(pyarrow_schema)
-    restored_schema = ibis_schema.to_pyarrow()
-
-    assert ibis_schema == sch.Schema({"a": dt.int64, "b": dt.string, "c": dt.boolean})
-    assert restored_schema == pyarrow_schema
-
-
 @pytest.mark.parametrize("lazy", [False, True])
 def test_schema_infer_polars_dataframe(lazy):
     pl = pytest.importorskip("polars")
@@ -411,6 +383,7 @@ def test_schema_from_to_polars_schema():
 
 
 def test_schema_from_to_numpy_dtypes():
+    np = pytest.importorskip("np")
     numpy_dtypes = [
         ("a", np.dtype("int64")),
         ("b", np.dtype("str")),
@@ -428,17 +401,9 @@ def test_schema_from_to_numpy_dtypes():
     assert restored_dtypes == expected_dtypes
 
 
-@pytest.mark.parametrize(
-    ("from_method", "to_method"),
-    [
-        pytest.param(
-            "from_pandas",
-            "to_pandas",
-            marks=pytest.mark.skipif(not has_pandas, reason="pandas not installed"),
-        ),
-    ],
-)
-def test_schema_from_to_pandas_dask_dtypes(from_method, to_method):
+def test_schema_from_to_pandas_dtypes():
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
     pandas_schema = pd.Series(
         [
             ("a", np.dtype("int64")),
@@ -447,7 +412,7 @@ def test_schema_from_to_pandas_dask_dtypes(from_method, to_method):
             ("d", pd.DatetimeTZDtype(tz="US/Eastern", unit="ns")),
         ]
     )
-    ibis_schema = getattr(sch.Schema, from_method)(pandas_schema)
+    ibis_schema = sch.Schema.from_pandas(pandas_schema)
     assert ibis_schema == sch.schema(pandas_schema)
 
     expected = sch.Schema(
@@ -460,7 +425,7 @@ def test_schema_from_to_pandas_dask_dtypes(from_method, to_method):
     )
     assert ibis_schema == expected
 
-    restored_dtypes = getattr(ibis_schema, to_method)()
+    restored_dtypes = ibis_schema.to_pandas()
     expected_dtypes = [
         ("a", np.dtype("int64")),
         ("b", np.dtype("object")),
@@ -468,3 +433,172 @@ def test_schema_from_to_pandas_dask_dtypes(from_method, to_method):
         ("d", pd.DatetimeTZDtype(tz="US/Eastern", unit="ns")),
     ]
     assert restored_dtypes == expected_dtypes
+
+
+def test_null_fields():
+    assert sch.schema({"a": "int64", "b": "string"}).null_fields == ()
+    assert sch.schema({"a": "null", "b": "string"}).null_fields == ("a",)
+    assert sch.schema({"a": "null", "b": "null"}).null_fields == ("a", "b")
+
+
+def test_to_sqlglot_column_defs():
+    schema = sch.schema({"a": "int64", "b": "string", "c": "!string"})
+    columns = schema.to_sqlglot_column_defs("duckdb")
+
+    assert len(columns) == 3
+    assert all(isinstance(col, sge.ColumnDef) for col in columns)
+    assert all(col.this.quoted is True for col in columns)
+    assert [col.this.this for col in columns] == ["a", "b", "c"]
+
+    assert not columns[0].constraints
+    assert not columns[1].constraints
+    assert len(columns[2].constraints) == 1
+    assert isinstance(columns[2].constraints[0].kind, sge.NotNullColumnConstraint)
+
+
+def test_to_sqlglot_column_defs_empty_schema():
+    schema = sch.schema({})
+    columns = schema.to_sqlglot_column_defs("duckdb")
+    assert columns == []
+
+
+def test_to_sqlglot_column_defs_create_table_integration():
+    schema = sch.schema({"id": "!int64", "name": "string"})
+    columns = schema.to_sqlglot_column_defs("duckdb")
+
+    table = sg.table("test_table", quoted=True)
+    create_stmt = sge.Create(
+        kind="TABLE",
+        this=sge.Schema(this=table, expressions=columns),
+    )
+
+    sql = create_stmt.sql(dialect="duckdb")
+    expected = 'CREATE TABLE "test_table" ("id" BIGINT NOT NULL, "name" TEXT)'
+    assert sql == expected
+
+
+def test_schema_from_sqlglot():
+    columns = [
+        sge.ColumnDef(
+            this=sg.to_identifier("bigint_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.BIGINT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("int_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.INT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("smallint_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.SMALLINT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("tinyint_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.TINYINT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("double_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.DOUBLE),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("float_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.FLOAT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("varchar_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.VARCHAR),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("text_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.TEXT),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("boolean_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.BOOLEAN),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("date_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.DATE),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("timestamp_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.DATETIME),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("time_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.TIME),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("binary_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.BINARY),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("uuid_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.UUID),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("json_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.JSON),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("decimal_col", quoted=True),
+            kind=sge.DataType(
+                this=sge.DataType.Type.DECIMAL,
+                expressions=[
+                    sge.DataTypeParam(this=sge.Literal.number(10)),
+                    sge.DataTypeParam(this=sge.Literal.number(2)),
+                ],
+            ),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("not_null_col", quoted=True),
+            kind=sge.DataType(this=sge.DataType.Type.VARCHAR),
+            constraints=[sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())],
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("array_col", quoted=True),
+            kind=sge.DataType(
+                this=sge.DataType.Type.ARRAY,
+                expressions=[sge.DataType(this=sge.DataType.Type.VARCHAR)],
+                nested=True,
+            ),
+        ),
+        sge.ColumnDef(
+            this=sg.to_identifier("map_col", quoted=True),
+            kind=sge.DataType(
+                this=sge.DataType.Type.MAP,
+                expressions=[
+                    sge.DataType(this=sge.DataType.Type.VARCHAR),
+                    sge.DataType(this=sge.DataType.Type.INT),
+                ],
+                nested=True,
+            ),
+        ),
+    ]
+
+    sqlglot_schema = sge.Schema(expressions=columns)
+    ibis_schema = sch.Schema.from_sqlglot(sqlglot_schema)
+    expected = sch.Schema(
+        {
+            "bigint_col": dt.int64,
+            "int_col": dt.int32,
+            "smallint_col": dt.int16,
+            "tinyint_col": dt.int8,
+            "double_col": dt.float64,
+            "float_col": dt.float32,
+            "varchar_col": dt.string,
+            "text_col": dt.string,
+            "boolean_col": dt.boolean,
+            "date_col": dt.date,
+            "timestamp_col": dt.timestamp,
+            "time_col": dt.time,
+            "binary_col": dt.binary,
+            "uuid_col": dt.uuid,
+            "json_col": dt.json,
+            "decimal_col": dt.Decimal(10, 2),
+            "not_null_col": dt.String(nullable=False),
+            "array_col": dt.Array(dt.string),
+            "map_col": dt.Map(dt.string, dt.int32),
+        }
+    )
+
+    assert ibis_schema == expected

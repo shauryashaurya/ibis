@@ -1,3 +1,5 @@
+"""Logical operations."""
+
 from __future__ import annotations
 
 from public import public
@@ -6,12 +8,14 @@ import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import ValidationError, attribute
 from ibis.common.exceptions import IbisTypeError
-from ibis.common.typing import VarTuple  # noqa: TCH001
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Binary, Unary, Value
 
 
 @public
 class LogicalBinary(Binary):
+    """Base class for logical binary operations."""
+
     left: Value[dt.Boolean]
     right: Value[dt.Boolean]
 
@@ -20,6 +24,8 @@ class LogicalBinary(Binary):
 
 @public
 class Not(Unary):
+    """Logical negation."""
+
     arg: Value[dt.Boolean]
 
     dtype = dt.boolean
@@ -27,21 +33,23 @@ class Not(Unary):
 
 @public
 class And(LogicalBinary):
-    pass
+    """Logical AND."""
 
 
 @public
 class Or(LogicalBinary):
-    pass
+    """Logical OR."""
 
 
 @public
 class Xor(LogicalBinary):
-    pass
+    """Logical XOR."""
 
 
 @public
 class Comparison(Binary):
+    """Base class for comparison operations."""
+
     left: Value
     right: Value
 
@@ -58,49 +66,51 @@ class Comparison(Binary):
         """
         if not rlz.comparable(left, right):
             raise IbisTypeError(
-                f"Arguments {rlz._arg_type_error_format(left)} and "
-                f"{rlz._arg_type_error_format(right)} are not comparable"
+                f"Arguments {rlz.arg_type_error_format(left)} and "
+                f"{rlz.arg_type_error_format(right)} are not comparable"
             )
         super().__init__(left=left, right=right)
 
 
 @public
 class Equals(Comparison):
-    pass
+    """Equality comparison."""
 
 
 @public
 class NotEquals(Comparison):
-    pass
+    """Inequality comparison."""
 
 
 @public
 class GreaterEqual(Comparison):
-    pass
+    """Greater than or equal to comparison."""
 
 
 @public
 class Greater(Comparison):
-    pass
+    """Greater than comparison."""
 
 
 @public
 class LessEqual(Comparison):
-    pass
+    """Less than or equal to comparison."""
 
 
 @public
 class Less(Comparison):
-    pass
+    """Less than comparison."""
 
 
 @public
 class IdenticalTo(Comparison):
-    pass
+    """Identity comparison. Considers two NULL values **equal**."""
 
 
 @public
 class Between(Value):
+    """Check if a value is within a range."""
+
     arg: Value
     lower_bound: Value
     upper_bound: Value
@@ -111,19 +121,21 @@ class Between(Value):
     def __init__(self, arg, lower_bound, upper_bound):
         if not rlz.comparable(arg, lower_bound):
             raise ValidationError(
-                f"Arguments {rlz._arg_type_error_format(arg)} and "
-                f"{rlz._arg_type_error_format(lower_bound)} are not comparable"
+                f"Arguments {rlz.arg_type_error_format(arg)} and "
+                f"{rlz.arg_type_error_format(lower_bound)} are not comparable"
             )
         if not rlz.comparable(arg, upper_bound):
             raise ValidationError(
-                f"Arguments {rlz._arg_type_error_format(arg)} and "
-                f"{rlz._arg_type_error_format(upper_bound)} are not comparable"
+                f"Arguments {rlz.arg_type_error_format(arg)} and "
+                f"{rlz.arg_type_error_format(upper_bound)} are not comparable"
             )
         super().__init__(arg=arg, lower_bound=lower_bound, upper_bound=upper_bound)
 
 
 @public
 class InValues(Value):
+    """Check if a value is in a set of values."""
+
     value: Value
     options: VarTuple[Value]
 
@@ -137,9 +149,13 @@ class InValues(Value):
 
 @public
 class IfElse(Value):
-    """Ternary case expression, equivalent to.
+    """Ternary case expression.
 
-    bool_expr.case().when(True, true_expr).else_(false_or_null_expr)
+    Equivalent to
+
+    ```python
+    bool_expr.cases((True, true_expr), else_=false_or_null_expr)
+    ```
 
     Many backends implement this as a built-in function.
     """

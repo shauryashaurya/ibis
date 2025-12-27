@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import abc
 import functools
 import inspect
 import math
 import operator
 from collections import defaultdict
+from datetime import date
 from typing import Any, Callable, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -28,6 +28,7 @@ class _UDF(NamedTuple):
 
 _SQLITE_UDF_REGISTRY = {}
 _SQLITE_UDAF_REGISTRY = {}
+UNSET = object()
 
 
 def ignore_nulls(f):
@@ -74,8 +75,8 @@ def udf(func=None, *, skip_if_exists=False, deterministic=True):
     Returns
     -------
     callable
-        A callable object that returns ``None`` if any of its inputs are
-        ``None``.
+        A callable object that returns `None` if any of its inputs are
+        `None`.
 
     """
     if func is None:
@@ -254,12 +255,12 @@ def _ibis_string_ascii(string):
 
 @udf
 def _ibis_rpad(string, width, pad):
-    return string.ljust(width, pad)[:width]
+    return string.ljust(width, pad)
 
 
 @udf
 def _ibis_lpad(string, width, pad):
-    return string.rjust(width, pad)[:width]
+    return string.rjust(width, pad)
 
 
 @udf
@@ -354,6 +355,12 @@ def _ibis_extract_user_info(url):
     return f"{username}:{password}"
 
 
+@udf
+def _ibis_date_delta(left, right):
+    delta = date.fromisoformat(left) - date.fromisoformat(right)
+    return delta.days
+
+
 class _ibis_var:
     def __init__(self, offset):
         self.mean = 0.0
@@ -438,14 +445,11 @@ class _ibis_bit_xor(_ibis_bit_agg):
         super().__init__(operator.xor)
 
 
-class _ibis_first_last(abc.ABC):
-    def __init__(self) -> None:
+class _ibis_first_last:
+    def __init__(self):
         self.value = None
 
-    @abc.abstractmethod
-    def step(self, value): ...
-
-    def finalize(self) -> int | None:
+    def finalize(self):
         return self.value
 
 
@@ -457,10 +461,26 @@ class _ibis_first(_ibis_first_last):
 
 
 @udaf
+class _ibis_first_include_null(_ibis_first_last):
+    def __init__(self):
+        self.value = UNSET
+
+    def step(self, value):
+        if self.value is UNSET:
+            self.value = value
+
+
+@udaf
 class _ibis_last(_ibis_first_last):
     def step(self, value):
         if value is not None:
             self.value = value
+
+
+@udaf
+class _ibis_last_include_null(_ibis_first_last):
+    def step(self, value):
+        self.value = value
 
 
 def register_all(con):

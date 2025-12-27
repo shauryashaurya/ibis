@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import datetime
 import json
 from typing import TYPE_CHECKING
 
+import pandas as pd
 import pyarrow as pa
-
-from ibis.formats.pandas import PandasData
-from ibis.formats.pyarrow import PyArrowData
 
 if TYPE_CHECKING:
     import ibis.expr.datatypes as dt
@@ -15,7 +12,7 @@ if TYPE_CHECKING:
 
 
 class JSONScalar(pa.ExtensionScalar):
-    def as_py(self):
+    def as_py(self, **_):
         value = self.value
         if value is None:
             return value
@@ -49,51 +46,89 @@ PYARROW_JSON_TYPE = JSONType()
 pa.register_extension_type(PYARROW_JSON_TYPE)
 
 
-class SnowflakePandasData(PandasData):
-    @classmethod
-    def convert_Timestamp_element(cls, dtype):
-        return datetime.datetime.fromisoformat
+try:
+    from ibis.formats.pandas import PandasData
+except ModuleNotFoundError:
+    pass
+else:
 
-    @classmethod
-    def convert_Date_element(cls, dtype):
-        return datetime.date.fromisoformat
+    class SnowflakePandasData(PandasData):
+        @classmethod
+        def convert_Timestamp_element(cls, dtype):
+            return pd.Timestamp.fromisoformat
 
-    @classmethod
-    def convert_Time_element(cls, dtype):
-        return datetime.time.fromisoformat
+        @classmethod
+        def convert_Date_element(cls, dtype):
+            return pd.Timestamp.fromisoformat
 
-    @classmethod
-    def convert_JSON(cls, s, dtype, pandas_type):
-        converter = cls.convert_JSON_element(dtype)
-        return s.map(converter, na_action="ignore").astype("object")
+        @classmethod
+        def convert_Time_element(cls, dtype):
+            return pd.Timestamp.fromisoformat
 
-    @classmethod
-    def convert_Array(cls, s, dtype, pandas_type):
-        raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
-        return super().convert_Array(raw_json_objects, dtype, pandas_type)
+        @classmethod
+        def convert_JSON(cls, s, dtype, pandas_type):
+            converter = cls.convert_JSON_element(dtype)
+            return s.map(converter, na_action="ignore").astype("object")
 
-    @classmethod
-    def convert_Map(cls, s, dtype, pandas_type):
-        raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
-        return super().convert_Map(raw_json_objects, dtype, pandas_type)
+        @classmethod
+        def convert_Array(cls, s, dtype, pandas_type):
+            raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
+            return super().convert_Array(raw_json_objects, dtype, pandas_type)
 
-    @classmethod
-    def convert_Struct(cls, s, dtype, pandas_type):
-        raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
-        return super().convert_Struct(raw_json_objects, dtype, pandas_type)
+        @classmethod
+        def convert_Map(cls, s, dtype, pandas_type):
+            raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
+            return super().convert_Map(raw_json_objects, dtype, pandas_type)
+
+        @classmethod
+        def convert_Struct(cls, s, dtype, pandas_type):
+            raw_json_objects = cls.convert_JSON(s, dtype, pandas_type)
+            return super().convert_Struct(raw_json_objects, dtype, pandas_type)
 
 
-class SnowflakePyArrowData(PyArrowData):
-    @classmethod
-    def convert_table(cls, table: pa.Table, schema: Schema) -> pa.Table:
-        columns = [cls.convert_column(table[name], typ) for name, typ in schema.items()]
-        return pa.Table.from_arrays(columns, names=schema.names)
+try:
+    from ibis.formats.pyarrow import PyArrowData
+except ModuleNotFoundError:
+    pass
+else:
 
-    @classmethod
-    def convert_column(cls, column: pa.Array, dtype: dt.DataType) -> pa.Array:
-        if dtype.is_json() or dtype.is_array() or dtype.is_map() or dtype.is_struct():
-            if isinstance(column, pa.ChunkedArray):
-                column = column.combine_chunks()
+    class SnowflakePyArrowData(PyArrowData):
+        @classmethod
+        def convert_table(cls, table: pa.Table, schema: Schema) -> pa.Table:
+            columns = [
+                cls.convert_column(table[name], typ) for name, typ in schema.items()
+            ]
+            return pa.Table.from_arrays(
+                columns,
+                schema=pa.schema(
+                    [
+                        pa.field(name, array.type, nullable=ibis_dtype.nullable)
+                        for array, (name, ibis_dtype) in zip(columns, schema.items())
+                    ]
+                ),
+            )
 
-            return pa.ExtensionArray.from_storage(PYARROW_JSON_TYPE, column)
-        return super().convert_column(column, dtype)
+        @classmethod
+        def convert_column(cls, column: pa.Array, dtype: dt.DataType) -> pa.Array:
+            if (
+                dtype.is_json()
+                or dtype.is_array()
+                or dtype.is_map()
+                or dtype.is_struct()
+            ):
+                if isinstance(column, pa.ChunkedArray):
+                    column = column.combine_chunks()
+
+                return pa.ExtensionArray.from_storage(PYARROW_JSON_TYPE, column)
+            return super().convert_column(column, dtype)
+
+        @classmethod
+        def convert_scalar(cls, scalar: pa.Scalar, dtype: dt.DataType) -> pa.Scalar:
+            if (
+                dtype.is_json()
+                or dtype.is_array()
+                or dtype.is_map()
+                or dtype.is_struct()
+            ):
+                return pa.ExtensionScalar.from_storage(PYARROW_JSON_TYPE, scalar)
+            return super().convert_scalar(scalar, dtype)

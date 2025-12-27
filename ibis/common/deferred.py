@@ -5,7 +5,7 @@ import functools
 import inspect
 import operator
 from abc import abstractmethod
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, NoReturn, TypeVar, overload
 
 from ibis.common.bases import Final, FrozenSlotted, Hashable, Immutable, Slotted
 from ibis.common.collections import FrozenDict
@@ -44,6 +44,9 @@ class Resolver(Coercible, Hashable):
     @abstractmethod
     def __eq__(self, other: Resolver) -> bool: ...
 
+    @abstractmethod
+    def __hash__(self) -> int: ...
+
     @classmethod
     def __coerce__(cls, value):
         if isinstance(value, cls):
@@ -69,7 +72,7 @@ class Deferred(Slotted, Immutable, Final):
 
     Parameters
     ----------
-    deferred
+    obj
         The deferred object to provide syntax sugar for.
     repr
         An optional fixed string to use when repr-ing the deferred expression,
@@ -79,7 +82,7 @@ class Deferred(Slotted, Immutable, Final):
 
     """
 
-    __slots__ = ("_resolver", "_repr")
+    __slots__ = ("_repr", "_resolver")
 
     def __init__(self, obj, repr=None):
         super().__init__(_resolver=resolver(obj), _repr=repr)
@@ -89,22 +92,24 @@ class Deferred(Slotted, Immutable, Final):
         context = {"_": _, **kwargs}
         return self._resolver.resolve(context)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self._resolver) if self._repr is None else self._repr
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Deferred:
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return Deferred(Attr(self, name))
 
-    def __iter__(self):
+    def __iter__(self) -> NoReturn:
         raise TypeError(f"{self.__class__.__name__!r} object is not iterable")
 
-    def __bool__(self):
+    def __bool__(self) -> NoReturn:
         raise TypeError(
             f"The truth value of {self.__class__.__name__} objects is not defined"
         )
 
-    def __getitem__(self, name):
-        return Deferred(Item(self, name))
+    def __getitem__(self, indexer: str | int | slice) -> Deferred:
+        return Deferred(Item(self, indexer))
 
     def __call__(self, *args, **kwargs):
         return Deferred(Call(self, *args, **kwargs))
@@ -171,6 +176,8 @@ class Deferred(Slotted, Immutable, Final):
 
     def __eq__(self, other: Any) -> Deferred:  # type: ignore
         return Deferred(BinaryOperator(operator.eq, self, other))
+
+    __hash__ = None
 
     def __ne__(self, other: Any) -> Deferred:  # type: ignore
         return Deferred(BinaryOperator(operator.ne, self, other))
@@ -326,7 +333,7 @@ class Factory(FrozenSlotted, Resolver):
 
 
 class Attr(FrozenSlotted, Resolver):
-    __slots__ = ("obj", "name")
+    __slots__ = ("name", "obj")
     obj: Resolver
     name: str
 
@@ -346,23 +353,23 @@ class Attr(FrozenSlotted, Resolver):
 
 
 class Item(FrozenSlotted, Resolver):
-    __slots__ = ("obj", "name")
+    __slots__ = ("indexer", "obj")
     obj: Resolver
-    name: str
+    indexer: str | int | slice
 
-    def __init__(self, obj, name):
-        super().__init__(obj=resolver(obj), name=resolver(name))
+    def __init__(self, obj, indexer):
+        super().__init__(obj=resolver(obj), indexer=resolver(indexer))
 
     def __repr__(self):
-        if isinstance(self.name, Just):
-            return f"{self.obj!r}[{self.name.value!r}]"
+        if isinstance(self.indexer, Just):
+            return f"{self.obj!r}[{self.indexer.value!r}]"
         else:
-            return f"Item({self.obj!r}, {self.name!r})"
+            return f"Item({self.obj!r}, {self.indexer!r})"
 
     def resolve(self, context):
         obj = self.obj.resolve(context)
-        name = self.name.resolve(context)
-        return obj[name]
+        idx = self.indexer.resolve(context)
+        return obj[idx]
 
 
 class Call(FrozenSlotted, Resolver):
@@ -381,7 +388,7 @@ class Call(FrozenSlotted, Resolver):
 
     """
 
-    __slots__ = ("func", "args", "kwargs")
+    __slots__ = ("args", "func", "kwargs")
     func: Resolver
     args: tuple[Resolver, ...]
     kwargs: dict[str, Resolver]
@@ -445,7 +452,7 @@ _operator_symbols = {
 
 
 class UnaryOperator(FrozenSlotted, Resolver):
-    __slots__ = ("func", "arg")
+    __slots__ = ("arg", "func")
     func: Callable
     arg: Resolver
 

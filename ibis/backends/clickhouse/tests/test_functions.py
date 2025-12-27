@@ -78,13 +78,13 @@ def test_timestamp_cast(alltypes, assert_sql):
     assert_sql(result2, "out2.sql")
 
 
-def test_timestamp_now(con, assert_sql):
+def test_timestamp_now(assert_sql):
     expr = ibis.now()
     assert_sql(expr)
 
 
 @pytest.mark.parametrize("unit", ["y", "m", "d", "w", "h", "minute"])
-def test_timestamp_truncate(con, unit, assert_sql):
+def test_timestamp_truncate(unit, assert_sql):
     stamp = ibis.timestamp("2009-05-17 12:34:56")
     expr = stamp.truncate(unit)
     assert_sql(expr)
@@ -116,8 +116,8 @@ def test_isnull_notnull(con, expr, expected):
     ("expr", "expected"),
     [
         (ibis.coalesce(5, None, 4), 5),
-        (ibis.coalesce(ibis.NA, 4, ibis.NA), 4),
-        (ibis.coalesce(ibis.NA, ibis.NA, 3.14), 3.14),
+        (ibis.coalesce(ibis.null(), 4, ibis.null()), 4),
+        (ibis.coalesce(ibis.null(), ibis.null(), 3.14), 3.14),
     ],
 )
 def test_coalesce(con, expr, expected):
@@ -127,13 +127,13 @@ def test_coalesce(con, expr, expected):
 @pytest.mark.parametrize(
     ("expr", "expected"),
     [
-        (ibis.NA.fillna(5), 5),
-        (L(5).fillna(10), 5),
+        (ibis.null().fill_null(5), 5),
+        (L(5).fill_null(10), 5),
         (L(5).nullif(5), None),
         (L(10).nullif(5), 10),
     ],
 )
-def test_fillna_nullif(con, expr, expected):
+def test_fill_null_nullif(con, expr, expected):
     result = con.execute(expr)
     if expected is None:
         assert pd.isnull(result)
@@ -150,7 +150,7 @@ def test_fillna_nullif(con, expr, expected):
         (L(datetime(2015, 9, 1, hour=14, minute=48, second=5)), "DateTime"),
         (L(date(2015, 9, 1)), "Date"),
         param(
-            ibis.NA,
+            ibis.null(),
             "Null",
             marks=pytest.mark.xfail(
                 raises=AssertionError,
@@ -327,8 +327,8 @@ def test_translate_math_functions(con, alltypes, call, assert_sql):
         pytest.param(L(-5.556).sign(), -1, id="sign_neg"),
         pytest.param(L(0).sign(), 0, id="sign_zero"),
         pytest.param(L(5.556).sqrt(), math.sqrt(5.556), id="sqrt"),
-        pytest.param(L(5.556).log(2), math.log(5.556, 2), id="log2_arg"),
-        pytest.param(L(5.556).log2(), math.log(5.556, 2), id="log2"),
+        pytest.param(L(5.556).log(2), math.log2(5.556), id="log2_arg"),
+        pytest.param(L(5.556).log2(), math.log2(5.556), id="log2"),
         pytest.param(L(5.556).log10(), math.log10(5.556), id="log10"),
         # clickhouse has different functions for exp/ln that are faster
         # than the defaults, but less precise
@@ -418,7 +418,7 @@ def test_numeric_builtins_work(alltypes, df):
 def test_null_column(alltypes):
     t = alltypes
     nrows = t.count().execute()
-    expr = t.mutate(na_column=ibis.NA).na_column
+    expr = t.mutate(na_column=ibis.null()).na_column
     result = expr.execute()
     expected = pd.Series([None] * nrows, name="na_column")
     tm.assert_series_equal(result, expected)
@@ -438,7 +438,7 @@ def test_literal_none_to_nullable_column(alltypes):
 
 def test_timestamp_from_integer(con, alltypes, assert_sql):
     # timestamp_col has datetime type
-    expr = alltypes.int_col.to_timestamp()
+    expr = alltypes.int_col.as_timestamp("s")
     assert_sql(expr, "out.sql")
     assert len(con.execute(expr))
 
@@ -476,7 +476,7 @@ def test_udf_in_array_map(alltypes):
 
     n = 5
     expr = (
-        alltypes[alltypes.int_col == 1]
+        alltypes.filter(alltypes.int_col == 1)
         .limit(n)
         .int_col.collect()
         .map(lambda x: my_add(x, 1))
@@ -492,3 +492,19 @@ def test_udf_in_array_filter(alltypes):
     expr = alltypes.int_col.collect().filter(lambda x: my_eq(x, 1))
     result = expr.execute()
     assert set(result) == {1}
+
+
+def test_timestamp_to_start_of_week(con):
+    pytest.importorskip("pyarrow")
+
+    expr = ibis.timestamp("2024-02-03 00:00:00").truncate("W")
+    result = con.to_pyarrow(expr).as_py()
+    assert result == datetime(2024, 1, 29, 0, 0, 0)
+
+
+def test_date_to_start_of_day(con):
+    pytest.importorskip("pyarrow")
+
+    expr = ibis.date("2024-02-03")
+    expr1 = expr.truncate("D")
+    assert con.to_pyarrow(expr1) == con.to_pyarrow(expr)

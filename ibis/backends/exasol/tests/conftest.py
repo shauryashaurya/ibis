@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 EXASOL_USER = os.environ.get("IBIS_TEST_EXASOL_USER", "sys")
 EXASOL_PASS = os.environ.get("IBIS_TEST_EXASOL_PASSWORD", "exasol")
 EXASOL_HOST = os.environ.get("IBIS_TEST_EXASOL_HOST", "localhost")
-EXASOL_PORT = int(os.environ.get("IBIS_TEST_EXASOL_PORT", 8563))
+EXASOL_PORT = int(os.environ.get("IBIS_TEST_EXASOL_PORT", "8563"))
 IBIS_TEST_EXASOL_DB = os.environ.get("IBIS_TEST_EXASOL_DATABASE", "EXASOL")
 
 
@@ -35,12 +35,11 @@ class TestConf(ServiceBackendTest):
     reduction_tolerance = 1e-7
     stateful = True
     service_name = "exasol"
-    supports_tpch = False
     force_sort = True
     deps = ("pyexasol",)
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw: Any):
+    def connect(*, tmpdir, worker_id, **kw: Any):  # noqa: ARG004
         return ibis.exasol.connect(
             user=EXASOL_USER,
             password=EXASOL_PASS,
@@ -67,7 +66,7 @@ class TestConf(ServiceBackendTest):
             "exec",
             self.service_name,
             "find",
-            "/usr",
+            "/opt",
             "-name",
             "exaplus",
             "-type",

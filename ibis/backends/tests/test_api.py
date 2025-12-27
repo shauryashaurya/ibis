@@ -14,6 +14,7 @@ def test_backend_name(backend):
 
 
 @pytest.mark.notyet(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notyet(["athena"], raises=NotImplementedError)
 def test_version(backend):
     assert isinstance(backend.api.version, str)
 
@@ -24,9 +25,7 @@ def test_version(backend):
         "polars",
         "clickhouse",
         "sqlite",
-        "dask",
         "exasol",
-        "pandas",
         "druid",
         "oracle",
         "bigquery",
@@ -36,11 +35,6 @@ def test_version(backend):
     ],
     reason="backend does not support catalogs",
     raises=AttributeError,
-)
-@pytest.mark.notimpl(
-    ["datafusion"],
-    raises=NotImplementedError,
-    reason="current_catalog isn't implemented",
 )
 @pytest.mark.xfail_version(pyspark=["pyspark<3.4"])
 def test_catalog_consistency(backend, con):
@@ -53,8 +47,10 @@ def test_catalog_consistency(backend, con):
     # exact names for now
     current_catalog = con.current_catalog
     assert isinstance(current_catalog, str)
-    if backend.name() == "snowflake":
+    if (name := backend.name()) in "snowflake":
         assert current_catalog.upper() in catalogs
+    elif name == "athena":
+        assert current_catalog.lower() in list(map(str.lower, catalogs))
     else:
         assert current_catalog in catalogs
 
@@ -142,3 +138,8 @@ def test_unbind(alltypes, expr_fn):
 
     assert "Unbound" not in repr(expr)
     assert "Unbound" in repr(expr.unbind())
+
+
+def test_get_backend(con, alltypes):
+    assert alltypes.get_backend() is con
+    assert alltypes.id.min().get_backend() is con

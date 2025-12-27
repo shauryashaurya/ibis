@@ -50,7 +50,7 @@ class DisjointSet(Mapping[K, set[K]]):
 
     """
 
-    __slots__ = ("_parents", "_classes")
+    __slots__ = ("_classes", "_parents")
     _parents: dict
     _classes: dict
 
@@ -120,6 +120,8 @@ class DisjointSet(Mapping[K, set[K]]):
         if not isinstance(other, DisjointSet):
             return NotImplemented
         return self._parents == other._parents
+
+    __hash__ = None  # disjoint sets are mutable, so they are not hashable
 
     def copy(self) -> DisjointSet:
         """Make a copy of the disjoint set.
@@ -320,7 +322,7 @@ class Pattern(Slotted):
 
     """
 
-    __slots__ = ("head", "args", "name")
+    __slots__ = ("args", "head", "name")
     head: type
     args: tuple
     name: str | None
@@ -455,7 +457,7 @@ class DynamicApplier(Slotted):
 class Rewrite(Slotted):
     """A rewrite rule which matches a pattern and applies a pattern or a function."""
 
-    __slots__ = ("matcher", "applier")
+    __slots__ = ("applier", "matcher")
     matcher: Pattern
     applier: Callable | Pattern | Variable
 
@@ -484,7 +486,7 @@ class ENode(Slotted, Node):
 
     """
 
-    __slots__ = ("head", "args")
+    __slots__ = ("args", "head")
     head: type
     args: tuple
 
@@ -534,7 +536,7 @@ class ENode(Slotted, Node):
 
 
 class EGraph:
-    __slots__ = ("_nodes", "_etables", "_eclasses")
+    __slots__ = ("_eclasses", "_etables", "_nodes")
     _nodes: dict
     _etables: collections.defaultdict
     _eclasses: DisjointSet
@@ -773,7 +775,7 @@ class EGraph:
         """
         enode = self._as_enode(node)
         enode = self._eclasses.find(enode)
-        costs = {en: (math.inf, None) for en in self._eclasses.keys()}
+        costs = dict.fromkeys(self._eclasses.keys(), (math.inf, None))
 
         def enode_cost(enode):
             cost = 1

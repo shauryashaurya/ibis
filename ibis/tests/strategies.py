@@ -3,9 +3,8 @@ from __future__ import annotations
 import warnings
 
 import hypothesis as h
-import hypothesis.extra.pandas as past
-import hypothesis.extra.pytz as tzst
 import hypothesis.strategies as st
+import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
@@ -73,7 +72,9 @@ def numeric_dtypes(nullable=_nullable):
 
 
 def string_dtype(nullable=_nullable):
-    return st.builds(dt.String, nullable=nullable)
+    return st.builds(
+        dt.String, length=st.none() | st.integers(min_value=0), nullable=nullable
+    )
 
 
 def binary_dtype(nullable=_nullable):
@@ -81,7 +82,7 @@ def binary_dtype(nullable=_nullable):
 
 
 def json_dtype(nullable=_nullable):
-    return st.builds(dt.JSON, nullable=nullable)
+    return st.builds(dt.JSON, binary=st.booleans(), nullable=nullable)
 
 
 def inet_dtype(nullable=_nullable):
@@ -115,7 +116,7 @@ def time_dtype(nullable=_nullable):
     return st.builds(dt.Time, nullable=nullable)
 
 
-_timezone = st.none() | tzst.timezones().map(str)
+_timezone = st.none() | st.timezones().map(str)
 _interval = st.sampled_from(list(IntervalUnit))
 _timestamp_scale = st.none() | st.integers(min_value=0, max_value=9)
 
@@ -128,7 +129,7 @@ def interval_dtype(interval=_interval, nullable=_nullable):
     return st.builds(dt.Interval, unit=interval, nullable=nullable)
 
 
-def temporal_dtypes(timezone=_timezone, interval=_interval, nullable=_nullable):
+def temporal_dtypes(timezone=_timezone, nullable=_nullable):
     return st.one_of(
         date_dtype(nullable=nullable),
         time_dtype(nullable=nullable),
@@ -136,22 +137,26 @@ def temporal_dtypes(timezone=_timezone, interval=_interval, nullable=_nullable):
     )
 
 
-def primitive_dtypes(nullable=_nullable):
-    return st.one_of(
-        null_dtype,
-        boolean_dtype(nullable=nullable),
-        integer_dtypes(nullable=nullable),
-        floating_dtypes(nullable=nullable),
-        date_dtype(nullable=nullable),
-        time_dtype(nullable=nullable),
+def primitive_dtypes(nullable=_nullable, include_null=True):
+    primitive = (
+        boolean_dtype(nullable=nullable)
+        | integer_dtypes(nullable=nullable)
+        | floating_dtypes(nullable=nullable)
+        | date_dtype(nullable=nullable)
+        | time_dtype(nullable=nullable)
     )
+    if include_null:
+        primitive |= null_dtype
+    return primitive
 
 
 _item_strategy = primitive_dtypes()
 
+_length = st.one_of(st.none(), st.integers(min_value=0))
 
-def array_dtypes(value_type=_item_strategy, nullable=_nullable):
-    return st.builds(dt.Array, value_type=value_type, nullable=nullable)
+
+def array_dtypes(value_type=_item_strategy, nullable=_nullable, length=_length):
+    return st.builds(dt.Array, value_type=value_type, nullable=nullable, length=length)
 
 
 def map_dtypes(key_type=_item_strategy, value_type=_item_strategy, nullable=_nullable):
@@ -172,36 +177,23 @@ def struct_dtypes(
     nullable=_nullable,
 ):
     num_fields = draw(num_fields)
-    names = draw(st.lists(names, min_size=num_fields, max_size=num_fields))
+    names = draw(st.lists(names, min_size=num_fields, max_size=num_fields, unique=True))
     types = draw(st.lists(types, min_size=num_fields, max_size=num_fields))
     fields = dict(zip(names, types))
     return dt.Struct(fields, nullable=draw(nullable))
 
 
-def geometry_dtypes(nullable=_nullable):
-    return st.builds(dt.GeoSpatial, geotype=st.just("geometry"), nullable=nullable)
-
-
-def geography_dtypes(nullable=_nullable):
-    return st.builds(dt.GeoSpatial, geotype=st.just("geography"), nullable=nullable)
-
-
-def specific_geometry_dtypes(nullable=_nullable):
-    return st.one_of(
-        st.builds(dt.Point, nullable=nullable),
-        st.builds(dt.LineString, nullable=nullable),
-        st.builds(dt.Polygon, nullable=nullable),
-        st.builds(dt.MultiPoint, nullable=nullable),
-        st.builds(dt.MultiLineString, nullable=nullable),
-        st.builds(dt.MultiPolygon, nullable=nullable),
-    )
-
-
 def geospatial_dtypes(nullable=_nullable):
+    geotype = st.one_of(st.just("geography"), st.just("geometry"))
+    srid = st.one_of(st.none(), st.integers(min_value=0))
     return st.one_of(
-        specific_geometry_dtypes(nullable=nullable),
-        geometry_dtypes(nullable=nullable),
-        geography_dtypes(nullable=nullable),
+        st.builds(dt.Point, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.LineString, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.Polygon, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.MultiPoint, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.MultiLineString, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.MultiPolygon, geotype=geotype, nullable=nullable, srid=srid),
+        st.builds(dt.GeoSpatial, geotype=geotype, nullable=nullable, srid=srid),
     )
 
 
@@ -223,8 +215,6 @@ def all_dtypes(nullable=_nullable):
             | temporal_dtypes(nullable=nullable)
             | interval_dtype(nullable=nullable)
             | geospatial_dtypes(nullable=nullable)
-            | variadic_dtypes(nullable=nullable)
-            | struct_dtypes(nullable=nullable)
             | array_dtypes(recursive, nullable=nullable)
             | map_dtypes(recursive, recursive, nullable=nullable)
             | struct_dtypes(recursive, nullable=nullable)
@@ -255,6 +245,9 @@ all_schema = schema(all_dtypes)
 
 @st.composite
 def memtable(draw, schema=schema(primitive_dtypes)):  # noqa: B008
+    pytest.importorskip("pandas")
+    past = pytest.importorskip("hypothesis.extra.pandas")
+
     schema = draw(schema)
 
     columns = [past.column(name, dtype=dtype) for name, dtype in schema.to_pandas()]

@@ -6,6 +6,7 @@ import pickle
 import pytest
 from pytest import param
 
+import ibis
 from ibis.common.bases import Slotted
 from ibis.common.collections import FrozenDict
 from ibis.common.deferred import (
@@ -234,6 +235,8 @@ class TableMock(dict):
     def __eq__(self, other):
         return isinstance(other, TableMock) and super().__eq__(other)
 
+    __hash__ = None
+
 
 def _binop(name, switch=False):
     def method(self, other):
@@ -289,7 +292,7 @@ class ValueMock(Slotted):
 
 
 class ColumnMock(ValueMock):
-    __slots__ = ("name", "dtype")
+    __slots__ = ("dtype", "name")
 
     def __init__(self, name, dtype):
         super().__init__(name=name, dtype=dtype)
@@ -297,16 +300,19 @@ class ColumnMock(ValueMock):
     def __deferred_repr__(self):
         return f"<column[{self.dtype}]>"
 
+    def type(self):
+        return self.dtype
+
 
 class UnaryMock(ValueMock):
-    __slots__ = ("name", "arg")
+    __slots__ = ("arg", "name")
 
     def __init__(self, name, arg):
         super().__init__(name=name, arg=arg)
 
 
 class BinaryMock(ValueMock):
-    __slots__ = ("name", "left", "right")
+    __slots__ = ("left", "name", "right")
 
     def __init__(self, name, left, right):
         super().__init__(name=name, left=left, right=right)
@@ -580,7 +586,7 @@ def test_deferred_is_immutable():
         _.a = 1
 
 
-def test_deferred_namespace(table):
+def test_deferred_namespace():
     ns = Namespace(deferred, module=__name__)
 
     assert isinstance(ns.ColumnMock, Deferred)
@@ -602,3 +608,9 @@ def test_deferred_namespace(table):
 def test_custom_deferred_repr(table):
     expr = _.x + table.a
     assert repr(expr) == "(_.x + <column[int]>)"
+
+
+def test_null_deferrable(table):
+    result = ibis.null(_.a.type()).resolve(table).op()
+    expected = ibis.null(table.a.type()).op()
+    assert result == expected

@@ -7,7 +7,7 @@ import pandas.testing as tm
 import pytest
 from numpy import testing
 
-pytest.importorskip("psycopg2")
+pytest.importorskip("psycopg")
 gpd = pytest.importorskip("geopandas")
 pytest.importorskip("shapely")
 
@@ -21,7 +21,7 @@ def test_load_geodata(con):
 
 
 def test_empty_select(geotable):
-    expr = geotable[geotable.geo_point.geo_equals(geotable.geo_linestring)]
+    expr = geotable.filter(geotable.geo_point.geo_equals(geotable.geo_linestring))
     result = expr.execute()
     assert len(result) == 0
 
@@ -91,19 +91,23 @@ def test_geo_covered_by(geotable):
 
 
 def test_geo_d_fully_within(geotable):
-    expr = geotable.geo_point.d_fully_within(geotable.geo_point.buffer(1.0), 2.0)
+    expr = geotable.geo_point.d_fully_within(
+        geotable.geo_point.buffer(1.0), distance=2.0
+    )
     assert expr.execute().all()
 
 
 def test_geo_d_within(geotable):
-    expr = geotable.geo_point.d_within(geotable.geo_point.buffer(1.0), 1.0)
+    expr = geotable.geo_point.d_within(geotable.geo_point.buffer(1.0), distance=1.0)
     assert expr.execute().all()
 
 
 def test_geo_end_point(geotable, gdf):
     expr = geotable.geo_linestring.end_point()
     result = expr.execute()
-    end_point = gdf.apply(lambda x: x.geo_linestring.interpolate(1, True), axis=1)
+    end_point = gdf.apply(
+        lambda x: x.geo_linestring.interpolate(1, normalized=True), axis=1
+    )
     for a, b in zip(result, end_point):
         assert a.equals(b)
 
@@ -238,7 +242,9 @@ def test_geo_srid(geotable):
 def test_geo_start_point(geotable, gdf):
     expr = geotable.geo_linestring.start_point()
     result = expr.execute()
-    start_point = gdf.apply(lambda x: x.geo_linestring.interpolate(0, True), axis=1)
+    start_point = gdf.apply(
+        lambda x: x.geo_linestring.interpolate(0, normalized=True), axis=1
+    )
     for a, b in zip(result, start_point):
         assert a.equals(b)
 

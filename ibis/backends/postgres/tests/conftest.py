@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
 
+    import ibis.expr.types as ir
+
 PG_USER = os.environ.get(
     "IBIS_TEST_POSTGRES_USER", os.environ.get("PGUSER", "postgres")
 )
@@ -34,7 +36,7 @@ PG_PASS = os.environ.get(
 PG_HOST = os.environ.get(
     "IBIS_TEST_POSTGRES_HOST", os.environ.get("PGHOST", "localhost")
 )
-PG_PORT = os.environ.get("IBIS_TEST_POSTGRES_PORT", os.environ.get("PGPORT", 5432))
+PG_PORT = os.environ.get("IBIS_TEST_POSTGRES_PORT", os.environ.get("PGPORT", "5432"))
 IBIS_TEST_POSTGRES_DB = os.environ.get(
     "IBIS_TEST_POSTGRES_DATABASE", os.environ.get("PGDATABASE", "ibis_testing")
 )
@@ -46,18 +48,23 @@ class TestConf(ServiceBackendTest):
 
     returned_timestamp_unit = "s"
     supports_structs = False
+    supports_map = True
     rounding_method = "half_to_even"
     service_name = "postgres"
-    deps = ("psycopg2",)
+    deps = ("psycopg",)
 
     driver_supports_multiple_statements = True
+
+    @property
+    def map(self) -> ir.Table | None:
+        return self.connection.table("map").cast({"kv": "map<string, int>"})
 
     @property
     def test_files(self) -> Iterable[Path]:
         return self.data_dir.joinpath("csv").glob("*.csv")
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw):
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
         return ibis.postgres.connect(
             host=PG_HOST,
             port=PG_PORT,
@@ -70,7 +77,8 @@ class TestConf(ServiceBackendTest):
 
 @pytest.fixture(scope="session")
 def con(tmp_path_factory, data_dir, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
 @pytest.fixture(scope="module")
@@ -96,11 +104,3 @@ def gdf(geotable):
 @pytest.fixture(scope="module")
 def intervals(con):
     return con.table("intervals")
-
-
-@pytest.fixture
-def translate():
-    from ibis.backends.postgres import Backend
-
-    context = Backend.compiler.make_context()
-    return lambda expr: Backend.compiler.translator_class(expr, context).get_result()

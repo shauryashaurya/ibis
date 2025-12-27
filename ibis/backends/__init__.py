@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import abc
+import atexit
 import collections.abc
+import contextlib
 import functools
 import importlib.metadata
 import keyword
 import re
 import sys
 import urllib.parse
+import weakref
+from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
-from urllib.parse import parse_qs, urlparse
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, NamedTuple, overload
 
 import ibis
 import ibis.common.exceptions as exc
@@ -18,16 +21,17 @@ import ibis.config
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis import util
-from ibis.common.caching import RefCountedCache
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping, MutableMapping
+    from urllib.parse import ParseResult
 
     import pandas as pd
     import polars as pl
     import pyarrow as pa
     import sqlglot as sg
     import torch
+
 
 __all__ = ("BaseBackend", "connect")
 
@@ -42,16 +46,15 @@ class TablesAccessor(collections.abc.Mapping):
     >>> con = ibis.sqlite.connect("example.db")
     >>> people = con.tables["people"]  # access via index
     >>> people = con.tables.people  # access via attribute
-
     """
 
-    def __init__(self, backend: BaseBackend):
+    def __init__(self, backend: BaseBackend) -> None:
         self._backend = backend
 
     def __getitem__(self, name) -> ir.Table:
         try:
             return self._backend.table(name)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise KeyError(name) from exc
 
     def __getattr__(self, name) -> ir.Table:
@@ -59,7 +62,7 @@ class TablesAccessor(collections.abc.Mapping):
             raise AttributeError(name)
         try:
             return self._backend.table(name)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise AttributeError(name) from exc
 
     def __iter__(self) -> Iterator[str]:
@@ -105,6 +108,7 @@ class _FileIOHandler:
     def to_pandas(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -124,16 +128,16 @@ class _FileIOHandler:
             Mapping of scalar parameter expressions to value.
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is in `ibis/config.py`.
+            no limit. The default is in `ibis/config.py`.
         kwargs
             Keyword arguments
-
         """
         return self.execute(expr, params=params, limit=limit, **kwargs)
 
     def to_pandas_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -150,7 +154,7 @@ class _FileIOHandler:
             Mapping of scalar parameter expressions to value.
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is in `ibis/config.py`.
+            no limit. The default is in `ibis/config.py`.
         chunk_size
             Maximum number of rows in each returned `DataFrame` batch. This may have
             no effect depending on the backend.
@@ -177,16 +181,50 @@ class _FileIOHandler:
             )
         )
 
-    @util.experimental
+    @overload
     def to_pyarrow(
         self,
-        expr: ir.Expr,
+        expr: ir.Table,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
         **kwargs: Any,
-    ) -> pa.Table:
-        """Execute expression and return results in as a pyarrow table.
+    ) -> pa.Table: ...
+
+    @overload
+    def to_pyarrow(
+        self,
+        expr: ir.Column,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Array: ...
+
+    @overload
+    def to_pyarrow(
+        self,
+        expr: ir.Scalar,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Scalar: ...
+
+    @util.experimental
+    def to_pyarrow(
+        self,
+        expr: ir.Expr,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Table | pa.Array | pa.Scalar:
+        """Execute expression to a pyarrow object.
 
         This method is eager and will execute the associated expression
         immediately.
@@ -199,15 +237,16 @@ class _FileIOHandler:
             Mapping of scalar parameter expressions to value.
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is in `ibis/config.py`.
+            no limit. The default is in `ibis/config.py`.
         kwargs
             Keyword arguments
 
         Returns
         -------
-        Table
-            A pyarrow table holding the results of the executed expression.
-
+        result
+            If the passed expression is a Table, a pyarrow table is returned.
+            If the passed expression is a Column, a pyarrow array is returned.
+            If the passed expression is a Scalar, a pyarrow scalar is returned.
         """
         pa = self._import_pyarrow()
         self._run_pre_execute_hooks(expr)
@@ -221,13 +260,14 @@ class _FileIOHandler:
             table = pa.Table.from_batches(reader, schema=arrow_schema)
 
         return expr.__pyarrow_result__(
-            table.rename_columns(table_expr.columns).cast(arrow_schema)
+            table.rename_columns(list(table_expr.columns)).cast(arrow_schema)
         )
 
     @util.experimental
     def to_polars(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -246,7 +286,7 @@ class _FileIOHandler:
             Mapping of scalar parameter expressions to value.
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is in `ibis/config.py`.
+            no limit. The default is in `ibis/config.py`.
         kwargs
             Keyword arguments
 
@@ -265,6 +305,7 @@ class _FileIOHandler:
     def to_pyarrow_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -282,7 +323,7 @@ class _FileIOHandler:
             Ibis expression to export to pyarrow
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is in `ibis/config.py`.
+            no limit. The default is in `ibis/config.py`.
         params
             Mapping of scalar parameter expressions to value.
         chunk_size
@@ -302,6 +343,7 @@ class _FileIOHandler:
     def to_torch(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -338,7 +380,7 @@ class _FileIOHandler:
         }
 
     def read_parquet(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Register a parquet file as a table in the current backend.
 
@@ -356,14 +398,13 @@ class _FileIOHandler:
         -------
         ir.Table
             The just-registered table
-
         """
         raise NotImplementedError(
             f"{self.name} does not support direct registration of parquet data."
         )
 
     def read_csv(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Register a CSV file as a table in the current backend.
 
@@ -381,14 +422,13 @@ class _FileIOHandler:
         -------
         ir.Table
             The just-registered table
-
         """
         raise NotImplementedError(
             f"{self.name} does not support direct registration of CSV data."
         )
 
     def read_json(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Register a JSON file as a table in the current backend.
 
@@ -406,22 +446,20 @@ class _FileIOHandler:
         -------
         ir.Table
             The just-registered table
-
         """
         raise NotImplementedError(
             f"{self.name} does not support direct registration of JSON data."
         )
 
     def read_delta(
-        self, source: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ):
         """Register a Delta Lake table in the current database.
 
         Parameters
         ----------
-        source
-            The data source. Must be a directory
-            containing a Delta Lake table.
+        path
+            The data source. Must be a directory containing a Delta Lake table.
         table_name
             An optional name to use for the created table. This defaults to
             a sequentially generated name.
@@ -432,7 +470,6 @@ class _FileIOHandler:
         -------
         ir.Table
             The just-registered table.
-
         """
         raise NotImplementedError(
             f"{self.name} does not support direct registration of DeltaLake tables."
@@ -442,6 +479,7 @@ class _FileIOHandler:
     def to_parquet(
         self,
         expr: ir.Table,
+        /,
         path: str | Path,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
@@ -475,9 +513,48 @@ class _FileIOHandler:
                     writer.write_batch(batch)
 
     @util.experimental
+    def to_parquet_dir(
+        self,
+        expr: ir.Table,
+        /,
+        directory: str | Path,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write the results of executing the given expression to a parquet file in a directory.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            The ibis expression to execute and persist to parquet.
+        directory
+            The data source. A string or Path to the directory where the parquet file will be written.
+        params
+            Mapping of scalar parameter expressions to value.
+        **kwargs
+            Additional keyword arguments passed to pyarrow.dataset.write_dataset
+
+        https://arrow.apache.org/docs/python/generated/pyarrow.dataset.write_dataset.html
+
+        """
+        self._import_pyarrow()
+        import pyarrow.dataset as ds
+
+        # by default write_dataset creates the directory
+        with expr.to_pyarrow_batches(params=params) as batch_reader:
+            ds.write_dataset(
+                batch_reader, base_dir=directory, format="parquet", **kwargs
+            )
+
+    @util.experimental
     def to_csv(
         self,
         expr: ir.Table,
+        /,
         path: str | Path,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
@@ -500,7 +577,6 @@ class _FileIOHandler:
             Additional keyword arguments passed to pyarrow.csv.CSVWriter
 
         https://arrow.apache.org/docs/python/generated/pyarrow.csv.CSVWriter.html
-
         """
         self._import_pyarrow()
         import pyarrow.csv as pcsv
@@ -514,6 +590,7 @@ class _FileIOHandler:
     def to_delta(
         self,
         expr: ir.Table,
+        /,
         path: str | Path,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
@@ -548,10 +625,87 @@ class _FileIOHandler:
         with expr.to_pyarrow_batches(params=params) as batch_reader:
             write_deltalake(path, batch_reader, **kwargs)
 
+    @util.experimental
+    def to_json(
+        self,
+        expr: ir.Table,
+        /,
+        path: str | Path,
+        **kwargs: Any,
+    ) -> None:
+        """Write the results of `expr` to a json file of [{column -> value}, ...] objects.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            The ibis expression to execute and persist to Delta Lake table.
+        path
+            The data source. A string or Path to the Delta Lake table.
+        kwargs
+            Additional, backend-specifc keyword arguments.
+        """
+        backend = expr._find_backend(use_default=True)
+        raise NotImplementedError(
+            f"{backend.__class__.__name__} does not support writing to JSON."
+        )
+
+
+class HasCurrentCatalog(abc.ABC):
+    """Has a `current_catalog` property."""
+
+    @property
+    @abc.abstractmethod
+    def current_catalog(self) -> str:
+        """The name of the current catalog in the backend.
+
+        A collection of `table` is referred to as a `database`.
+        A collection of `database` is referred to as a `catalog`.
+
+        These terms are mapped onto the corresponding features in each
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
+
+        Returns
+        -------
+        str
+            The name of the current catalog.
+        """
+
+
+class HasCurrentDatabase(abc.ABC):
+    """Has a `current_database` property."""
+
+    @property
+    @abc.abstractmethod
+    def current_database(self) -> str:
+        """The name of the current database in the backend.
+
+        A collection of `table` is referred to as a `database`.
+        A collection of `database` is referred to as a `catalog`.
+
+        These terms are mapped onto the corresponding features in each
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
+
+        Returns
+        -------
+        str
+            The name of the current database.
+        """
+
 
 class CanListCatalog(abc.ABC):
     @abc.abstractmethod
-    def list_catalogs(self, like: str | None = None) -> list[str]:
+    def list_catalogs(self, *, like: str | None = None) -> list[str]:
         """List existing catalogs in the current connection.
 
         ::: {.callout-note}
@@ -561,33 +715,29 @@ class CanListCatalog(abc.ABC):
         A collection of `database` is referred to as a `catalog`.
 
         These terms are mapped onto the corresponding features in each
-        backend (where available), regardless of whether the backend itself
-        uses the same terminology.
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
         :::
 
         Parameters
         ----------
         like
-            A pattern in Python's regex format to filter returned database
-            names.
+            A pattern in Python's regex format to filter returned catalog names.
 
         Returns
         -------
         list[str]
             The catalog names that exist in the current connection, that match
             the `like` pattern if provided.
-
         """
-
-    @property
-    @abc.abstractmethod
-    def current_catalog(self) -> str:
-        """The current catalog in use."""
 
 
 class CanCreateCatalog(CanListCatalog):
     @abc.abstractmethod
-    def create_catalog(self, name: str, force: bool = False) -> None:
+    def create_catalog(self, name: str, /, *, force: bool = False) -> None:
         """Create a new catalog.
 
         ::: {.callout-note}
@@ -597,8 +747,11 @@ class CanCreateCatalog(CanListCatalog):
         A collection of `database` is referred to as a `catalog`.
 
         These terms are mapped onto the corresponding features in each
-        backend (where available), regardless of whether the backend itself
-        uses the same terminology.
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
         :::
 
         Parameters
@@ -607,11 +760,10 @@ class CanCreateCatalog(CanListCatalog):
             Name of the new catalog.
         force
             If `False`, an exception is raised if the catalog already exists.
-
         """
 
     @abc.abstractmethod
-    def drop_catalog(self, name: str, force: bool = False) -> None:
+    def drop_catalog(self, name: str, /, *, force: bool = False) -> None:
         """Drop a catalog with name `name`.
 
         ::: {.callout-note}
@@ -621,8 +773,11 @@ class CanCreateCatalog(CanListCatalog):
         A collection of `database` is referred to as a `catalog`.
 
         These terms are mapped onto the corresponding features in each
-        backend (where available), regardless of whether the backend itself
-        uses the same terminology.
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
         :::
 
         Parameters
@@ -631,14 +786,13 @@ class CanCreateCatalog(CanListCatalog):
             Catalog to drop.
         force
             If `False`, an exception is raised if the catalog does not exist.
-
         """
 
 
 class CanListDatabase(abc.ABC):
     @abc.abstractmethod
     def list_databases(
-        self, like: str | None = None, catalog: str | None = None
+        self, *, like: str | None = None, catalog: str | None = None
     ) -> list[str]:
         """List existing databases in the current connection.
 
@@ -649,8 +803,11 @@ class CanListDatabase(abc.ABC):
         A collection of `database` is referred to as a `catalog`.
 
         These terms are mapped onto the corresponding features in each
-        backend (where available), regardless of whether the backend itself
-        uses the same terminology.
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
         :::
 
         Parameters
@@ -667,21 +824,29 @@ class CanListDatabase(abc.ABC):
         list[str]
             The database names that exist in the current connection, that match
             the `like` pattern if provided.
-
         """
-
-    @property
-    @abc.abstractmethod
-    def current_database(self) -> str:
-        """The current database in use."""
 
 
 class CanCreateDatabase(CanListDatabase):
     @abc.abstractmethod
     def create_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         """Create a database named `name` in `catalog`.
+
+        ::: {.callout-note}
+        ## Ibis does not use the word `schema` to refer to database hierarchy.
+
+        A collection of `table` is referred to as a `database`.
+        A collection of `database` is referred to as a `catalog`.
+
+        These terms are mapped onto the corresponding features in each
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
+        :::
 
         Parameters
         ----------
@@ -697,62 +862,105 @@ class CanCreateDatabase(CanListDatabase):
 
     @abc.abstractmethod
     def drop_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         """Drop the database with `name` in `catalog`.
+
+        ::: {.callout-note}
+        ## Ibis does not use the word `schema` to refer to database hierarchy.
+
+        A collection of `table` is referred to as a `database`.
+        A collection of `database` is referred to as a `catalog`.
+
+        These terms are mapped onto the corresponding features in each
+        backend (where available), regardless of the terminology the backend uses.
+
+        See the
+        [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+        for more info.
+        :::
 
         Parameters
         ----------
         name
             Name of the schema to drop.
         catalog
-            Name of the catalog to drop the database from. If `None`, the
-            current catalog is used.
+            Name of the catalog to drop the database from.
+            If `None`, the current catalog is used.
         force
             If `False`, an exception is raised if the database does not exist.
 
         """
 
 
-# TODO: remove this for 10.0
-class CanListSchema:
-    @util.deprecated(
-        instead="Use `list_databases` instead`", as_of="9.0", removed_in="10.0"
-    )
-    def list_schemas(
-        self, like: str | None = None, database: str | None = None
-    ) -> list[str]:
-        return self.list_databases(like=like, catalog=database)
-
-    @property
-    @util.deprecated(
-        instead="Use `Backend.current_database` instead.",
-        as_of="9.0",
-        removed_in="10.0",
-    )
-    def current_schema(self) -> str:
-        return self.current_database
+class CacheEntry(NamedTuple):
+    orig_op: ops.Relation
+    cached_op_ref: weakref.ref[ops.Relation]
+    finalizer: weakref.finalize
 
 
-class CanCreateSchema(CanListSchema):
-    @util.deprecated(
-        instead="Use `create_database` instead", as_of="9.0", removed_in="10.0"
-    )
-    def create_schema(
-        self, name: str, database: str | None = None, force: bool = False
-    ) -> None:
-        self.create_database(name=name, catalog=database, force=force)
+class CacheHandler:
+    """A mixin for handling `.cache()`/`CachedTable` operations."""
 
-    @util.deprecated(
-        instead="Use `drop_database` instead", as_of="9.0", removed_in="10.0"
-    )
-    def drop_schema(
-        self, name: str, database: str | None = None, force: bool = False
-    ) -> None:
-        self.drop_database(name=name, catalog=database, force=force)
+    def __init__(self):
+        self._cache_name_to_entry = {}
+        self._cache_op_to_entry = {}
+
+    def _cached_table(self, table: ir.Table) -> ir.CachedTable:
+        """Convert a Table to a CachedTable.
+
+        Parameters
+        ----------
+        table
+            Table expression to cache
+
+        Returns
+        -------
+        Table
+            Cached table
+        """
+        entry = self._cache_op_to_entry.get(table.op())
+        if entry is None or (cached_op := entry.cached_op_ref()) is None:
+            cached_op = self._create_cached_table(util.gen_name("cached"), table).op()
+            entry = CacheEntry(
+                table.op(),
+                weakref.ref(cached_op),
+                weakref.finalize(
+                    cached_op, self._finalize_cached_table, cached_op.name
+                ),
+            )
+            self._cache_op_to_entry[table.op()] = entry
+            self._cache_name_to_entry[cached_op.name] = entry
+        return ir.CachedTable(cached_op)
+
+    def _finalize_cached_table(self, name: str) -> None:
+        """Release a cached table given its name.
+
+        This is a no-op if the cached table is already released.
+
+        Parameters
+        ----------
+        name
+            The name of the cached table.
+        """
+        if (entry := self._cache_name_to_entry.pop(name, None)) is not None:
+            self._cache_op_to_entry.pop(entry.orig_op)
+            entry.finalizer.detach()
+            try:
+                self._drop_cached_table(name)
+            except Exception:
+                # suppress exceptions during interpreter shutdown
+                if not sys.is_finalizing():
+                    raise
+
+    def _create_cached_table(self, name: str, expr: ir.Table) -> ir.Table:
+        return self.create_table(name, expr, schema=expr.schema(), temp=True)
+
+    def _drop_cached_table(self, name: str) -> None:
+        self.drop_table(name, force=True)
 
 
-class BaseBackend(abc.ABC, _FileIOHandler):
+class BaseBackend(abc.ABC, _FileIOHandler, CacheHandler):
     """Base backend class.
 
     All Ibis backends must subclass this class and implement all the
@@ -763,19 +971,13 @@ class BaseBackend(abc.ABC, _FileIOHandler):
 
     supports_temporary_tables = False
     supports_python_udfs = False
-    supports_in_memory_tables = True
 
     def __init__(self, *args, **kwargs):
         self._con_args: tuple[Any] = args
         self._con_kwargs: dict[str, Any] = kwargs
-        # expression cache
-        self._query_cache = RefCountedCache(
-            populate=self._load_into_cache,
-            lookup=lambda name: self.table(name).op(),
-            finalize=self._clean_up_cached_table,
-            generate_name=functools.partial(util.gen_name, "cache"),
-            key=lambda expr: expr.op(),
-        )
+        self._can_reconnect: bool = True
+        self._memtables = weakref.WeakSet()
+        super().__init__()
 
     @property
     @abc.abstractmethod
@@ -859,7 +1061,10 @@ class BaseBackend(abc.ABC, _FileIOHandler):
     # TODO(kszucs): should call self.connect(*self._con_args, **self._con_kwargs)
     def reconnect(self) -> None:
         """Reconnect to the database already configured with connect."""
-        self.do_connect(*self._con_args, **self._con_kwargs)
+        if self._can_reconnect:
+            self.do_connect(*self._con_args, **self._con_kwargs)
+        else:
+            raise exc.IbisError("Cannot reconnect to unconfigured {self.name} backend")
 
     def do_connect(self, *args, **kwargs) -> None:
         """Connect to database specified by `args` and `kwargs`."""
@@ -896,9 +1101,9 @@ class BaseBackend(abc.ABC, _FileIOHandler):
 
     @abc.abstractmethod
     def list_tables(
-        self, like: str | None = None, database: tuple[str, str] | str | None = None
+        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
     ) -> list[str]:
-        """Return the list of table names in the current database.
+        """The table names that match `like` in the given `database`.
 
         For some backends, the tables may be files in a directory,
         or other equivalent entities in a SQL database.
@@ -908,66 +1113,101 @@ class BaseBackend(abc.ABC, _FileIOHandler):
         like
             A pattern in Python's regex format.
         database
-            The database from which to list tables.
-            If not provided, the current database is used.
+            The database, or (catalog, database) from which to list tables.
+
+            For backends that support a single-level table hierarchy,
+            you can pass in a string like `"bar"`.
             For backends that support multi-level table hierarchies, you can
             pass in a dotted string path like `"catalog.database"` or a tuple of
             strings like `("catalog", "database")`.
+            If not provided, the current database
+            (and catalog, if applicable for this backend) is used.
 
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
+            See the
+            [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+            for more info.
 
         Returns
         -------
         list[str]
             The list of the table names that match the pattern `like`.
 
+        Examples
+        --------
+        This example uses the DuckDB backend, but the list_tables API
+        works the same for other backends.
+
+        >>> import ibis
+        >>> con = ibis.duckdb.connect()
+        >>> foo = con.create_table("foo", schema=ibis.schema(dict(a="int")))
+        >>> con.list_tables()
+        ['foo']
+        >>> bar = con.create_view("bar", foo)
+        >>> con.list_tables()
+        ['bar', 'foo']
+        >>> con.create_database("my_database")
+        >>> con.list_tables(database="my_database")
+        []
+        >>> con.raw_sql("CREATE TABLE my_database.baz (a INTEGER)")  # doctest: +ELLIPSIS
+        <duckdb.duckdb.DuckDBPyConnection object at 0x...>
+        >>> con.list_tables(database="my_database")
+        ['baz']
         """
 
     @abc.abstractmethod
     def table(
-        self, name: str, database: tuple[str, str] | str | None = None
+        self, name: str, /, *, database: tuple[str, str] | str | None = None
     ) -> ir.Table:
-        """Construct a table expression.
+        """Construct a table expression from the corresponding table in the backend.
 
         Parameters
         ----------
         name
             Table name
         database
-            Database name
-            If not provided, the current database is used.
+            The database, or (catalog, database) from which to get the table.
+
+            For backends that support a single-level table hierarchy,
+            you can pass in a string like `"bar"`.
             For backends that support multi-level table hierarchies, you can
             pass in a dotted string path like `"catalog.database"` or a tuple of
             strings like `("catalog", "database")`.
+            If not provided, the current database
+            (and catalog, if applicable for this backend) is used.
 
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
+            See the
+            [Table Hierarchy Concepts Guide](/concepts/backend-table-hierarchy.qmd)
+            for more info.
 
         Returns
         -------
         Table
             Table expression
 
+        Examples
+        --------
+        >>> import ibis
+        >>> backend = ibis.duckdb.connect()
+
+        Get the "foo" table from the current database
+        (and catalog, if applicable for this backend):
+
+        >>> backend.table("foo")  # doctest: +SKIP
+
+        Get the "foo" table from the "bar" database
+        (in DuckDB's language they would say the "bar" schema,
+        in SQL this would be `"bar"."foo"`)
+
+        >>> backend.table("foo", database="bar")  # doctest: +SKIP
+
+        Get the "foo" table from the "bar" database, within the "baz" catalog
+        (in DuckDB's language they would say the "bar" schema, and "baz" database,
+        in SQL this would be `"baz"."bar"."foo"`)
+
+        >>> backend.table("foo", database=("baz", "bar"))  # doctest: +SKIP
         """
 
-    @functools.cached_property
+    @property
     def tables(self):
         """An accessor for tables in the database.
 
@@ -1019,60 +1259,98 @@ class BaseBackend(abc.ABC, _FileIOHandler):
         if self.supports_python_udfs:
             raise NotImplementedError(self.name)
 
-    def _register_in_memory_tables(self, expr: ir.Expr):
-        if self.supports_in_memory_tables:
-            raise NotImplementedError(self.name)
+    def _verify_in_memory_tables_are_unique(self, expr: ir.Expr) -> None:
+        memtables = expr.op().find(ops.InMemoryTable)
+        name_counts = Counter(op.name for op in memtables)
+
+        if duplicate_names := sorted(
+            name for name, count in name_counts.items() if count > 1
+        ):
+            raise exc.IbisError(f"Duplicate in-memory table names: {duplicate_names}")
+        return memtables
+
+    def _register_in_memory_tables(self, expr: ir.Expr) -> None:
+        for memtable in self._verify_in_memory_tables_are_unique(expr):
+            if memtable not in self._memtables:
+                self._register_in_memory_table(memtable)
+                self._memtables.add(memtable)
+                if (
+                    finalizer := self._make_memtable_finalizer(memtable.name)
+                ) is not None:
+
+                    def finalize(finalizer=finalizer):
+                        with contextlib.suppress(Exception):
+                            finalizer()
+
+                    atexit.register(finalize)
+
+    @abc.abstractmethod
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        """Register an in-memory table associated with `op`."""
+
+    @abc.abstractmethod
+    def _make_memtable_finalizer(self, name: str) -> None | Callable[..., None]:
+        """Make a finalizer for an in-memory table."""
 
     def _run_pre_execute_hooks(self, expr: ir.Expr) -> None:
         """Backend-specific hooks to run before an expression is executed."""
-        self._define_udf_translation_rules(expr)
         self._register_udfs(expr)
         self._register_in_memory_tables(expr)
 
-    def _define_udf_translation_rules(self, expr: ir.Expr):
-        if self.supports_python_udfs:
-            raise NotImplementedError(self.name)
-
+    @abc.abstractmethod
     def compile(
         self,
         expr: ir.Expr,
+        /,
+        *,
+        limit: int | None = None,
         params: Mapping[ir.Expr, Any] | None = None,
-    ) -> Any:
-        """Compile an expression."""
-        return self.compiler.to_sql(expr, params=params)
+        **kwargs: Any,
+    ) -> str | pl.LazyFrame:
+        """Compile `expr` to a SQL string (for SQL backends) or a LazyFrame (for the polars backend).
 
-    def _to_sqlglot(self, expr: ir.Expr, **kwargs) -> sg.exp.Expression:
-        """Convert an Ibis expression to a sqlglot expression.
-
-        Called by `ibis.to_sql`; gives the backend an opportunity to generate
-        nicer SQL for human consumption.
+        Parameters
+        ----------
+        expr
+            An ibis expression to compile.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            no limit. The default is in `ibis/config.py`.
+        params
+            Mapping of scalar parameter expressions to value.
+        kwargs
+            Additional keyword arguments
         """
-        raise NotImplementedError(f"Backend '{self.name}' backend doesn't support SQL")
 
-    def execute(self, expr: ir.Expr) -> Any:
-        """Execute an expression."""
+    def execute(
+        self,
+        expr: ir.Expr,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame | pd.Series | Any:
+        """Execute an Ibis expression and return a pandas `DataFrame`, `Series`, or scalar.
 
-    def add_operation(self, operation: ops.Node) -> Callable:
-        """Add a translation function to the backend for a specific operation.
-
-        Operations are defined in `ibis.expr.operations`, and a translation
-        function receives the translator object and an expression as
-        parameters, and returns a value depending on the backend.
+        Parameters
+        ----------
+        expr
+            Ibis expression to execute.
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            no limit. The default is in `ibis/config.py`.
+        kwargs
+            Keyword arguments
         """
-        if not hasattr(self, "compiler"):
-            raise RuntimeError("Only SQL-based backends support `add_operation`")
-
-        def decorator(translation_function: Callable) -> None:
-            self.compiler.translator_class.add_operation(
-                operation, translation_function
-            )
-
-        return decorator
 
     @abc.abstractmethod
     def create_table(
         self,
         name: str,
+        /,
         obj: pd.DataFrame | pa.Table | ir.Table | None = None,
         *,
         schema: ibis.Schema | None = None,
@@ -1105,13 +1383,13 @@ class BaseBackend(abc.ABC, _FileIOHandler):
         -------
         Table
             The table that was created.
-
         """
 
     @abc.abstractmethod
     def drop_table(
         self,
         name: str,
+        /,
         *,
         database: str | None = None,
         force: bool = False,
@@ -1126,7 +1404,6 @@ class BaseBackend(abc.ABC, _FileIOHandler):
             Name of the database where the table exists, if not the default.
         force
             If `False`, an exception is raised if the table does not exist.
-
         """
         raise NotImplementedError(
             f'Backend "{self.name}" does not implement "drop_table"'
@@ -1151,6 +1428,7 @@ class BaseBackend(abc.ABC, _FileIOHandler):
     def create_view(
         self,
         name: str,
+        /,
         obj: ir.Table,
         *,
         database: str | None = None,
@@ -1172,14 +1450,13 @@ class BaseBackend(abc.ABC, _FileIOHandler):
 
         Returns
         -------
-        Table
+        ir.Table
             The view that was created.
-
         """
 
     @abc.abstractmethod
     def drop_view(
-        self, name: str, *, database: str | None = None, force: bool = False
+        self, name: str, /, *, database: str | None = None, force: bool = False
     ) -> None:
         """Drop a view.
 
@@ -1191,11 +1468,10 @@ class BaseBackend(abc.ABC, _FileIOHandler):
             Name of the database where the view exists, if not the default.
         force
             If `False`, an exception is raised if the view does not exist.
-
         """
 
     @classmethod
-    def has_operation(cls, operation: type[ops.Value]) -> bool:
+    def has_operation(cls, operation: type[ops.Value], /) -> bool:
         """Return whether the backend implements support for `operation`.
 
         Parameters
@@ -1216,50 +1492,10 @@ class BaseBackend(abc.ABC, _FileIOHandler):
         False
         >>> ibis.postgres.has_operation(ops.ArrayIndex)
         True
-
         """
         raise NotImplementedError(
             f"{cls.name} backend has not implemented `has_operation` API"
         )
-
-    def _cached(self, expr: ir.Table):
-        """Cache the provided expression.
-
-        All subsequent operations on the returned expression will be performed on the cached data.
-
-        Parameters
-        ----------
-        expr
-            Table expression to cache
-
-        Returns
-        -------
-        Expr
-            Cached table
-
-        """
-        op = expr.op()
-        if (result := self._query_cache.get(op)) is None:
-            self._query_cache.store(expr)
-            result = self._query_cache[op]
-        return ir.CachedTable(result)
-
-    def _release_cached(self, expr: ir.CachedTable) -> None:
-        """Releases the provided cached expression.
-
-        Parameters
-        ----------
-        expr
-            Cached expression to release
-
-        """
-        del self._query_cache[expr.op()]
-
-    def _load_into_cache(self, name, expr):
-        raise NotImplementedError(self.name)
-
-    def _clean_up_cached_table(self, op):
-        raise NotImplementedError(self.name)
 
     def _transpile_sql(self, query: str, *, dialect: str | None = None) -> str:
         # only transpile if dialect was passed
@@ -1276,6 +1512,137 @@ class BaseBackend(abc.ABC, _FileIOHandler):
         if dialect != output_dialect:
             (query,) = sg.transpile(query, read=dialect, write=output_dialect)
         return query
+
+
+class BaseExampleLoader(abc.ABC):
+    __slots__ = ()
+
+    @abc.abstractmethod
+    def _load_example(self, *, path: str | Path, table_name: str) -> ir.Table:
+        # Read directly into these backends. This helps reduce memory
+        # usage, making the larger example datasets easier to work with.
+        if path.endswith(".parquet"):
+            return self._load_parquet(path=path, table_name=table_name)
+        else:
+            return self._load_csv(path=path, table_name=table_name)
+
+
+class ExampleLoader(BaseExampleLoader):
+    __slots__ = ()
+
+    def _load_example(self, *, path: str | Path, table_name: str) -> ir.Table:
+        # Read directly into these backends. This helps reduce memory
+        # usage, making the larger example datasets easier to work with.
+        if path.endswith(".parquet"):
+            return self._load_parquet(path=path, table_name=table_name)
+        else:
+            return self._load_csv(path=path, table_name=table_name)
+
+    @abc.abstractmethod
+    def _load_parquet(self, *, path: str | Path, table_name: str) -> ir.Table:
+        """Load an example Apache Parquet file."""
+
+    @abc.abstractmethod
+    def _load_csv(self, *, path: str | Path, table_name: str) -> ir.Table:
+        """Load an example CSV file."""
+
+
+class NoExampleLoader(BaseExampleLoader):
+    __slots__ = ()
+
+    def _load_example(self, *, path: str | Path, table_name: str) -> ir.Table:
+        raise NotImplementedError(f"{self.name} does not support loading example data.")
+
+
+class DirectExampleLoader(ExampleLoader):
+    __slots__ = ()
+
+    def _load_parquet(self, *, path: str | Path, table_name: str) -> ir.Table:
+        return self.read_parquet(path, table_name=table_name)
+
+    def _load_csv(self, *, path: str | Path, table_name: str) -> ir.Table:
+        return self.read_csv(path, table_name=table_name)
+
+
+class DirectPyArrowExampleLoader(DirectExampleLoader):
+    __slots__ = ()
+
+    overwrite_example: bool = False
+    temporary_example: bool = False
+
+    def _load_csv(self, *, path: str | Path, table_name: str) -> ir.Table:
+        import pyarrow as pa
+        import pyarrow.csv
+
+        # The convert options lets pyarrow treat empty strings as null for
+        # string columns, but not quoted empty strings.
+        table = pyarrow.csv.read_csv(
+            path,
+            convert_options=pyarrow.csv.ConvertOptions(
+                strings_can_be_null=True, quoted_strings_can_be_null=False
+            ),
+        )
+
+        # All null columns are inferred as null-type, but not all
+        # backends support null-type columns. Cast to an all-null
+        # string column instead.
+        for i, field in enumerate(table.schema):
+            if pyarrow.types.is_null(field.type):
+                table = table.set_column(i, field.name, table[i].cast(pa.string()))
+
+        return self.create_table(
+            table_name,
+            obj=table,
+            temp=self.temporary_example,
+            overwrite=self.overwrite_example,
+        )
+
+
+class PyArrowExampleLoader(ExampleLoader):
+    __slots__ = ()
+
+    overwrite_example: bool = False
+    temporary_example: bool = True
+
+    def _load_parquet(self, *, path: str | Path, table_name: str) -> ir.Table:
+        import pyarrow_hotfix  # noqa: F401, I001
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(path)
+        return self.create_table(
+            table_name,
+            obj=table,
+            temp=self.temporary_example,
+            overwrite=self.overwrite_example,
+        )
+
+    def _load_csv(self, *, path: str | Path, table_name: str) -> ir.Table:
+        import pyarrow_hotfix  # noqa: F401, I001
+        import pyarrow as pa
+        import pyarrow.csv
+
+        # The convert options lets pyarrow treat empty strings as null for
+        # string columns, but not quoted empty strings.
+        table = pyarrow.csv.read_csv(
+            path,
+            convert_options=pyarrow.csv.ConvertOptions(
+                strings_can_be_null=True, quoted_strings_can_be_null=False
+            ),
+        )
+
+        # All null columns are inferred as null-type, but not all
+        # backends support null-type columns. Cast to an all-null
+        # string column instead.
+        for i, field in enumerate(table.schema):
+            if pyarrow.types.is_null(field.type):
+                table = table.set_column(i, field.name, table[i].cast(pa.string()))
+
+        return self.create_table(
+            table_name,
+            obj=table,
+            temp=self.temporary_example,
+            overwrite=self.overwrite_example,
+        )
 
 
 @functools.cache
@@ -1303,7 +1670,7 @@ def _get_backend_names(*, exclude: tuple[str] = ()) -> frozenset[str]:
     return frozenset(ep.name for ep in entrypoints).difference(exclude)
 
 
-def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
+def connect(resource: Path | str, /, **kwargs: Any) -> BaseBackend:
     """Connect to `resource`, inferring the backend automatically.
 
     The general pattern for `ibis.connect` is
@@ -1367,52 +1734,49 @@ def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
     orig_kwargs = kwargs.copy()
     kwargs = dict(urllib.parse.parse_qsl(parsed.query))
 
+    # convert single parameter lists value to single values
+    for name, value in kwargs.items():
+        if len(value) == 1:
+            kwargs[name] = value[0]
+
+    # Merge explicit kwargs with query string, explicit kwargs
+    # taking precedence
+    kwargs.update(orig_kwargs)
+
     if scheme == "file":
         path = parsed.netloc + parsed.path
-        # Merge explicit kwargs with query string, explicit kwargs
-        # taking precedence
-        kwargs.update(orig_kwargs)
         if path.endswith(".duckdb"):
             return ibis.duckdb.connect(path, **kwargs)
         elif path.endswith((".sqlite", ".db")):
             return ibis.sqlite.connect(path, **kwargs)
-        elif path.endswith((".parquet", ".csv", ".csv.gz")):
-            # Load parquet/csv/csv.gz files with duckdb by default
+        elif path.endswith((".csv", ".csv.gz")):
+            # Load csv/csv.gz files with duckdb by default
             con = ibis.duckdb.connect(**kwargs)
-            con.register(path)
+            con.read_csv(path)
+            return con
+        elif path.endswith(".parquet"):
+            # Load parquet files with duckdb by default
+            con = ibis.duckdb.connect(**kwargs)
+            con.read_parquet(path)
             return con
         else:
             raise ValueError(f"Don't know how to connect to {resource!r}")
 
-    if kwargs:
-        # If there are kwargs (either explicit or from the query string),
-        # re-add them to the parsed URL
-        query = urllib.parse.urlencode(kwargs)
-        parsed = parsed._replace(query=query)
-
-    if scheme in ("postgres", "postgresql"):
-        # Treat `postgres://` and `postgresql://` the same
-        scheme = "postgres"
-
-    # Convert all arguments back to a single URL string
-    url = parsed.geturl()
-    if "://" not in url:
-        # urllib may roundtrip `duckdb://` to `duckdb:`. Here we re-add the
-        # missing `//`.
-        url = url.replace(":", "://", 1)
+    # Treat `postgres://` and `postgresql://` the same
+    scheme = scheme.replace("postgresql", "postgres")
 
     try:
         backend = getattr(ibis, scheme)
     except AttributeError:
         raise ValueError(f"Don't know how to connect to {resource!r}") from None
 
-    return backend._from_url(url, **orig_kwargs)
+    return backend._from_url(parsed, **kwargs)
 
 
 class UrlFromPath:
     __slots__ = ()
 
-    def _from_url(self, url: str, **kwargs) -> BaseBackend:
+    def _from_url(self, url: ParseResult, **kwargs: Any) -> BaseBackend:
         """Connect to a backend using a URL `url`.
 
         Parameters
@@ -1428,7 +1792,6 @@ class UrlFromPath:
             A backend instance
 
         """
-        url = urlparse(url)
         netloc = url.netloc
         parts = list(filter(None, (netloc, url.path[bool(netloc) :])))
         database = Path(*parts) if parts and parts != [":memory:"] else ":memory:"
@@ -1439,16 +1802,6 @@ class UrlFromPath:
         elif isinstance(database, Path):
             database = database.absolute()
 
-        query_params = parse_qs(url.query)
-
-        for name, value in query_params.items():
-            if len(value) > 1:
-                kwargs[name] = value
-            elif len(value) == 1:
-                kwargs[name] = value[0]
-            else:
-                raise exc.IbisError(f"Invalid URL parameter: {name}")
-
         self._convert_kwargs(kwargs)
         return self.connect(database=database, **kwargs)
 
@@ -1458,7 +1811,7 @@ class NoUrl:
 
     name: str
 
-    def _from_url(self, url: str, **kwargs) -> BaseBackend:
+    def _from_url(self, url: ParseResult, **kwargs) -> BaseBackend:
         """Connect to the backend with empty url.
 
         Parameters
@@ -1476,3 +1829,12 @@ class NoUrl:
 
         """
         return self.connect(**kwargs)
+
+
+class SupportsTempTables:
+    __slots__ = ()
+
+    supports_temporary_tables = True
+
+    def _make_memtable_finalizer(self, name: str) -> None:
+        """No-op because temporary tables are automatically cleaned up."""

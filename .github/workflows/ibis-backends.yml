@@ -53,34 +53,31 @@ jobs:
           - windows-latest
         python-version:
           - "3.9"
-          - "3.11"
+          - "3.13"
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras bigquery
-
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: run simple bigquery unit tests
-        run: just ci-check ibis/backends/bigquery/tests/unit
+        run: just ci-check "--extra bigquery" ibis/backends/bigquery/tests/unit
 
       - name: upload code coverage
         if: success()
         continue-on-error: true
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           flags: backend,bigquery,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -96,92 +93,91 @@ jobs:
           - windows-latest
         python-version:
           - "3.9"
-          - "3.11"
+          - "3.13"
         backend:
           - name: duckdb
             title: DuckDB
             serial: true
             extras:
-              - duckdb
-              - deltalake
-              - examples
-              - decompiler
-              - polars
+              - --extra duckdb
+              - --extra deltalake
+              - --extra geospatial
+              - --extra examples
+              - --extra decompiler
+              - --extra polars
             additional_deps:
               - torch
-          # TODO: remove this duckdb job once the next duckdb_spatial is released
-          - name: duckdb
-            title: DuckDB + Geospatial
-            extras:
-              - geospatial
-            additional_deps:
-              - "duckdb==0.9.2"
           - name: clickhouse
             title: ClickHouse
             services:
               - clickhouse
             extras:
-              - clickhouse
-              - examples
-          - name: pandas
-            title: Pandas
-            extras:
-              - pandas
+              - --extra clickhouse
+              - --extra examples
           - name: sqlite
             title: SQLite
+            serial: true
             extras:
-              - sqlite
+              - --extra sqlite
           - name: datafusion
-            title: Datafusion
+            title: DataFusion
+            serial: true
             extras:
-              - datafusion
+              - --extra datafusion
           - name: polars
             title: Polars
             extras:
-              - polars
-              - deltalake
+              - --extra polars
+              - --extra deltalake
           - name: mysql
             title: MySQL
+            serial: true
             services:
               - mysql
             extras:
-              - mysql
-              - geospatial
+              - --extra mysql
+              - --extra geospatial
+              - --extra polars
             sys-deps:
               - libgeos-dev
+              - default-libmysqlclient-dev
           - name: postgres
             title: PostgreSQL
+            serial: true
             extras:
-              - postgres
-              - geospatial
+              - --extra postgres
+              - --extra geospatial
             services:
               - postgres
             sys-deps:
               - libgeos-dev
+              - libpq5
           - name: postgres
             title: PostgreSQL + Torch
+            serial: true
             extras:
-              - postgres
-              - geospatial
-              - polars
+              - --extra postgres
+              - --extra geospatial
+              - --extra polars
             additional_deps:
               - torch
             services:
               - postgres
             sys-deps:
               - libgeos-dev
+              - libpq5
           - name: risingwave
-            title: Risingwave
+            title: RisingWave
             serial: true
             services:
               - risingwave
             extras:
-              - risingwave
+              - --extra risingwave
           - name: impala
             title: Impala
             serial: true
             extras:
-              - impala
+              - --extra impala
             services:
               - impala
               - kudu
@@ -190,8 +186,10 @@ jobs:
               - ninja-build
           - name: mssql
             title: MS SQL Server
+            serial: true
             extras:
-              - mssql
+              - --extra mssql
+              - --extra polars
             services:
               - mssql
             sys-deps:
@@ -201,116 +199,189 @@ jobs:
           - name: trino
             title: Trino
             extras:
-              - trino
+              - --extra trino
             services:
               - trino
           - name: druid
             title: Druid
             extras:
-              - druid
+              - --extra druid
             services:
               - druid
           - name: exasol
             title: Exasol
             serial: true
             extras:
-              - exasol
+              - --extra exasol
             services:
               - exasol
           - name: oracle
             title: Oracle
             serial: true
             extras:
-              - oracle
+              - --extra oracle
+              - --extra polars
             services:
               - oracle
           - name: flink
             title: Flink
             serial: true
             extras:
-              - flink
+              - --extra flink
             additional_deps:
-              - "'apache-flink < 1.20.0'"
-              - "'pandas < 2.2'"
+              - "'apache-flink==1.20.2'"
+              - "'pandas<2.2'"
+              - setuptools
             services:
               - flink
         include:
           - os: ubuntu-latest
-            python-version: "3.11.8"
+            python-version: "3.11"
             backend:
-              name: dask
-              title: Dask
+              name: flink
+              title: Flink
+              serial: true
               extras:
-                - dask
+                - --extra flink
+              additional_deps:
+                - "'apache-flink==1.20.2'"
+                - "'pandas<2.2'"
+                - setuptools
+              services:
+                - flink
           - os: ubuntu-latest
-            python-version: "3.9"
+            python-version: "3.11"
             backend:
-              name: dask
-              title: Dask
+              name: impala
+              title: Impala
+              serial: true
               extras:
-                - dask
+                - --extra impala
+              services:
+                - impala
+                - kudu
+              sys-deps:
+                - cmake
+                - ninja-build
+          # pytorch wheel doesn't exist for windows + python 3.13, so test
+          # against 3.12 until that's shipped
+          - os: windows-latest
+            python-version: "3.12"
+            backend:
+              name: duckdb
+              title: DuckDB
+              serial: true
+              extras:
+                - --extra duckdb
+                - --extra deltalake
+                - --extra geospatial
+                - --extra examples
+                - --extra decompiler
+                - --extra polars
+            additional_deps:
+              - torch
+          # also test duckdb with python 3.13 on windows, *without* pytorch
+          - os: windows-latest
+            python-version: "3.13"
+            backend:
+              name: duckdb
+              title: DuckDB
+              serial: true
+              extras:
+                - --extra duckdb
+                - --extra deltalake
+                - --extra geospatial
+                - --extra examples
+                - --extra decompiler
+                - --extra polars
         exclude:
+          - os: windows-latest
+            python-version: "3.13"
+            backend:
+              name: duckdb
           - os: windows-latest
             backend:
               name: mysql
               title: MySQL
+              serial: true
               extras:
-                - mysql
-                - geospatial
+                - --extra mysql
+                - --extra geospatial
+                - --extra polars
               services:
                 - mysql
               sys-deps:
                 - libgeos-dev
+                - default-libmysqlclient-dev
           - os: windows-latest
             backend:
               name: clickhouse
               title: ClickHouse
               extras:
-                - clickhouse
-                - examples
+                - --extra clickhouse
+                - --extra examples
               services:
                 - clickhouse
           - os: windows-latest
             backend:
               name: postgres
               title: PostgreSQL
+              serial: true
               extras:
-                - postgres
-                - geospatial
+                - --extra postgres
+                - --extra geospatial
               services:
                 - postgres
               sys-deps:
                 - libgeos-dev
+                - libpq5
           - os: windows-latest
             backend:
               name: risingwave
-              title: Risingwave
+              title: RisingWave
               serial: true
               services:
                 - risingwave
               extras:
-                - risingwave
+                - --extra risingwave
           - os: windows-latest
             backend:
               name: postgres
               title: PostgreSQL + Torch
+              serial: true
               extras:
-                - postgres
-                - geospatial
-                - polars
+                - --extra postgres
+                - --extra geospatial
+                - --extra polars
               additional_deps:
                 - torch
               services:
                 - postgres
               sys-deps:
                 - libgeos-dev
+                - libpq5
+          # TODO(deepyaman): Test whether this works upon releasing https://github.com/cloudera/impyla/commit/bf1f94c3c4106ded6267d2485c1e939775a6a87f
+          - os: ubuntu-latest
+            python-version: "3.13"
+            backend:
+              name: impala
+              title: Impala
+              serial: true
+              extras:
+                - --extra impala
+              services:
+                - impala
+                - kudu
+              sys-deps:
+                - cmake
+                - ninja-build
           - os: windows-latest
             backend:
               name: impala
               title: Impala
               serial: true
               extras:
-                - impala
+                - --extra impala
               services:
                 - impala
                 - kudu
@@ -321,8 +392,10 @@ jobs:
             backend:
               name: mssql
               title: MS SQL Server
+              serial: true
               extras:
-                - mssql
+                - --extra mssql
+                - --extra polars
               services:
                 - mssql
               sys-deps:
@@ -336,13 +409,13 @@ jobs:
               services:
                 - trino
               extras:
-                - trino
+                - --extra trino
           - os: windows-latest
             backend:
               name: druid
               title: Druid
               extras:
-                - druid
+                - --extra druid
               services:
                 - druid
           - os: windows-latest
@@ -351,19 +424,35 @@ jobs:
               title: Oracle
               serial: true
               extras:
-                - oracle
+                - --extra oracle
+                - --extra polars
               services:
                 - oracle
+          - os: ubuntu-latest
+            python-version: "3.13"
+            backend:
+              name: flink
+              title: Flink
+              serial: true
+              extras:
+                - --extra flink
+              additional_deps:
+                - "'apache-flink==1.20.2'"
+                - "'pandas<2.2'"
+                - setuptools
+              services:
+                - flink
           - os: windows-latest
             backend:
               name: flink
               title: Flink
               serial: true
               extras:
-                - flink
+                - --extra flink
               additional_deps:
-                - "'apache-flink < 1.20.0'"
-                - "'pandas < 2.2'"
+                - "'apache-flink==1.20.2'"
+                - "'pandas<2.2'"
+                - setuptools
               services:
                 - flink
           - os: windows-latest
@@ -372,7 +461,7 @@ jobs:
               title: Exasol
               serial: true
               extras:
-                - exasol
+                - --extra exasol
               services:
                 - exasol
     steps:
@@ -389,9 +478,9 @@ jobs:
         run: choco install sqlite
 
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -400,34 +489,25 @@ jobs:
 
       - name: start services
         if: matrix.backend.services != null
-        run: docker compose up --wait ${{ join(matrix.backend.services, ' ') }}
+        run: just up ${{ join(matrix.backend.services, ' ') }}
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
-
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras "${{ join(matrix.backend.extras, ' ') }}"
-
-      - name: install deps for broken avro-python setup
-        if: matrix.backend.name == 'flink'
-        run: poetry run pip install wheel
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
       - name: install other deps
         if: matrix.backend.additional_deps != null
-        run: poetry run pip install ${{ join(matrix.backend.additional_deps, ' ') }}
-
-      - name: show installed deps
-        run: poetry run pip list
+        run: uv add --no-sync --optional ${{ matrix.backend.name }} ${{ join(matrix.backend.additional_deps, ' ') }}
 
       - name: "run parallel tests: ${{ matrix.backend.name }}"
         if: ${{ !matrix.backend.serial }}
-        run: just ci-check -m ${{ matrix.backend.name }} --numprocesses auto --dist=loadgroup
+        timeout-minutes: 60
+        run: just ci-check "${{ join(matrix.backend.extras, ' ') }} --extra examples" -m ${{ matrix.backend.name }} --numprocesses auto --dist=loadgroup
         env:
           IBIS_TEST_IMPALA_HOST: localhost
           IBIS_TEST_IMPALA_PORT: 21050
@@ -435,179 +515,33 @@ jobs:
 
       - name: "run serial tests: ${{ matrix.backend.name }}"
         if: matrix.backend.serial
-        run: just ci-check -m ${{ matrix.backend.name }}
+        timeout-minutes: 60
+        run: just ci-check "${{ join(matrix.backend.extras, ' ') }} --extra examples" -m ${{ matrix.backend.name }}
         env:
           FLINK_REMOTE_CLUSTER_ADDR: localhost
           FLINK_REMOTE_CLUSTER_PORT: "8081"
           IBIS_EXAMPLES_DATA: ${{ runner.temp }}/examples-${{ matrix.backend.name }}-${{ matrix.os }}-${{ steps.install_python.outputs.python-version }}
 
-      - name: check that no untracked files were produced
-        shell: bash
-        run: |
-          ! git status --porcelain | tee /dev/stderr | grep .
-
-      - name: upload code coverage
-        if: success()
-        continue-on-error: true
-        uses: codecov/codecov-action@v4
-        with:
-          flags: backend,${{ matrix.backend.name }},${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Show docker compose logs on fail
-        if: matrix.backend.services != null && failure()
-        run: docker compose logs
-
-  test_backends_min_version:
-    name: ${{ matrix.backend.title }} Min Version ${{ matrix.os }} python-${{ matrix.python-version }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-        python-version:
-          - "3.9"
-          - "3.11"
-        backend:
-          - name: dask
-            title: Dask
-            deps:
-              required:
-                - "numpy@1.23.2"
-                - "pyarrow@10.0.1"
-              optional:
-                - "dask[array,dataframe]@2022.9.1"
-                - "pandas@1.5.3"
-            extras:
-              - dask
-          - name: postgres
-            title: PostgreSQL
-            deps:
-              required:
-                - "numpy@1.23.2"
-                - "pyarrow@10.0.1"
-              optional:
-                - "psycopg2@2.8.4"
-                - "geopandas@0.6"
-                - "Shapely@2"
-            services:
-              - postgres
-            extras:
-              - postgres
-              - geospatial
-        exclude:
-          - os: windows-latest
-            backend:
-              name: postgres
-              title: PostgreSQL
-              deps:
-                required:
-                  - "numpy@1.23.2"
-                  - "pyarrow@10.0.1"
-                optional:
-                  - "psycopg2@2.8.4"
-                  - "geopandas@0.6"
-                  - "Shapely@2"
-              services:
-                - postgres
-              extras:
-                - postgres
-                - geospatial
-          - python-version: "3.11"
-            backend:
-              name: postgres
-              title: PostgreSQL
-              deps:
-                required:
-                  - "numpy@1.23.2"
-                  - "pyarrow@10.0.1"
-                optional:
-                  - "psycopg2@2.8.4"
-                  - "geopandas@0.6"
-                  - "Shapely@2"
-              services:
-                - postgres
-              extras:
-                - postgres
-                - geospatial
-          - python-version: "3.11"
-            backend:
-              name: dask
-              title: Dask
-              deps:
-                required:
-                  - "numpy@1.23.2"
-                  - "pyarrow@10.0.1"
-                optional:
-                  - "dask[array,dataframe]@2022.9.1"
-                  - "pandas@1.5.3"
-              extras:
-                - dask
-    steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: install libgeos for shapely
-        if: matrix.backend.name == 'postgres'
-        run: |
-          sudo apt-get update -y -qq
-          sudo apt-get install -qq -y build-essential libgeos-dev
-
-      - uses: extractions/setup-just@v2
+      - name: "run backend doctests: ${{ matrix.backend.name }}"
+        if: matrix.os == 'ubuntu-latest'
+        run: just backend-doctests ${{ matrix.backend.name }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FLINK_REMOTE_CLUSTER_ADDR: localhost
+          FLINK_REMOTE_CLUSTER_PORT: "8081"
+          IBIS_EXAMPLES_DATA: ${{ runner.temp }}/examples-${{ matrix.backend.name }}-${{ matrix.os }}-${{ steps.install_python.outputs.python-version }}
 
-      - name: download backend data
-        run: just download-data
-
-      - name: start services
-        if: matrix.backend.services != null
-        run: docker compose up --wait ${{ join(matrix.backend.services, ' ') }}
-
-      - name: install python
-        uses: actions/setup-python@v5
-        id: install_python
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: install poetry
-        run: python -m pip install --upgrade pip 'poetry==1.8.2'
-
-      - name: remove incompatible deps
-        # it requires a version of pandas that min versions are not compatible with
-        run: poetry remove lonboard deltalake
-
-      - name: install minimum versions of required deps
-        run: poetry add --lock ${{ join(matrix.backend.deps.required, ' ') }} --python="==${{ steps.install_python.outputs.python-version }}"
-
-      - name: install minimum versions of optional deps
-        run: poetry add --lock --optional ${{ join(matrix.backend.deps.optional, ' ') }} --python="==${{ steps.install_python.outputs.python-version }}"
-
-      - name: checkout the lock file
-        run: git checkout poetry.lock
-
-      - name: lock with no updates
-        # poetry add is aggressive and will update other dependencies like
-        # numpy and pandas so we keep the pyproject.toml edits and then relock
-        # without updating anything except the requested versions
-        run: poetry lock --no-update
-
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras "${{ join(matrix.backend.extras, ' ') }}"
-
-      - name: run tests
-        run: just ci-check -m ${{ matrix.backend.name }} --numprocesses auto --dist=loadgroup
+      - name: checkout uv.lock and pyproject.toml
+        run: git checkout uv.lock pyproject.toml
 
       - name: check that no untracked files were produced
         shell: bash
-        run: git checkout poetry.lock pyproject.toml && ! git status --porcelain | tee /dev/stderr | grep .
+        run: |
+          ! git status --porcelain | grep -F .
 
       - name: upload code coverage
         if: success()
         continue-on-error: true
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           flags: backend,${{ matrix.backend.name }},${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -617,87 +551,102 @@ jobs:
         run: docker compose logs
 
   test_pyspark:
-    name: PySpark ${{ matrix.pyspark-version }} ubuntu-latest python-${{ matrix.python-version }}
+    name: PySpark ${{ matrix.tag }} ${{ matrix.pyspark-minor-version }} ubuntu-latest python-${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - python-version: "3.9"
-            pyspark-version: "3.3"
+            pyspark-minor-version: "3.3"
+            tag: local
             deps:
-              - "'pandas@<2'"
-              - "'numpy@<1.24'"
+              - pyspark==3.3.4
+              - pandas==1.5.3
+              - numpy==1.23.5
           - python-version: "3.11"
-            pyspark-version: "3.5"
+            pyspark-minor-version: "3.5"
+            tag: local
             deps:
-              - "'pandas@>2'"
-              - "'numpy@>1.24'"
+              - delta-spark==3.3.0
+          - python-version: "3.13"
+            pyspark-minor-version: "3.5"
+            tag: local
+            deps:
+              - setuptools==75.1.0
+              - delta-spark==3.3.0
           - python-version: "3.12"
-            pyspark-version: "3.5"
+            pyspark-minor-version: "3.5"
+            SPARK_REMOTE: "sc://localhost:15002"
+            tag: remote
             deps:
-              - "'pandas@>2'"
-              - "'numpy@>1.24'"
+              - setuptools==75.1.0
+              - delta-spark==3.3.0
+              - googleapis-common-protos
+              - grpcio
+              - grpcio-status
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: microsoft
           java-version: 17
 
-      - uses: extractions/setup-just@v2
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: start services
+        if: matrix.tag == 'remote'
+        run: just up spark-connect
 
       - name: download backend data
         run: just download-data
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: install poetry
-        run: python -m pip install --upgrade pip 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
 
-      - name: remove lonboard
         # it requires a version of pandas that pyspark is not compatible with
-        run: poetry remove lonboard
+      - name: remove lonboard
+        if: matrix.pyspark-minor-version == '3.3'
+        run: uv remove --group docs --no-sync lonboard
 
-      - name: install exact versions of pyspark, pandas and numpy
-        run: poetry add --lock 'pyspark@${{ matrix.pyspark-version }}' ${{ join(matrix.deps, ' ') }}
+      - name: install pyspark-specific dependencies
+        run: uv add --no-sync ${{ join(matrix.deps, ' ') }}
 
-      - name: checkout the lock file
-        run: git checkout poetry.lock
+      - name: install iceberg
+        shell: bash
+        run: just download-iceberg-jar ${{ matrix.pyspark-minor-version }}
 
-      - name: lock with no updates
-        # poetry add is aggressive and will update other dependencies like
-        # numpy and pandas so we keep the pyproject.toml edits and then relock
-        # without updating anything except the requested versions
-        run: poetry lock --no-update
+      - name: run spark connect tests
+        if: matrix.tag == 'remote'
+        timeout-minutes: 60
+        run: just ci-check "--extra pyspark --extra examples" -m pyspark
+        env:
+          SPARK_REMOTE: ${{ matrix.SPARK_REMOTE }}
 
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras pyspark
-
-      - name: install delta-spark
-        if: matrix.pyspark-version == '3.5'
-        run: poetry run pip install delta-spark
-
-      - name: run tests
-        run: just ci-check -m pyspark
+      - name: run spark tests
+        if: matrix.tag == 'local'
+        timeout-minutes: 60
+        run: just ci-check "--extra pyspark --extra examples" -m pyspark
 
       - name: check that no untracked files were produced
         shell: bash
-        run: git checkout poetry.lock pyproject.toml && ! git status --porcelain | tee /dev/stderr | grep .
+        run: git checkout uv.lock pyproject.toml && ! git status --porcelain | grep -F .
 
       - name: upload code coverage
         # only upload coverage for jobs that aren't mostly xfails
         if: success()
         continue-on-error: true
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           flags: backend,pyspark,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -706,7 +655,7 @@ jobs:
     # this job exists so that we can use a single job from this workflow to gate merging
     runs-on: ubuntu-latest
     needs:
-      - test_backends_min_version
+      - test_bigquery_lite
       - test_backends
       - test_pyspark
     steps:

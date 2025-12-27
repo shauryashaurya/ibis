@@ -32,7 +32,7 @@ class TestConf(BackendTest):
 
     @property
     def test_files(self) -> Iterable[Path]:
-        return [self.data_dir.joinpath("impala")]
+        return [self.data_dir.joinpath("directory")]
 
     def preload(self):
         env = IbisTestEnv()
@@ -79,7 +79,7 @@ class TestConf(BackendTest):
         (parquet,) = self.test_files
 
         # container path to data
-        prefix = "/user/hive/warehouse/impala/parquet"
+        prefix = "/user/hive/warehouse/directory/parquet"
         for dir in parquet.joinpath("parquet").glob("*"):
             con.drop_table(dir.name, database=database, force=True)
 
@@ -124,7 +124,7 @@ class TestConf(BackendTest):
         self.connection = self.connect(database=env.test_data_db, **kw)
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw):
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
         env = IbisTestEnv()
         return ibis.impala.connect(host=env.impala_host, port=env.impala_port, **kw)
 
@@ -191,7 +191,8 @@ def test_data_dir(env):
 
 @pytest.fixture(scope="session")
 def backend(tmp_path_factory, data_dir, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id)
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be
 
 
 @pytest.fixture(scope="module")

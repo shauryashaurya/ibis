@@ -76,7 +76,7 @@ def copy_into(con, data_dir: Path, table: str) -> None:
         f"$1:{name}{'::VARCHAR' * typ.is_timestamp()}::{SnowflakeType.to_string(typ)}"
         for name, typ in schema.items()
     )
-    con.execute(f"PUT {file.as_uri()} @{stage}/{file.name}")
+    con.execute(f"PUT 'file://{file.as_posix()}' @{stage}/{file.name}")
     con.execute(
         f"""
         COPY INTO "{table}"
@@ -90,28 +90,47 @@ class TestConf(BackendTest):
     supports_map = True
     deps = ("snowflake.connector",)
     supports_tpch = True
+    supports_tpcds = True
 
-    def load_tpch(self) -> None:
-        """No-op, snowflake already defines these in `SNOWFLAKE_SAMPLE_DATA`."""
+    def _load_tpc(self, *, suite, scale_factor) -> None:
+        """Create views of data in the TPC-H catalog that ships with Trino.
 
-    def _tpch_table(self, name: str):
-        name = name.upper()
-        t = self.connection.table(name, database="SNOWFLAKE_SAMPLE_DATA.TPCH_SF1")
-        return t.rename("snake_case")
+        This method create relations that have column names prefixed with the
+        first one (or two in the case of partsupp -> ps) character table name
+        to match the DuckDB TPC-H query conventions.
+        """
+        con = self.connection
+        schema = f"tpc{suite}"
 
-    def _transform_tpch_sql(self, parsed):
-        def add_catalog_and_schema(node):
-            if isinstance(node, sg.exp.Table):
-                return node.__class__(
-                    db="TPCH_SF1",
-                    catalog="SNOWFLAKE_SAMPLE_DATA",
-                    **{
-                        k: v for k, v in node.args.items() if k not in ("db", "catalog")
-                    },
+        con.create_database(schema, force=True)
+
+        parquet_dir = self.data_dir.joinpath(schema, f"sf={scale_factor}", "parquet")
+        assert parquet_dir.exists(), parquet_dir
+
+        tables = frozenset(con.list_tables(database=("IBIS_TESTING", schema)))
+        for path in parquet_dir.glob("*.parquet"):
+            table_name = path.with_suffix("").name
+            if table_name not in tables:
+                con.create_table(
+                    table_name,
+                    con.read_parquet(path),
+                    database=f'IBIS_TESTING."{schema}"',
                 )
+
+    def _transform_tpc_sql(self, parsed, *, suite, leaves):
+        def quote(node):
+            if isinstance(node, sg.exp.Identifier):
+                return sg.to_identifier(node.name, quoted=True)
+            return node
+
+        def add_catalog_and_schema(node):
+            if isinstance(node, sg.exp.Table) and node.name in leaves:
+                node.args["db"] = sg.to_identifier(f"tpc{suite}")
+                node.args["catalog"] = sg.to_identifier("IBIS_TESTING")
             return node
 
         result = parsed.transform(add_catalog_and_schema)
+        result = result.transform(quote)
         return result
 
     def _load_data(self, **_: Any) -> None:
@@ -146,6 +165,7 @@ class TestConf(BackendTest):
                 CREATE SCHEMA IF NOT EXISTS {dbschema};
                 USE {dbschema};
                 CREATE TEMP STAGE {db};
+                CREATE STAGE IF NOT EXISTS ibis_testing;
                 CREATE STAGE IF NOT EXISTS models;
                 {self.script_dir.joinpath("snowflake.sql").read_text()}
                 """
@@ -160,7 +180,7 @@ class TestConf(BackendTest):
                 assert os.path.exists(path)
                 assert os.path.getsize(path)
 
-                c.execute(f"PUT {Path(path).as_uri()} @MODELS")
+                c.execute(f"PUT 'file://{Path(path).absolute().as_posix()}' @MODELS")
 
             # not much we can do to make this faster, but running these in
             # multiple threads seems to save about 2x
@@ -172,7 +192,7 @@ class TestConf(BackendTest):
                     future.result()
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw) -> BaseBackend:
+    def connect(*, tmpdir, worker_id, **kw) -> BaseBackend:  # noqa: ARG004
         if os.environ.get("SNOWFLAKE_SNOWPARK"):
             import snowflake.snowpark as sp
 
@@ -189,11 +209,16 @@ class TestConf(BackendTest):
                         "schema": os.environ["SNOWFLAKE_SCHEMA"],
                     }
                 )
-            return ibis.backends.snowflake.Backend.from_snowpark(builder.create())
+            return ibis.backends.snowflake.Backend.from_connection(builder.create())
         else:
             return ibis.connect(_get_url(), **kw)
 
+    @property
+    def struct(self):
+        return super().struct.cast({"abc": "struct<a: float64, b: string, c: int64>"})
+
 
 @pytest.fixture(scope="session")
-def con(data_dir, tmp_path_factory, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+def con(tmp_path_factory, data_dir, worker_id):
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection

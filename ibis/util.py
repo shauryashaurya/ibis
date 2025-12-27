@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import collections
 import collections.abc
+import contextlib
 import functools
 import importlib.metadata
 import itertools
 import operator
 import os
+import re
 import sys
+import tempfile
 import textwrap
 import types
 import uuid
@@ -24,22 +27,20 @@ import toolz
 from ibis.common.typing import Coercible
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
-    from numbers import Real
+    from collections.abc import Iterable, Iterator, Sequence
     from pathlib import Path
 
     import ibis.expr.types as ir
 
 T = TypeVar("T", covariant=True)
+S = TypeVar("S", bound=T, covariant=True)
 U = TypeVar("U", covariant=True)
 K = TypeVar("K")
 V = TypeVar("V")
 
 
-# https://www.compart.com/en/unicode/U+22EE
-VERTICAL_ELLIPSIS = "\u22ee"
-# https://www.compart.com/en/unicode/U+2026
-HORIZONTAL_ELLIPSIS = "\u2026"
+VERTICAL_ELLIPSIS = "⋮"
+HORIZONTAL_ELLIPSIS = "…"
 
 
 def guid() -> str:
@@ -89,7 +90,7 @@ any_of = toolz.compose(any, is_one_of)
 all_of = toolz.compose(all, is_one_of)
 
 
-def promote_list(val: V | Sequence[V]) -> list[V]:
+def promote_list(val: V | Iterable[V]) -> list[V]:
     """Ensure that the value is a list.
 
     Parameters
@@ -114,7 +115,7 @@ def promote_list(val: V | Sequence[V]) -> list[V]:
         return [val]
 
 
-def promote_tuple(val: V | Sequence[V]) -> tuple[V]:
+def promote_tuple(val: V | Iterable[V]) -> tuple[V]:
     """Ensure that the value is a tuple.
 
     Parameters
@@ -150,53 +151,11 @@ def is_function(v: Any) -> bool:
 
 
 def log(msg: str) -> None:
-    """Log `msg` using ``options.verbose_log`` if set, otherwise ``print``."""
+    """Log `msg` using `options.verbose_log` if set, otherwise `print`."""
     from ibis.config import options
 
     if options.verbose:
         (options.verbose_log or print)(msg)
-
-
-def approx_equal(a: Real, b: Real, eps: Real):
-    """Return whether the difference between `a` and `b` is less than `eps`.
-
-    Raises
-    ------
-    AssertionError
-
-    """
-    assert abs(a - b) < eps
-
-
-def safe_index(elements: Sequence[int], value: int) -> int:
-    """Find the location of `value` in `elements`.
-
-    Return -1 if `value` is not found instead of raising ``ValueError``.
-
-    Parameters
-    ----------
-    elements
-        Elements to index into
-    value : int
-        Index of the given sequence/elements
-
-    Returns
-    -------
-    int
-
-    Examples
-    --------
-    >>> sequence = [1, 2, 3]
-    >>> safe_index(sequence, 2)
-    1
-    >>> safe_index(sequence, 4)
-    -1
-
-    """
-    try:
-        return elements.index(value)
-    except ValueError:
-        return -1
 
 
 def is_iterable(o: Any) -> bool:
@@ -443,6 +402,7 @@ def experimental(func):
     return func
 
 
+@functools.cache
 def backend_entry_points() -> list[importlib.metadata.EntryPoint]:
     """Get the list of installed `ibis.backend` entrypoints."""
 
@@ -502,14 +462,19 @@ def normalize_filename(source: str | Path) -> str:
         source = source.removeprefix(f"{prefix}://")
 
     def _absolufy_paths(name):
-        if not name.startswith(
-            ("http", "s3", "az", "abfs", "abfss", "adl", "gs", "gcs", "azure")
-        ):
+        if re.search(r"^(?:.+)://", name) is None:
             return os.path.abspath(name)
         return name
 
     source = _absolufy_paths(source)
     return source
+
+
+def normalize_filenames(source_list):
+    # Promote to list
+    source_list = promote_list(source_list)
+
+    return list(map(normalize_filename, source_list))
 
 
 def gen_name(namespace: str) -> str:
@@ -636,7 +601,7 @@ class Namespace:
 class PseudoHashable(Coercible, Generic[V]):
     """A wrapper that provides a best effort precomputed hash."""
 
-    __slots__ = ("obj", "hash")
+    __slots__ = ("hash", "obj")
     obj: V
 
     def __init__(self, obj: V):
@@ -674,3 +639,95 @@ class PseudoHashable(Coercible, Generic[V]):
             return self.obj != other.obj
         else:
             return NotImplemented
+
+
+def chunks(n: int, *, chunk_size: int) -> Iterator[tuple[int, int]]:
+    """Return an iterator of chunk start and end indices.
+
+    Parameters
+    ----------
+    n
+        The total number of elements.
+    chunk_size
+        The size of each chunk.
+
+    Returns
+    -------
+    int
+        THE start and end indices of each chunk.
+
+    Examples
+    --------
+    >>> list(chunks(10, chunk_size=3))
+    [(0, 3), (3, 6), (6, 9), (9, 10)]
+    >>> list(chunks(10, chunk_size=4))
+    [(0, 4), (4, 8), (8, 10)]
+    """
+    return ((start, min(start + chunk_size, n)) for start in range(0, n, chunk_size))
+
+
+def get_subclasses(obj: type[T]) -> Iterator[type[S]]:
+    """Recursively compute all subclasses of `obj`.
+
+    ::: {.callout-note}
+    ## The resulting iterator does **not** include the input type object.
+    :::
+
+    Parameters
+    ----------
+    obj
+        Any type object
+
+    Examples
+    --------
+    >>> class Base: ...
+    >>> class Subclass1(Base): ...
+    >>> class Subclass2(Base): ...
+    >>> class TransitiveSubclass(Subclass2): ...
+
+    Everything inherits `Base` (directly or transitively)
+
+    >>> list(get_subclasses(Base))
+    [<class 'ibis.util.Subclass1'>, <class 'ibis.util.Subclass2'>, <class 'ibis.util.TransitiveSubclass'>]
+
+    Nothing inherits from `Subclass1`
+
+    >>> list(get_subclasses(Subclass1))
+    []
+
+    Only `TransitiveSubclass` inherits from `Subclass2`
+
+    >>> list(get_subclasses(Subclass2))
+    [<class 'ibis.util.TransitiveSubclass'>]
+
+    Nothing inherits from `TransitiveSubclass`
+
+    >>> list(get_subclasses(TransitiveSubclass))
+    []
+    """
+    for child_class in obj.__subclasses__():
+        yield child_class
+        yield from get_subclasses(child_class)
+
+
+if sys.version_info[:2] < (3, 10):
+
+    @contextlib.contextmanager
+    def mktempd():
+        tmpdir = tempfile.TemporaryDirectory()
+        try:
+            yield tmpdir.name
+        finally:
+            with contextlib.suppress(Exception):
+                tmpdir.cleanup()
+else:
+
+    def mktempd():
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def version(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None

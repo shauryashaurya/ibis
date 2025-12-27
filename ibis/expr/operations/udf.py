@@ -1,3 +1,5 @@
+"""User-defined functions (UDFs) implementation."""
+
 from __future__ import annotations
 
 import abc
@@ -49,7 +51,7 @@ class InputType(enum.Enum):
 
 
 @public
-class ScalarUDF(ops.Value):
+class ScalarUDF(ops.Impure):
     @attribute
     def shape(self):
         if not (args := getattr(self, "args")):  # noqa: B009
@@ -63,7 +65,7 @@ class ScalarUDF(ops.Value):
 
 
 @public
-class AggUDF(ops.Reduction):
+class AggUDF(ops.Reduction, ops.Impure):
     where: Optional[ops.Value[dt.Boolean]] = None
 
 
@@ -223,7 +225,7 @@ class scalar(_UDF):
             will be derived from the type annotations of the wrapped function.
 
             For **builtin** UDFs, only the **return type** annotation is required.
-            See [the user guide](../how-to/extending/builtin.qmd#input-types) for
+            See [the user guide](/how-to/extending/builtin.qmd#input-types) for
             more information.
         kwargs
             Additional backend-specific configuration arguments for the UDF.
@@ -238,7 +240,6 @@ class scalar(_UDF):
         >>> con = ibis.connect("duckdb://")
         >>> con.execute(expr)
         1
-
         """
         return _wrap(
             cls._make_wrapper,
@@ -288,9 +289,9 @@ class scalar(_UDF):
         Python function call per row
 
         This calling pattern tends to be **much** slower than
-        [`pandas`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
+        [`pandas`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
         or
-        [`pyarrow`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)-based
+        [`pyarrow`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)-based
         vectorized UDFs.
         :::
 
@@ -354,11 +355,50 @@ class scalar(_UDF):
         │                     4 │
         └───────────────────────┘
 
+        Define a UDF that adds one to an integer field that is part of a struct:
+
+        >>> import ibis.expr.datatypes as dt
+        >>> FieldType = dt.Struct({"a": "int"})
+        >>> @ibis.udf.scalar.python
+        ... def add_one_py_struct(x: FieldType) -> int:
+        ...     return x["a"] + 1
+        >>> t = ibis.memtable({"struct_col": [{"a": 1}, {"a": 2}, {"a": 3}]})
+        >>> add_one_py_struct(t.struct_col).name("added_one")
+        ┏━━━━━━━━━━━┓
+        ┃ added_one ┃
+        ┡━━━━━━━━━━━┩
+        │ int64     │
+        ├───────────┤
+        │         2 │
+        │         3 │
+        │         4 │
+        └───────────┘
+
+        Similarly, you can operate on maps as well:
+
+        >>> FieldType = dt.Map(dt.string, dt.int64)
+        >>> @ibis.udf.scalar.python
+        ... def add_one_py_map(x: FieldType) -> int:
+        ...     return x["a"] + 1
+        >>> t = ibis.memtable(
+        ...     {"map_col": [{"a": 1}, {"a": 2}, {"a": 3}]},
+        ...     schema={"map_col": "map<string, int>"},
+        ... )
+        >>> add_one_py_map(t.map_col).name("added_one")
+        ┏━━━━━━━━━━━┓
+        ┃ added_one ┃
+        ┡━━━━━━━━━━━┩
+        │ int64     │
+        ├───────────┤
+        │         2 │
+        │         3 │
+        │         4 │
+        └───────────┘
+
         See Also
         --------
-        - [`pandas`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
-        - [`pyarrow`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)
-
+        - [`pandas`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
+        - [`pyarrow`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)
         """
         return _wrap(
             cls._make_wrapper,
@@ -451,11 +491,43 @@ class scalar(_UDF):
         └───────────────────────┘
         ```
 
+        Define a UDF that adds one to an integer field that is part of a struct:
+
+        >>> import ibis.expr.datatypes as dt
+        >>> FieldType = dt.Struct({"a": "int"})
+        >>> @ibis.udf.scalar.pandas
+        ... def add_one_py_struct(x: FieldType) -> int:
+        ...     return x["a"] + 1
+        >>> t = ibis.memtable({"struct_col": [{"a": 1}, {"a": 2}, {"a": 3}]})
+        >>> con = ibis.pyspark.connect()
+        >>> expr = add_one_py_struct(t.struct_col).name("added_one")
+        >>> con.execute(expr)
+        0    2
+        1    3
+        2    4
+        Name: added_one, dtype: int64
+
+        Similarly, you can operate on maps as well:
+
+        >>> FieldType = dt.Map(dt.string, dt.int64)
+        >>> @ibis.udf.scalar.pandas
+        ... def add_one_py_map(x: FieldType) -> int:
+        ...     return x.map(lambda d: d["a"] + 1)
+        >>> t = ibis.memtable(
+        ...     {"map_col": [{"a": 1}, {"a": 2}, {"a": 3}]},
+        ...     schema={"map_col": "map<string, int>"},
+        ... )
+        >>> expr = add_one_py_map(t.map_col).name("added_one")
+        >>> con.execute(expr)
+        0    2
+        1    3
+        2    4
+        Name: added_one, dtype: int64
+
         See Also
         --------
-        - [`python`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.python)
-        - [`pyarrow`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)
-
+        - [`python`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.python)
+        - [`pyarrow`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pyarrow)
         """
         return _wrap(
             cls._make_wrapper,
@@ -537,11 +609,51 @@ class scalar(_UDF):
         │                                  52 │
         └─────────────────────────────────────┘
 
+        Define a UDF that adds one to an integer field that is part of a struct:
+
+        >>> import pyarrow.compute as pac
+        >>> import ibis.expr.datatypes as dt
+        >>> FieldType = dt.Struct({"a": "int"})
+        >>> @ibis.udf.scalar.pyarrow
+        ... def add_one_py_struct(x: FieldType) -> int:
+        ...     return pac.add(x.combine_chunks().field("a"), 1)
+        >>> t = ibis.memtable({"struct_col": [{"a": 1}, {"a": 2}, {"a": 3}]})
+        >>> add_one_py_struct(t.struct_col).name("added_one")
+        ┏━━━━━━━━━━━┓
+        ┃ added_one ┃
+        ┡━━━━━━━━━━━┩
+        │ int64     │
+        ├───────────┤
+        │         2 │
+        │         3 │
+        │         4 │
+        └───────────┘
+
+        Similarly, you can operate on maps as well:
+
+        >>> FieldType = dt.Map(dt.string, dt.int64)
+        >>> @ibis.udf.scalar.pyarrow
+        ... def add_one_py_map(x: FieldType) -> int:
+        ...     return pac.add(pac.map_lookup(x, "a", occurrence="first"), 1)
+        >>> t = ibis.memtable(
+        ...     {"map_col": [{"a": 1}, {"a": 2}, {"a": 3}]},
+        ...     schema={"map_col": "map<string, int>"},
+        ... )
+        >>> add_one_py_map(t.map_col).name("added_one")
+        ┏━━━━━━━━━━━┓
+        ┃ added_one ┃
+        ┡━━━━━━━━━━━┩
+        │ int64     │
+        ├───────────┤
+        │         2 │
+        │         3 │
+        │         4 │
+        └───────────┘
+
         See Also
         --------
-        - [`python`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.python)
-        - [`pandas`](./scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
-
+        - [`python`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.python)
+        - [`pandas`](/reference/scalar-udfs.qmd#ibis.expr.operations.udf.scalar.pandas)
         """
         return _wrap(
             cls._make_wrapper,
@@ -557,6 +669,13 @@ class scalar(_UDF):
 
 @public
 class agg(_UDF):
+    """Aggregate user-defined functions.
+
+    ::: {.callout-note}
+    ## The `agg` class itself is **not** a public API, its methods are.
+    :::
+    """
+
     __slots__ = ()
 
     _base = AggUDF
@@ -617,10 +736,10 @@ class agg(_UDF):
         ... def favg(a: float) -> float:
         ...     '''Compute the average of a column using Kahan summation.'''
         >>> t = ibis.examples.penguins.fetch()
-        >>> expr = favg(t.bill_length_mm)
-        >>> expr
-        43.9219298245614
-
+        >>> favg(t.bill_length_mm)
+        ┌──────────┐
+        │ 43.92193 │
+        └──────────┘
         """
         return _wrap(
             cls._make_wrapper,

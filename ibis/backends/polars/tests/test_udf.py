@@ -15,13 +15,13 @@ pc = pytest.importorskip("pyarrow.compute")
 with pytest.warns(FutureWarning, match="v9.0"):
 
     @elementwise(input_type=["string"], output_type="int64")
-    def my_string_length(arr, **kwargs):
+    def my_string_length(arr, **_):
         return pl.from_arrow(
             pc.cast(pc.multiply(pc.utf8_length(arr.to_arrow()), 2), target_type="int64")
         )
 
     @elementwise(input_type=[dt.int64, dt.int64], output_type=dt.int64)
-    def my_add(arr1, arr2, **kwargs):
+    def my_add(arr1, arr2, **_):
         return pl.from_arrow(pc.add(arr1.to_arrow(), arr2.to_arrow()))
 
     @reduction(input_type=[dt.float64], output_type=dt.float64)
@@ -41,13 +41,13 @@ def test_udf(alltypes):
 
 
 def test_multiple_argument_udf(alltypes):
-    expr = my_add(alltypes.smallint_col, alltypes.int_col).name("tmp")
+    expr = my_add(alltypes.smallint_col, alltypes.int_col.cast("int64"))
     result = expr.execute()
 
     df = alltypes[["smallint_col", "int_col"]].execute()
     expected = df.smallint_col + df.int_col
 
-    tm.assert_series_equal(result, expected.rename("tmp"))
+    tm.assert_series_equal(result, expected.astype("int64"), check_names=False)
 
 
 @pytest.mark.parametrize(

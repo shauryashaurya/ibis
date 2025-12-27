@@ -18,7 +18,7 @@ from ibis.backends.trino.tests.conftest import (
 
 @pytest.fixture
 def tmp_name(con):
-    name = ibis.util.gen_name("test_trino")
+    name = util.gen_name("test_trino")
     yield name
     con.drop_table(name, force=True)
 
@@ -74,7 +74,7 @@ def test_con_source(source, expected):
         user=TRINO_USER,
         host=TRINO_HOST,
         port=TRINO_PORT,
-        password=TRINO_PASS,
+        auth=TRINO_PASS,
         database="hive",
         schema="default",
         source=source,
@@ -152,14 +152,14 @@ def test_table_access_database_schema(con):
     t = con.table("region", database=("tpch", "sf1"))
     assert t.count().execute()
 
-    with pytest.raises(exc.IbisError, match='Table not found: tpch."tpch.sf1".region'):
+    with pytest.raises(exc.TableNotFound, match=r".*region"):
         con.table("region", database=("tpch", "tpch.sf1"))
 
     with pytest.raises(exc.IbisError, match="Overspecified table hierarchy provided"):
         con.table("region", database="system.tpch.sf1")
 
 
-def test_list_tables_schema_warning_refactor(con):
+def test_list_tables(con):
     tpch_tables = [
         "customer",
         "lineitem",
@@ -173,13 +173,53 @@ def test_list_tables_schema_warning_refactor(con):
 
     assert con.list_tables()
 
-    # Error if user mixes tuple inputs and string inputs for database and schema
-    with pytest.raises(FutureWarning):
-        with pytest.raises(exc.IbisInputError):
-            con.list_tables(database=("tuple", "ohstuff"), schema="str")
-
-    with pytest.warns(FutureWarning):
-        assert con.list_tables(database="tpch", schema="sf1") == tpch_tables
-
     assert con.list_tables(database="tpch.sf1") == tpch_tables
     assert con.list_tables(database=("tpch", "sf1")) == tpch_tables
+
+
+def test_connect_uri():
+    con = ibis.connect(
+        f"trino://{TRINO_USER}:{TRINO_PASS}@{TRINO_HOST}:{TRINO_PORT}/memory/default"
+    )
+
+    result = con.sql("SELECT 1 AS a, 'b' AS b").to_pandas()
+
+    assert result.iat[0, 0] == 1
+    assert result.iat[0, 1] == "b"
+
+
+def test_nested_madness(con, tmp_name):
+    result = (
+        con.create_table(tmp_name, ibis.literal("A-1_B-2").name("c").as_table())
+        .select(
+            cc=lambda t: t.c.split("_").map(
+                lambda c: ibis.struct(
+                    {
+                        "As": ibis.array(
+                            [
+                                ibis.struct(
+                                    {
+                                        "X": c.split("-")[0],
+                                        "Y": c.split("-")[1].cast("int"),
+                                        "Zs": ibis.literal(
+                                            None, type="array<struct<z: string>>"
+                                        ),
+                                    }
+                                )
+                            ]
+                        ),
+                        "Bs": ibis.literal(None, type="array<struct<w: string>>"),
+                    }
+                )
+            )
+        )
+        .execute()
+    )
+
+    assert len(result) == 1
+
+    elements = result.iat[0, 0]
+
+    assert len(elements) == 2
+    assert all(element.keys() == {"As", "Bs"} for element in elements)
+    assert all(element["Bs"] is None for element in elements)

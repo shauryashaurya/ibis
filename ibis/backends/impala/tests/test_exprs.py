@@ -17,7 +17,7 @@ from ibis.expr import api
 def test_embedded_identifier_quoting(alltypes):
     t = alltypes
 
-    expr = t[[(t.double_col * 2).name("double(fun)")]]["double(fun)"].sum()
+    expr = t.select((t.double_col * 2).name("double(fun)"))["double(fun)"].sum()
     expr.execute()
 
 
@@ -52,20 +52,20 @@ def test_builtins(con, alltypes):
         i4 % 10,
         20 % i1,
         d % 5,
-        i1.fillna(0),
-        i4.fillna(0),
-        i8.fillna(0),
-        i4.to_timestamp("s"),
-        i4.to_timestamp("ms"),
-        i4.to_timestamp("us"),
-        i8.to_timestamp(),
+        i1.fill_null(0),
+        i4.fill_null(0),
+        i8.fill_null(0),
+        i4.as_timestamp("s"),
+        i4.as_timestamp("ms"),
+        i4.as_timestamp("us"),
+        i8.as_timestamp("s"),
         d.abs(),
         d.cast("decimal(12, 2)"),
         d.cast("int32"),
         d.ceil(),
         d.exp(),
         d.isnull(),
-        d.fillna(0),
+        d.fill_null(0),
         d.floor(),
         d.log(),
         d.ln(),
@@ -96,8 +96,8 @@ def test_builtins(con, alltypes):
         d.bucket([0, 10, 25, 50], include_over=True),
         d.bucket([0, 10, 25, 50], include_over=True, close_extreme=False),
         d.bucket([10, 25, 50, 100], include_under=True),
-        d.histogram(10),
-        d.histogram(5, base=10),
+        d.histogram(nbins=10),
+        d.histogram(nbins=5, base=10),
         d.histogram(base=10, binwidth=5),
         # coalesce-like cases
         api.coalesce(
@@ -132,9 +132,9 @@ def test_builtins(con, alltypes):
         s.repeat(i1),
     ]
 
-    proj_exprs = [expr.name("e%d" % i) for i, expr in enumerate(exprs)]
+    proj_exprs = [expr.name(f"e{i:d}") for i, expr in enumerate(exprs)]
 
-    projection = table[proj_exprs]
+    projection = table.select(proj_exprs)
     projection.limit(10).execute()
 
     _check_impala_output_types_match(con, projection)
@@ -148,9 +148,9 @@ def _check_impala_output_types_match(con, table):
     for n, left_ty, right_ty in zip(
         left_schema.names, left_schema.types, right_schema.types
     ):
-        assert (
-            left_ty == right_ty
-        ), f"Value for {n} had left type {left_ty} and right type {right_ty}\nquery:\n{query}"
+        assert left_ty == right_ty, (
+            f"Value for {n} had left type {left_ty} and right type {right_ty}\nquery:\n{query}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -164,7 +164,7 @@ def _check_impala_output_types_match(con, table):
         (5 / L(50).nullif(0), 0.1),
         (5 / L(50).nullif(L(50000)), 0.1),
         (5 / L(50000).nullif(0), 0.0001),
-        (L(50000).fillna(0), 50000),
+        (L(50000).fill_null(0), 50000),
     ],
 )
 def test_int_builtins(con, expr, expected):
@@ -191,9 +191,9 @@ def test_column_types(alltypes_df, col, expected):
 @pytest.mark.parametrize(
     ("expr", "expected"),
     [
-        (L(50000).to_timestamp("s"), pd.to_datetime(50000, unit="s")),
-        (L(50000).to_timestamp("ms"), pd.to_datetime(50000, unit="ms")),
-        (L(5 * 10**8).to_timestamp(), pd.to_datetime(5 * 10**8, unit="s")),
+        (L(50000).as_timestamp("s"), pd.to_datetime(50000, unit="s")),
+        (L(50000).as_timestamp("ms"), pd.to_datetime(50000, unit="ms")),
+        (L(5 * 10**8).as_timestamp("s"), pd.to_datetime(5 * 10**8, unit="s")),
         (
             ibis.timestamp("2009-05-17 12:34:56").truncate("y"),
             pd.Timestamp("2009-01-01"),
@@ -257,13 +257,13 @@ def approx_equal(a, b, eps):
     [
         pytest.param(lambda dc: dc, "5.245", id="id"),
         pytest.param(lambda dc: dc % 5, "0.245", id="mod"),
-        pytest.param(lambda dc: dc.fillna(0), "5.245", id="fillna"),
+        pytest.param(lambda dc: dc.fill_null(0), "5.245", id="fill_null"),
         pytest.param(lambda dc: dc.exp(), "189.6158", id="exp"),
         pytest.param(lambda dc: dc.log(), "1.65728", id="log"),
         pytest.param(lambda dc: dc.log2(), "2.39094", id="log2"),
         pytest.param(lambda dc: dc.log10(), "0.71975", id="log10"),
         pytest.param(lambda dc: dc.sqrt(), "2.29019", id="sqrt"),
-        pytest.param(lambda dc: dc.fillna(0), "5.245", id="zero_ifnull"),
+        pytest.param(lambda dc: dc.fill_null(0), "5.245", id="zero_ifnull"),
         pytest.param(lambda dc: -dc, "-5.245", id="neg"),
     ],
 )
@@ -295,9 +295,9 @@ def test_decimal_builtins_2(con, func, expected):
         (L("0123").translate("012", "abc"), "abc3"),
         (L("abcd").find("a"), 0),
         (L("baaaab").find("b", 2), 5),
-        (L("abcd").lpad(1, "-"), "a"),
+        (L("abcd").lpad(1, "-"), "abcd"),
         (L("abcd").lpad(5), " abcd"),
-        (L("abcd").rpad(1, "-"), "a"),
+        (L("abcd").rpad(1, "-"), "abcd"),
         (L("abcd").rpad(5), "abcd "),
         (L("abcd").find_in_set(["a", "b", "abcd"]), 2),
         (L(", ").join(["a", "b"]), "a, b"),
@@ -352,14 +352,14 @@ def test_filter_predicates(con):
 
     expr = t
     for pred in predicates:
-        expr = expr[pred(expr)].select(expr)
+        expr = expr.filter(pred(expr)).select(expr)
 
     expr.execute()
 
 
 def test_histogram_value_counts(alltypes):
     t = alltypes
-    expr = t.double_col.histogram(10).value_counts()
+    expr = t.double_col.histogram(nbins=10).value_counts()
     expr.execute()
 
 
@@ -384,8 +384,8 @@ def test_decimal_timestamp_builtins(con):
         dc * 2,
         dc**2,
         dc.cast("double"),
-        api.ifelse(table.l_discount > 0, dc * table.l_discount, api.NA),
-        dc.fillna(0),
+        api.ifelse(table.l_discount > 0, dc * table.l_discount, api.null()),
+        dc.fill_null(0),
         ts < (ibis.now() + ibis.interval(months=3)),
         ts < (ibis.timestamp("2005-01-01") + ibis.interval(months=3)),
         # hashing
@@ -411,16 +411,16 @@ def test_decimal_timestamp_builtins(con):
         "weeks",
     ]
     for field in timestamp_fields:
-        if hasattr(ts, field):
-            exprs.append(getattr(ts, field)())
+        if (attr := getattr(ts, field, None)) is not None:
+            exprs.append(attr())
 
         offset = ibis.interval(**{field: 2})
         exprs.append(ts + offset)
         exprs.append(ts - offset)
 
-    proj_exprs = [expr.name("e%d" % i) for i, expr in enumerate(exprs)]
+    proj_exprs = [expr.name(f"e{i:d}") for i, expr in enumerate(exprs)]
 
-    projection = table[proj_exprs].limit(10)
+    projection = table.select(proj_exprs).limit(10)
     projection.execute()
 
 
@@ -461,10 +461,10 @@ def test_aggregations(alltypes):
         d.var(how="pop"),
         table.bool_col.any(),
         table.bool_col.notany(),
-        -table.bool_col.any(),
+        ~table.bool_col.any(),
         table.bool_col.all(),
         table.bool_col.notall(),
-        -table.bool_col.all(),
+        ~table.bool_col.all(),
         table.bool_col.count(where=cond),
         d.sum(where=cond),
         d.mean(where=cond),
@@ -474,7 +474,7 @@ def test_aggregations(alltypes):
         d.var(where=cond),
     ]
 
-    metrics = [expr.name("e%d" % i) for i, expr in enumerate(exprs)]
+    metrics = [expr.name(f"e{i:d}") for i, expr in enumerate(exprs)]
 
     agged_table = table.aggregate(metrics)
     agged_table.execute()
@@ -492,7 +492,7 @@ def test_analytic_functions(alltypes):
         f.rank(),
         f.dense_rank(),
         f.percent_rank(),
-        f.ntile(buckets=7),
+        f.ntile(7),
         f.first(),
         f.last(),
         f.first().over(ibis.window(preceding=10)),
@@ -511,7 +511,7 @@ def test_analytic_functions(alltypes):
         f.max(),
     ]
 
-    proj_exprs = [expr.name("e%d" % i) for i, expr in enumerate(exprs)]
+    proj_exprs = [expr.name(f"e{i:d}") for i, expr in enumerate(exprs)]
 
     proj_table = g.mutate(proj_exprs)
     proj_table.execute()
@@ -520,7 +520,7 @@ def test_analytic_functions(alltypes):
 def test_anti_join_self_reference_works(con, alltypes):
     t = alltypes.limit(100)
     t2 = t.view()
-    case = t[-((t.string_col == t2.string_col).any())]
+    case = t.filter(~((t.string_col == t2.string_col).any()))
     con.explain(case)
 
 
@@ -540,7 +540,8 @@ def test_tpch_self_join_failure(con):
     joined_all = (
         region.join(nation, region.r_regionkey == nation.n_regionkey)
         .join(customer, customer.c_nationkey == nation.n_nationkey)
-        .join(orders, orders.o_custkey == customer.c_custkey)[fields_of_interest]
+        .join(orders, orders.o_custkey == customer.c_custkey)
+        .select(fields_of_interest)
     )
 
     year = joined_all.odate.year().name("year")
@@ -554,7 +555,7 @@ def test_tpch_self_join_failure(con):
     yoy = current.join(
         prior,
         ((current.region == prior.region) & (current.year == (prior.year - 1))),
-    )[current.region, current.year, yoy_change]
+    ).select(current.region, current.year, yoy_change)
 
     # no analysis failure
     con.explain(yoy)
@@ -577,18 +578,19 @@ def test_tpch_correlated_subquery_failure(con):
     tpch = (
         region.join(nation, region.r_regionkey == nation.n_regionkey)
         .join(customer, customer.c_nationkey == nation.n_nationkey)
-        .join(orders, orders.o_custkey == customer.c_custkey)[fields_of_interest]
+        .join(orders, orders.o_custkey == customer.c_custkey)
+        .select(fields_of_interest)
     )
 
     t2 = tpch.view()
-    conditional_avg = t2[(t2.region == tpch.region)].amount.mean()
+    conditional_avg = t2.filter(t2.region == tpch.region).amount.mean()
     amount_filter = tpch.amount > conditional_avg
 
-    expr = tpch[amount_filter].limit(0)
+    expr = tpch.filter(amount_filter).limit(0)
 
     # impala can't plan this because its correlated subquery implementation is
     # broken: it cannot detect the outer reference inside the inner query
-    with pytest.raises(HiveServer2Error, match="Could not resolve .+ reference"):
+    with pytest.raises(HiveServer2Error, match=r"Could not resolve .+ reference"):
         con.explain(expr)
 
 
@@ -622,7 +624,7 @@ def test_unions_with_ctes(con, alltypes):
     )
     expr2 = expr1.view()
 
-    join1 = expr1.join(expr2, expr1.string_col == expr2.string_col)[[expr1]]
+    join1 = expr1.join(expr2, expr1.string_col == expr2.string_col).select(expr1)
     join2 = join1.view()
 
     expr = join1.union(join2)
@@ -632,10 +634,10 @@ def test_unions_with_ctes(con, alltypes):
 @pytest.mark.parametrize(
     ("left", "right", "expected"),
     [
-        (ibis.NA.cast("int64"), ibis.NA.cast("int64"), True),
+        (ibis.null().cast("int64"), ibis.null().cast("int64"), True),
         (L(1), L(1), True),
-        (ibis.NA.cast("int64"), L(1), False),
-        (L(1), ibis.NA.cast("int64"), False),
+        (ibis.null().cast("int64"), L(1), False),
+        (L(1), ibis.null().cast("int64"), False),
         (L(0), L(1), False),
         (L(1), L(0), False),
     ],
@@ -665,12 +667,12 @@ def test_where_with_timestamp(snapshot):
 
 def test_filter_with_analytic(snapshot):
     x = ibis.table(ibis.schema([("col", "int32")]), "x")
-    with_filter_col = x[x.columns + [ibis.null().name("filter")]]
-    filtered = with_filter_col[with_filter_col["filter"].isnull()]
-    subquery = filtered[filtered.columns]
+    with_filter_col = x.select(*x.columns, ibis.null().name("filter"))
+    filtered = with_filter_col.filter(with_filter_col["filter"].isnull())
+    subquery = filtered.select(filtered.columns)
 
-    with_analytic = subquery[["col", subquery.count().name("analytic")]]
-    expr = with_analytic[with_analytic.columns]
+    with_analytic = subquery.select("col", subquery.count().name("analytic"))
+    expr = with_analytic.select(with_analytic.columns)
 
     snapshot.assert_match(ibis.impala.compile(expr), "out.sql")
 

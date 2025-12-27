@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import datetime
 import numbers
 from decimal import Decimal
@@ -7,7 +8,6 @@ from enum import Enum, EnumMeta
 
 import dateutil.parser
 import dateutil.tz
-import pytz
 from public import public
 
 from ibis import util
@@ -46,8 +46,7 @@ class Unit(Coercible, Enum, metaclass=AbstractEnumMeta):
             pass
 
         # then look for the enum name (unit name)
-        if value.endswith("s"):
-            value = value[:-1]
+        value = value.removesuffix("s")
         try:
             return cls[value.upper()]
         except KeyError:
@@ -115,6 +114,21 @@ class TimestampUnit(TemporalUnit):
     MICROSECOND = "us"
     NANOSECOND = "ns"
 
+    @staticmethod
+    def to_scale(unit: str) -> int:
+        """Convert to number of digits after decimal (eg "ms" -> 3)."""
+        unit = TimestampUnit(unit)
+        if unit == TimestampUnit.SECOND:
+            return 0
+        elif unit == TimestampUnit.MILLISECOND:
+            return 3
+        elif unit == TimestampUnit.MICROSECOND:
+            return 6
+        elif unit == TimestampUnit.NANOSECOND:
+            return 9
+        else:
+            raise ValueError(f"Invalid unit {unit}")
+
 
 @public
 class IntervalUnit(TemporalUnit):
@@ -168,6 +182,9 @@ def normalize_timedelta(
     3000000
 
     """
+    with contextlib.suppress(AttributeError):
+        value = value.item()
+
     if isinstance(value, datetime.timedelta):
         # datetime.timedelta only stores days, seconds, and microseconds internally
         if value.days and not (value.seconds or value.microseconds):
@@ -195,7 +212,7 @@ def normalize_timezone(tz):
             return dateutil.tz.gettz(tz)
     elif isinstance(tz, (int, float)):
         return datetime.timezone(datetime.timedelta(hours=tz))
-    elif isinstance(tz, (dateutil.tz.tzoffset, pytz._FixedOffset)):
+    elif isinstance(tz, dateutil.tz.tzoffset):
         # this way we have a proper tzname() output, e.g. "UTC+01:00"
         return datetime.timezone(tz.utcoffset(None))
     elif isinstance(tz, datetime.tzinfo):

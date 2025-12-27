@@ -1,5 +1,5 @@
 ---
-title: JupyterLite console
+title: Online playground
 format:
   html:
     page-layout: full
@@ -8,7 +8,15 @@ format:
 Try our experimental JupyterLite console with Ibis, using the Palmer
 penguins[^1] dataset loaded into the DuckDB backend!
 
-{{< include ../../_tabsets/repl_warning.qmd >}}
+::: {.callout-warning collapse="true"}
+## Ibis in the browser is experimental.
+
+iOS is known to crash on this page.
+
+Mobile Firefox may also not work (the page won't crash though).
+
+Please [open an issue on GitHub](https://github.com/ibis-project/ibis/issues/new/choose) if you encounter problems.
+:::
 
 ```{python}
 #| echo: false
@@ -16,12 +24,6 @@ penguins[^1] dataset loaded into the DuckDB backend!
 from urllib.parse import urlencode
 
 lines = """
-%pip install numpy pandas tzdata
-import pyodide_js, pathlib, js
-await pyodide_js.loadPackage("https://storage.googleapis.com/ibis-wasm-wheels/pyarrow-16.0.0.dev2661%2Bg9bddb87fd-cp311-cp311-emscripten_3_1_46_wasm32.whl")
-pathlib.Path("penguins.csv").write_text(await (await js.fetch("https://storage.googleapis.com/ibis-tutorial-data/penguins.csv")).text())
-del pyodide_js, pathlib, js
-%clear
 %pip install 'ibis-framework[duckdb]'
 from ibis.interactive import *
 penguins = ibis.read_csv("penguins.csv")

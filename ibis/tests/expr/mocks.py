@@ -20,12 +20,12 @@ from sqlglot.dialects import DuckDB
 
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-from ibis.backends import BaseBackend
+from ibis.backends import BaseBackend, SupportsTempTables
 from ibis.expr.schema import Schema
 from ibis.expr.tests.conftest import MOCK_TABLES
 
 
-class MockBackend(BaseBackend):
+class MockBackend(SupportsTempTables, BaseBackend):
     name = "mock"
     version = "1.0"
     current_database = "mockdb"
@@ -42,7 +42,10 @@ class MockBackend(BaseBackend):
     def disconnect(self):
         pass
 
-    def table(self, name, **kwargs):
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        pass
+
+    def table(self, name, **_):
         schema = self.get_schema(name)
         node = ops.DatabaseTable(source=self, name=name, schema=schema)
         return node.to_expr()
@@ -52,11 +55,6 @@ class MockBackend(BaseBackend):
 
     def list_databases(self):
         return ["mockdb"]
-
-    def _to_sqlglot(self, expr, **kwargs):
-        import ibis
-
-        return ibis.duckdb._to_sqlglot(expr, **kwargs)
 
     def fetch_from_cursor(self, cursor, schema):
         pass
@@ -95,7 +93,7 @@ class MockBackend(BaseBackend):
     def _get_schema_using_query(self, query):
         return self.sql_query_schemas[query]
 
-    def _get_sql_string_view_schema(self, name, table, query):
+    def _get_sql_string_view_schema(self, name, table, query):  # noqa: ARG002
         return self.sql_query_schemas[query]
 
     @contextlib.contextmanager

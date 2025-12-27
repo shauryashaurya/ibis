@@ -3,97 +3,73 @@
 from __future__ import annotations
 
 import contextlib
-import re
 import warnings
-from functools import cached_property, partial
-from itertools import repeat
+from functools import cached_property
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import unquote_plus
 
-import pymysql
+import MySQLdb
 import sqlglot as sg
 import sqlglot.expressions as sge
+from MySQLdb import ProgrammingError
+from MySQLdb.constants import ER
 
 import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
-from ibis.backends import CanCreateDatabase
-from ibis.backends.mysql.compiler import MySQLCompiler
+from ibis.backends import (
+    CanCreateDatabase,
+    HasCurrentDatabase,
+    PyArrowExampleLoader,
+    SupportsTempTables,
+)
 from ibis.backends.sql import SQLBackend
-from ibis.backends.sql.compiler import TRUE, C
+from ibis.backends.sql.compilers.base import STAR, TRUE, C, RenameTable
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from urllib.parse import ParseResult
 
     import pandas as pd
+    import polars as pl
     import pyarrow as pa
 
 
-class Backend(SQLBackend, CanCreateDatabase):
+class Backend(
+    SupportsTempTables,
+    SQLBackend,
+    CanCreateDatabase,
+    HasCurrentDatabase,
+    PyArrowExampleLoader,
+):
     name = "mysql"
-    compiler = MySQLCompiler()
+    compiler = sc.mysql.compiler
     supports_create_or_replace = False
 
-    def _from_url(self, url: str, **kwargs):
-        """Connect to a backend using a URL `url`.
-
-        Parameters
-        ----------
-        url
-            URL with which to connect to a backend.
-        kwargs
-            Additional keyword arguments
-
-        Returns
-        -------
-        BaseBackend
-            A backend instance
-
-        """
-
-        url = urlparse(url)
-        database, *_ = url.path[1:].split("/", 1)
-        query_params = parse_qs(url.query)
-        connect_args = {
-            "user": url.username,
-            "password": url.password or "",
-            "host": url.hostname,
-            "database": database or "",
-        }
-
-        for name, value in query_params.items():
-            if len(value) > 1:
-                connect_args[name] = value
-            elif len(value) == 1:
-                connect_args[name] = value[0]
-            else:
-                raise com.IbisError(f"Invalid URL parameter: {name}")
-
-        kwargs.update(connect_args)
+    def _from_url(self, url: ParseResult, **kwarg_overrides):
+        kwargs = {}
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["password"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if database := url.path[1:].split("/", 1)[0]:
+            kwargs["database"] = database
+        if url.port:
+            kwargs["port"] = url.port
+        kwargs.update(kwarg_overrides)
         self._convert_kwargs(kwargs)
-
-        if "user" in kwargs and not kwargs["user"]:
-            del kwargs["user"]
-
-        if "host" in kwargs and not kwargs["host"]:
-            del kwargs["host"]
-
-        if "database" in kwargs and not kwargs["database"]:
-            del kwargs["database"]
-
-        if "password" in kwargs and kwargs["password"] is None:
-            del kwargs["password"]
-
         return self.connect(**kwargs)
 
     @cached_property
     def version(self):
-        matched = re.search(r"(\d+)\.(\d+)\.(\d+)", self.con.server_version)
-        return ".".join(matched.groups())
+        return ".".join(map(str, self.con._server_version))
 
     def do_connect(
         self,
@@ -101,7 +77,6 @@ class Backend(SQLBackend, CanCreateDatabase):
         user: str | None = None,
         password: str | None = None,
         port: int = 3306,
-        database: str | None = None,
         autocommit: bool = True,
         **kwargs,
     ) -> None:
@@ -117,62 +92,72 @@ class Backend(SQLBackend, CanCreateDatabase):
             Password
         port
             Port
-        database
-            Database to connect to
         autocommit
             Autocommit mode
         kwargs
-            Additional keyword arguments passed to `pymysql.connect`
+            Additional keyword arguments passed to `MySQLdb.connect`
 
         Examples
         --------
         >>> import os
-        >>> import getpass
+        >>> import ibis
         >>> host = os.environ.get("IBIS_TEST_MYSQL_HOST", "localhost")
-        >>> user = os.environ.get("IBIS_TEST_MYSQL_USER", getpass.getuser())
-        >>> password = os.environ.get("IBIS_TEST_MYSQL_PASSWORD")
-        >>> database = os.environ.get("IBIS_TEST_MYSQL_DATABASE", "ibis_testing")
-        >>> con = connect(database=database, host=host, user=user, password=password)
+        >>> user = os.environ.get("IBIS_TEST_MYSQL_USER", "ibis")
+        >>> password = os.environ.get("IBIS_TEST_MYSQL_PASSWORD", "ibis")
+        >>> database = os.environ.get("IBIS_TEST_MYSQL_DATABASE", "ibis-testing")
+        >>> con = ibis.mysql.connect(database=database, host=host, user=user, password=password)
         >>> con.list_tables()  # doctest: +ELLIPSIS
         [...]
         >>> t = con.table("functional_alltypes")
         >>> t
-        MySQLTable[table]
-          name: functional_alltypes
-          schema:
-            id : int32
-            bool_col : int8
-            tinyint_col : int8
-            smallint_col : int16
-            int_col : int32
-            bigint_col : int64
-            float_col : float32
-            double_col : float64
-            date_string_col : string
-            string_col : string
-            timestamp_col : timestamp
-            year : int32
-            month : int32
-
+        DatabaseTable: functional_alltypes
+          id              int32
+          bool_col        int8
+          tinyint_col     int8
+          smallint_col    int16
+          int_col         int32
+          bigint_col      int64
+          float_col       float32
+          double_col      float64
+          date_string_col string
+          string_col      string
+          timestamp_col   timestamp
+          year            int32
+          month           int32
         """
-        con = pymysql.connect(
+        self.con = MySQLdb.connect(
             user=user,
-            host=host,
+            host="127.0.0.1" if host == "localhost" else host,
             port=port,
             password=password,
-            database=database,
             autocommit=autocommit,
-            conv=pymysql.converters.conversions,
             **kwargs,
         )
 
-        with contextlib.closing(con.cursor()) as cur:
+        self._post_connect()
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: MySQLdb.Connection, /) -> Backend:
+        """Create an Ibis client from an existing connection to a MySQL database.
+
+        Parameters
+        ----------
+        con
+            An existing connection to a MySQL database.
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        new_backend._post_connect()
+        return new_backend
+
+    def _post_connect(self) -> None:
+        with self.con.cursor() as cur:
             try:
                 cur.execute("SET @@session.time_zone = 'UTC'")
             except Exception as e:  # noqa: BLE001
                 warnings.warn(f"Unable to set session timezone to UTC: {e}")
-
-        self.con = con
 
     @property
     def current_database(self) -> str:
@@ -180,30 +165,62 @@ class Backend(SQLBackend, CanCreateDatabase):
             [(database,)] = cur.fetchall()
         return database
 
-    def list_databases(self, like: str | None = None) -> list[str]:
+    def list_databases(self, *, like: str | None = None) -> list[str]:
         # In MySQL, "database" and "schema" are synonymous
         with self._safe_raw_sql("SHOW DATABASES") as cur:
             databases = list(map(itemgetter(0), cur.fetchall()))
         return self._filter_with_like(databases, like)
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
-        table = util.gen_name(f"{self.name}_metadata")
+        from ibis.backends.mysql.datatypes import _type_from_cursor_info
 
+        char_set_info = self.con.get_character_set_info()
+        multi_byte_maximum_length = char_set_info["mbmaxlen"]
+
+        sql = (
+            sg.select(STAR)
+            .from_(
+                sg.parse_one(query, dialect=self.dialect).subquery(
+                    sg.to_identifier(
+                        util.gen_name("query_schema"), quoted=self.compiler.quoted
+                    )
+                )
+            )
+            .limit(0)
+            .sql(self.dialect)
+        )
         with self.begin() as cur:
-            cur.execute(f"CREATE TEMPORARY TABLE {table} AS {query}")
-            try:
-                return self.get_schema(table)
-            finally:
-                cur.execute(f"DROP TABLE {table}")
+            cur.execute(sql)
+            descr, flags = cur.description, cur.description_flags
+
+        items = {}
+        for (name, type_code, _, _, field_length, scale, _), raw_flags in zip(
+            descr, flags
+        ):
+            items[name] = _type_from_cursor_info(
+                flags=raw_flags,
+                type_code=type_code,
+                field_length=field_length,
+                scale=scale,
+                multi_byte_maximum_length=multi_byte_maximum_length,
+            )
+        return sch.Schema(items)
 
     def get_schema(
         self, name: str, *, catalog: str | None = None, database: str | None = None
     ) -> sch.Schema:
-        table = sg.table(name, db=database, catalog=catalog, quoted=True).sql(self.name)
+        table = sg.table(
+            name, db=database, catalog=catalog, quoted=self.compiler.quoted
+        ).sql(self.dialect)
 
         with self.begin() as cur:
-            cur.execute(f"DESCRIBE {table}")
-            result = cur.fetchall()
+            try:
+                cur.execute(sge.Describe(this=table).sql(self.dialect))
+            except ProgrammingError as e:
+                if e.args[0] == ER.NO_SUCH_TABLE:
+                    raise com.TableNotFound(name) from e
+            else:
+                result = cur.fetchall()
 
         type_mapper = self.compiler.type_mapper
         fields = {
@@ -214,16 +231,18 @@ class Backend(SQLBackend, CanCreateDatabase):
         return sch.Schema(fields)
 
     def create_database(self, name: str, force: bool = False) -> None:
-        sql = sge.Create(kind="DATABASE", exist=force, this=sg.to_identifier(name)).sql(
-            self.name
-        )
+        sql = sge.Create(
+            kind="DATABASE", exists=force, this=sg.to_identifier(name)
+        ).sql(self.name)
         with self.begin() as cur:
             cur.execute(sql)
 
-    def drop_database(self, name: str, force: bool = False) -> None:
-        sql = sge.Drop(kind="DATABASE", exist=force, this=sg.to_identifier(name)).sql(
-            self.name
-        )
+    def drop_database(
+        self, name: str, *, catalog: str | None = None, force: bool = False
+    ) -> None:
+        sql = sge.Drop(
+            kind="DATABASE", exists=force, this=sg.table(name, catalog=catalog)
+        ).sql(self.name)
         with self.begin() as cur:
             cur.execute(sql)
 
@@ -231,13 +250,20 @@ class Backend(SQLBackend, CanCreateDatabase):
     def begin(self):
         con = self.con
         cur = con.cursor()
+        autocommit = con.get_autocommit()
+
+        if not autocommit:
+            con.begin()
+
         try:
             yield cur
         except Exception:
-            con.rollback()
+            if not autocommit:
+                con.rollback()
             raise
         else:
-            con.commit()
+            if not autocommit:
+                con.commit()
         finally:
             cur.close()
 
@@ -245,7 +271,7 @@ class Backend(SQLBackend, CanCreateDatabase):
     # from .execute()
     @contextlib.contextmanager
     def _safe_raw_sql(self, *args, **kwargs):
-        with contextlib.closing(self.raw_sql(*args, **kwargs)) as result:
+        with self.raw_sql(*args, **kwargs) as result:
             yield result
 
     def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
@@ -253,79 +279,47 @@ class Backend(SQLBackend, CanCreateDatabase):
             query = query.sql(dialect=self.name)
 
         con = self.con
+        autocommit = con.get_autocommit()
+
         cursor = con.cursor()
+
+        if not autocommit:
+            con.begin()
 
         try:
             cursor.execute(query, **kwargs)
         except Exception:
-            con.rollback()
+            if not autocommit:
+                con.rollback()
             cursor.close()
             raise
         else:
-            con.commit()
+            if not autocommit:
+                con.commit()
             return cursor
 
     # TODO: disable positional arguments
     def list_tables(
         self,
         like: str | None = None,
-        schema: str | None = None,
         database: tuple[str, str] | str | None = None,
     ) -> list[str]:
-        """List the tables in the database.
-
-        Parameters
-        ----------
-        like
-            A pattern to use for listing tables.
-        schema
-            [deprecated] The schema to perform the list against.
-        database
-            Database to list tables from. Default behavior is to show tables in
-            the current database (``self.current_database``).
-
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
-        """
-        if schema is not None:
-            self._warn_schema()
-
-        if schema is not None and database is not None:
-            raise ValueError(
-                "Using both the `schema` and `database` kwargs is not supported. "
-                "`schema` is deprecated and will be removed in Ibis 10.0"
-                "\nUse the `database` kwarg with one of the following patterns:"
-                '\ndatabase="database"'
-                '\ndatabase=("catalog", "database")'
-                '\ndatabase="catalog.database"',
-            )
-        elif schema is not None:
-            table_loc = schema
-        elif database is not None:
-            table_loc = database
+        if database is not None:
+            table_loc = self._to_sqlglot_table(database)
         else:
-            table_loc = self.current_database
-
-        table_loc = self._to_sqlglot_table(table_loc)
+            table_loc = sge.Table(
+                db=sg.to_identifier(self.current_database, quoted=self.compiler.quoted),
+                catalog=None,
+            )
 
         conditions = [TRUE]
 
-        if table_loc is not None:
-            if (sg_cat := table_loc.args["catalog"]) is not None:
-                sg_cat.args["quoted"] = False
-            if (sg_db := table_loc.args["db"]) is not None:
-                sg_db.args["quoted"] = False
+        if (sg_cat := table_loc.args["catalog"]) is not None:
+            sg_cat.args["quoted"] = False
+        if (sg_db := table_loc.args["db"]) is not None:
+            sg_db.args["quoted"] = False
+        if table_loc.catalog or table_loc.db:
             conditions = [C.table_schema.eq(sge.convert(table_loc.sql(self.name)))]
-
-            # conditions.append(C.table_schema.eq(table_loc))
 
         col = "table_name"
         sql = (
@@ -342,13 +336,32 @@ class Backend(SQLBackend, CanCreateDatabase):
         return self._filter_with_like(map(itemgetter(0), out), like)
 
     def execute(
-        self, expr: ir.Expr, limit: str | None = "default", **kwargs: Any
-    ) -> Any:
-        """Execute an expression."""
+        self,
+        expr: ir.Expr,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame | pd.Series | Any:
+        """Execute an Ibis expression and return a pandas `DataFrame`, `Series`, or scalar.
+
+        Parameters
+        ----------
+        expr
+            Ibis expression to execute.
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            no limit. The default is in `ibis/config.py`.
+        kwargs
+            Keyword arguments
+        """
 
         self._run_pre_execute_hooks(expr)
         table = expr.as_table()
-        sql = self.compile(table, limit=limit, **kwargs)
+        sql = self.compile(table, limit=limit, params=params, **kwargs)
 
         schema = table.schema()
 
@@ -359,22 +372,23 @@ class Backend(SQLBackend, CanCreateDatabase):
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | pa.Table | ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema: ibis.Schema | None = None,
+        schema: sch.SchemaLike | None = None,
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
     ) -> ir.Table:
         if obj is None and schema is None:
             raise ValueError("Either `obj` or `schema` must be specified")
-
-        if database is not None and database != self.current_database:
-            raise com.UnsupportedOperationError(
-                "Creating tables in other databases is not supported by Postgres"
-            )
-        else:
-            database = None
+        if schema is not None:
+            schema = ibis.schema(schema)
 
         properties = []
 
@@ -389,49 +403,44 @@ class Backend(SQLBackend, CanCreateDatabase):
 
             self._run_pre_execute_hooks(table)
 
-            query = self._to_sqlglot(table)
+            query = self.compiler.to_sqlglot(table)
         else:
             query = None
-
-        column_defs = [
-            sge.ColumnDef(
-                this=sg.to_identifier(colname, quoted=self.compiler.quoted),
-                kind=self.compiler.type_mapper.from_ibis(typ),
-                constraints=(
-                    None
-                    if typ.nullable
-                    else [sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())]
-                ),
-            )
-            for colname, typ in (schema or table.schema()).items()
-        ]
 
         if overwrite:
             temp_name = util.gen_name(f"{self.name}_table")
         else:
             temp_name = name
 
-        table = sg.table(temp_name, catalog=database, quoted=self.compiler.quoted)
-        target = sge.Schema(this=table, expressions=column_defs)
+        if not schema:
+            schema = table.schema()
 
-        create_stmt = sge.Create(
-            kind="TABLE",
-            this=target,
-            properties=sge.Properties(expressions=properties),
+        quoted = self.compiler.quoted
+        dialect = self.dialect
+
+        table_expr = sg.table(temp_name, catalog=database, quoted=quoted)
+        target = sge.Schema(
+            this=table_expr, expressions=schema.to_sqlglot_column_defs(dialect)
         )
 
-        this = sg.table(name, catalog=database, quoted=self.compiler.quoted)
+        create_stmt = sge.Create(
+            kind="TABLE", this=target, properties=sge.Properties(expressions=properties)
+        )
+
+        this = sg.table(name, catalog=database, quoted=quoted)
         with self._safe_raw_sql(create_stmt) as cur:
             if query is not None:
-                insert_stmt = sge.Insert(this=table, expression=query).sql(self.name)
-                cur.execute(insert_stmt)
+                cur.execute(sge.Insert(this=table_expr, expression=query).sql(dialect))
 
             if overwrite:
+                cur.execute(sge.Drop(kind="TABLE", this=this, exists=True).sql(dialect))
                 cur.execute(
-                    sge.Drop(kind="TABLE", this=this, exists=True).sql(self.name)
-                )
-                cur.execute(
-                    f"ALTER TABLE IF EXISTS {table.sql(self.name)} RENAME TO {this.sql(self.name)}"
+                    sge.Alter(
+                        kind="TABLE",
+                        this=table_expr,
+                        exists=True,
+                        actions=[RenameTable(this=this)],
+                    ).sql(dialect)
                 )
 
         if schema is None:
@@ -444,61 +453,45 @@ class Backend(SQLBackend, CanCreateDatabase):
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         schema = op.schema
-        if null_columns := [col for col, dtype in schema.items() if dtype.is_null()]:
+        if null_columns := schema.null_fields:
             raise com.IbisTypeError(
                 "MySQL cannot yet reliably handle `null` typed columns; "
                 f"got null typed columns: {null_columns}"
             )
 
-        # only register if we haven't already done so
-        if (name := op.name) not in self.list_tables():
-            quoted = self.compiler.quoted
-            column_defs = [
-                sg.exp.ColumnDef(
-                    this=sg.to_identifier(colname, quoted=quoted),
-                    kind=self.compiler.type_mapper.from_ibis(typ),
-                    constraints=(
-                        None
-                        if typ.nullable
-                        else [
-                            sg.exp.ColumnConstraint(
-                                kind=sg.exp.NotNullColumnConstraint()
-                            )
-                        ]
-                    ),
-                )
-                for colname, typ in schema.items()
-            ]
+        name = op.name
+        quoted = self.compiler.quoted
+        dialect = self.dialect
 
-            create_stmt = sg.exp.Create(
-                kind="TABLE",
-                this=sg.exp.Schema(
-                    this=sg.to_identifier(name, quoted=quoted), expressions=column_defs
-                ),
-                properties=sg.exp.Properties(expressions=[sge.TemporaryProperty()]),
-            )
-            create_stmt_sql = create_stmt.sql(self.name)
+        create_stmt = sg.exp.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot_column_defs(dialect),
+            ),
+            properties=sg.exp.Properties(expressions=[sge.TemporaryProperty()]),
+        )
+        create_stmt_sql = create_stmt.sql(dialect)
 
-            columns = schema.keys()
-            df = op.data.to_frame()
-            data = df.itertuples(index=False)
-            cols = ", ".join(
-                ident.sql(self.name)
-                for ident in map(partial(sg.to_identifier, quoted=quoted), columns)
-            )
-            specs = ", ".join(repeat("%s", len(columns)))
-            table = sg.table(name, quoted=quoted)
-            sql = f"INSERT INTO {table.sql(self.name)} ({cols}) VALUES ({specs})"
-            with self.begin() as cur:
-                cur.execute(create_stmt_sql)
+        df = op.data.to_frame()
+        # nan can not be used with MySQL
+        df = df.replace(float("nan"), None)
 
-                if not df.empty:
-                    cur.executemany(sql, data)
+        data = df.itertuples(index=False)
+        sql = self._build_insert_template(
+            name, schema=schema, columns=True, placeholder="%s"
+        )
+        with self.begin() as cur:
+            cur.execute(create_stmt_sql)
+
+            if not df.empty:
+                cur.executemany(sql, data)
 
     @util.experimental
     def to_pyarrow_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -524,16 +517,7 @@ class Backend(SQLBackend, CanCreateDatabase):
 
         from ibis.backends.mysql.converter import MySQLPandasData
 
-        try:
-            df = pd.DataFrame.from_records(
-                cursor, columns=schema.names, coerce_float=True
-            )
-        except Exception:
-            # clean up the cursor if we fail to create the DataFrame
-            #
-            # in the sqlite case failing to close the cursor results in
-            # artificially locked tables
-            cursor.close()
-            raise
-        df = MySQLPandasData.convert_table(df, schema)
-        return df
+        df = pd.DataFrame.from_records(
+            cursor.fetchall(), columns=schema.names, coerce_float=True
+        )
+        return MySQLPandasData.convert_table(df, schema)

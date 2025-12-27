@@ -11,8 +11,8 @@ import ibis.expr.operations as ops
 from ibis import util
 from ibis.common.annotations import annotated
 from ibis.common.temporal import IntervalUnit
-from ibis.expr.types.core import _binop
-from ibis.expr.types.generic import Column, Scalar, Value
+from ibis.expr.types.generic import Column, Scalar, Value, _binop
+from ibis.util import deprecated
 
 if TYPE_CHECKING:
     import datetime
@@ -26,19 +26,73 @@ class _DateComponentMixin:
     """Temporal expressions that have a date component."""
 
     def epoch_seconds(self) -> ir.IntegerValue:
-        """Extract UNIX epoch in seconds."""
+        """Extract UNIX epoch in seconds.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).epoch_seconds()
+        ┌────────────┐
+        │ 1735603200 │
+        └────────────┘
+        """
         return ops.ExtractEpochSeconds(self).to_expr()
 
     def year(self) -> ir.IntegerValue:
-        """Extract the year component."""
+        """Extract the year component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).year()
+        ┌──────┐
+        │ 2024 │
+        └──────┘
+        """
         return ops.ExtractYear(self).to_expr()
 
+    def iso_year(self) -> ir.IntegerValue:
+        """Extract the ISO year component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).iso_year()
+        ┌──────┐
+        │ 2025 │
+        └──────┘
+        """
+        return ops.ExtractIsoYear(self).to_expr()
+
     def month(self) -> ir.IntegerValue:
-        """Extract the month component."""
+        """Extract the month component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).month()
+        ┌────┐
+        │ 12 │
+        └────┘
+        """
         return ops.ExtractMonth(self).to_expr()
 
     def day(self) -> ir.IntegerValue:
-        """Extract the day component."""
+        """Extract the day component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).day()
+        ┌────┐
+        │ 31 │
+        └────┘
+        """
         return ops.ExtractDay(self).to_expr()
 
     @property
@@ -54,15 +108,65 @@ class _DateComponentMixin:
         return DayOfWeek(self)
 
     def day_of_year(self) -> ir.IntegerValue:
-        """Extract the day of the year component."""
+        """Extract the day of the year component.
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "date_col": [
+        ...             date(2023, 1, 1),
+        ...             date(2023, 6, 17),
+        ...             date(2023, 12, 31),
+        ...             date(2024, 2, 29),
+        ...             date(2024, 12, 31),
+        ...         ]
+        ...     },
+        ... )
+        >>> t.date_col.day_of_year()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ExtractDayOfYear(date_col) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ int32                      │
+        ├────────────────────────────┤
+        │                          1 │
+        │                        168 │
+        │                        365 │
+        │                         60 │
+        │                        366 │
+        └────────────────────────────┘
+        """
         return ops.ExtractDayOfYear(self).to_expr()
 
     def quarter(self) -> ir.IntegerValue:
-        """Extract the quarter component."""
+        """Extract the quarter component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).quarter()
+        ┌───┐
+        │ 4 │
+        └───┘
+        """
         return ops.ExtractQuarter(self).to_expr()
 
     def week_of_year(self) -> ir.IntegerValue:
-        """Extract the week of the year component."""
+        """Extract the week of the year component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.date(2024, 12, 31).week_of_year()
+        ┌───┐
+        │ 1 │
+        └───┘
+        """
         return ops.ExtractWeekOfYear(self).to_expr()
 
 
@@ -76,33 +180,93 @@ class _TimeComponentMixin:
         -------
         TimeValue
             The time component of `self`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp(2024, 12, 31, 23, 59, 59).time()
+        ┌──────────┐
+        │ 23:59:59 │
+        └──────────┘
         """
         return ops.Time(self).to_expr()
 
     def hour(self) -> ir.IntegerValue:
-        """Extract the hour component."""
+        """Extract the hour component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp(2024, 12, 31, 23, 59, 59).hour()
+        ┌────┐
+        │ 23 │
+        └────┘
+        """
         return ops.ExtractHour(self).to_expr()
 
     def minute(self) -> ir.IntegerValue:
-        """Extract the minute component."""
+        """Extract the minute component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp(2024, 12, 31, 23, 59, 59).minute()
+        ┌────┐
+        │ 59 │
+        └────┘
+        """
         return ops.ExtractMinute(self).to_expr()
 
     def second(self) -> ir.IntegerValue:
-        """Extract the second component."""
+        """Extract the second component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp(2024, 12, 31, 23, 59, 59).second()
+        ┌────┐
+        │ 59 │
+        └────┘
+        """
         return ops.ExtractSecond(self).to_expr()
 
     def microsecond(self) -> ir.IntegerValue:
-        """Extract the microsecond component."""
+        """Extract the microsecond component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp("2024-12-31 23:59:59.999").microsecond()
+        ┌────────┐
+        │ 999000 │
+        └────────┘
+        """
         return ops.ExtractMicrosecond(self).to_expr()
 
     def millisecond(self) -> ir.IntegerValue:
-        """Extract the millisecond component."""
+        """Extract the millisecond component.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> ibis.timestamp("2024-12-31 23:59:59.999").millisecond()
+        ┌─────┐
+        │ 999 │
+        └─────┘
+        """
         return ops.ExtractMillisecond(self).to_expr()
 
     def between(
         self,
         lower: str | datetime.time | TimeValue,
         upper: str | datetime.time | TimeValue,
+        *,
         timezone: str | None = None,
     ) -> ir.BooleanValue:
         """Check if the expr falls between `lower` and `upper`, inclusive.
@@ -123,6 +287,21 @@ class _TimeComponentMixin:
         BooleanValue
             Whether `self` is between `lower` and `upper`, adjusting `timezone`
             as needed.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> lower = ibis.date(2024, 12, 30)
+        >>> upper = ibis.date(2025, 1, 1)
+        >>> ibis.date(2024, 12, 31).between(lower, upper)
+        ┌──────┐
+        │ True │
+        └──────┘
+        >>> ibis.date(2020, 12, 31).between(lower, upper)
+        ┌───────┐
+        │ False │
+        └───────┘
         """
         op = self.op()
         if isinstance(op, ops.Time):
@@ -147,7 +326,9 @@ class _TimeComponentMixin:
 
 @public
 class TimeValue(_TimeComponentMixin, Value):
-    def strftime(self, format_str: str) -> ir.StringValue:
+    """A time of day from 0:00:00 to 23:59:59.999999999."""
+
+    def strftime(self, format_str: str, /) -> ir.StringValue:
         """Format a time according to `format_str`.
 
         Format string may depend on the backend, but we try to conform to ANSI
@@ -165,7 +346,7 @@ class TimeValue(_TimeComponentMixin, Value):
         """
         return ops.Strftime(self, format_str).to_expr()
 
-    def truncate(self, unit: Literal["h", "m", "s", "ms", "us", "ns"]) -> TimeValue:
+    def truncate(self, unit: Literal["h", "m", "s", "ms", "us", "ns"], /) -> TimeValue:
         """Truncate the expression to a time expression in units of `unit`.
 
         Commonly used for time series resampling.
@@ -242,7 +423,9 @@ class TimeValue(_TimeComponentMixin, Value):
     def delta(
         self,
         other: datetime.time | Value[dt.Time],
-        part: Literal[
+        /,
+        *,
+        unit: Literal[
             "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"
         ]
         | Value[dt.String],
@@ -259,7 +442,7 @@ class TimeValue(_TimeComponentMixin, Value):
         ----------
         other
             A time expression
-        part
+        unit
             The unit of time to compute the difference in
 
         Returns
@@ -273,8 +456,10 @@ class TimeValue(_TimeComponentMixin, Value):
         >>> ibis.options.interactive = True
         >>> start = ibis.time("01:58:00")
         >>> end = ibis.time("23:59:59")
-        >>> end.delta(start, "hour")
-        22
+        >>> end.delta(start, unit="hour")
+        ┌────┐
+        │ 22 │
+        └────┘
         >>> data = '''tpep_pickup_datetime,tpep_dropoff_datetime
         ... 2016-02-01T00:23:56,2016-02-01T00:42:28
         ... 2016-02-01T00:12:14,2016-02-01T00:21:41
@@ -286,7 +471,7 @@ class TimeValue(_TimeComponentMixin, Value):
         >>> taxi = ibis.read_csv("/tmp/triptimes.csv")
         >>> ride_duration = (
         ...     taxi.tpep_dropoff_datetime.time()
-        ...     .delta(taxi.tpep_pickup_datetime.time(), "minute")
+        ...     .delta(taxi.tpep_pickup_datetime.time(), unit="minute")
         ...     .name("ride_minutes")
         ... )
         >>> ride_duration
@@ -302,7 +487,7 @@ class TimeValue(_TimeComponentMixin, Value):
         │            5 │
         └──────────────┘
         """
-        return ops.TimeDelta(left=self, right=other, part=part).to_expr()
+        return ops.TimeDelta(left=self, right=other, part=unit).to_expr()
 
 
 @public
@@ -317,7 +502,9 @@ class TimeColumn(Column, TimeValue):
 
 @public
 class DateValue(Value, _DateComponentMixin):
-    def strftime(self, format_str: str) -> ir.StringValue:
+    """A date (without time), eg 2024-12-31."""
+
+    def strftime(self, format_str: str, /) -> ir.StringValue:
         """Format a date according to `format_str`.
 
         Format string may depend on the backend, but we try to conform to ANSI
@@ -332,10 +519,51 @@ class DateValue(Value, _DateComponentMixin):
         -------
         StringValue
             Formatted version of `arg`
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "date_col": [
+        ...             date(2020, 10, 5),
+        ...             date(2020, 11, 10),
+        ...             date(2020, 12, 15),
+        ...         ]
+        ...     },
+        ... )
+
+        Return a string with the year and month.
+
+        >>> t.date_col.strftime("%Y-%m")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Strftime(date_col, '%Y-%m') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                      │
+        ├─────────────────────────────┤
+        │ 2020-10                     │
+        │ 2020-11                     │
+        │ 2020-12                     │
+        └─────────────────────────────┘
+
+        Return a string with the month name, day, and year.
+
+        >>> t.date_col.strftime("%B %-d, %Y")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Strftime(date_col, '%B %-d, %Y') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                           │
+        ├──────────────────────────────────┤
+        │ October 5, 2020                  │
+        │ November 10, 2020                │
+        │ December 15, 2020                │
+        └──────────────────────────────────┘
         """
         return ops.Strftime(self, format_str).to_expr()
 
-    def truncate(self, unit: Literal["Y", "Q", "M", "W", "D"]) -> DateValue:
+    def truncate(self, unit: Literal["Y", "Q", "M", "W", "D"], /) -> DateValue:
         """Truncate date expression to units of `unit`.
 
         Parameters
@@ -347,6 +575,42 @@ class DateValue(Value, _DateComponentMixin):
         -------
         DateValue
             Truncated date value expression
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "date_col": [
+        ...             date(2020, 1, 5),
+        ...             date(2020, 4, 10),
+        ...             date(2020, 7, 15),
+        ...             date(2020, 10, 20),
+        ...         ]
+        ...     },
+        ... )
+
+        Return date columns truncated to the start of the year, quarter, month, and
+        week.
+
+        >>> t.select(
+        ...     year=t.date_col.truncate("Y"),
+        ...     quarter=t.date_col.truncate("Q"),
+        ...     month=t.date_col.truncate("M"),
+        ...     week=t.date_col.truncate("W"),
+        ... )
+        ┏━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+        ┃ year       ┃ quarter    ┃ month      ┃ week       ┃
+        ┡━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+        │ date       │ date       │ date       │ date       │
+        ├────────────┼────────────┼────────────┼────────────┤
+        │ 2020-01-01 │ 2020-01-01 │ 2020-01-01 │ 2019-12-30 │
+        │ 2020-01-01 │ 2020-04-01 │ 2020-04-01 │ 2020-04-06 │
+        │ 2020-01-01 │ 2020-07-01 │ 2020-07-01 │ 2020-07-13 │
+        │ 2020-01-01 │ 2020-10-01 │ 2020-10-01 │ 2020-10-19 │
+        └────────────┴────────────┴────────────┴────────────┘
         """
         return ops.DateTruncate(self, unit).to_expr()
 
@@ -410,7 +674,9 @@ class DateValue(Value, _DateComponentMixin):
     def delta(
         self,
         other: datetime.date | Value[dt.Date],
-        part: Literal["year", "quarter", "month", "week", "day"] | Value[dt.String],
+        /,
+        *,
+        unit: Literal["year", "quarter", "month", "week", "day"] | Value[dt.String],
     ) -> ir.IntegerValue:
         """Compute the number of `part`s between two dates.
 
@@ -424,7 +690,7 @@ class DateValue(Value, _DateComponentMixin):
         ----------
         other
             A date expression
-        part
+        unit
             The unit of time to compute the difference in
 
         Returns
@@ -438,12 +704,14 @@ class DateValue(Value, _DateComponentMixin):
         >>> ibis.options.interactive = True
         >>> start = ibis.date("1992-09-30")
         >>> end = ibis.date("1992-10-01")
-        >>> end.delta(start, "day")
-        1
+        >>> end.delta(start, unit="day")
+        ┌───┐
+        │ 1 │
+        └───┘
         >>> prez = ibis.examples.presidential.fetch()
         >>> prez.mutate(
-        ...     years_in_office=prez.end.delta(prez.start, "year"),
-        ...     hours_in_office=prez.end.delta(prez.start, "hour"),
+        ...     years_in_office=prez.end.delta(prez.start, unit="year"),
+        ...     hours_in_office=prez.end.delta(prez.start, unit="hour"),
         ... ).drop("party")
         ┏━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┓
         ┃ name       ┃ start      ┃ end        ┃ years_in_office ┃ hours_in_office ┃
@@ -463,7 +731,43 @@ class DateValue(Value, _DateComponentMixin):
         │ …          │ …          │ …          │               … │               … │
         └────────────┴────────────┴────────────┴─────────────────┴─────────────────┘
         """
-        return ops.DateDelta(left=self, right=other, part=part).to_expr()
+        return ops.DateDelta(left=self, right=other, part=unit).to_expr()
+
+    def epoch_days(self) -> ir.IntegerValue:
+        """Return the number of days since the UNIX epoch date.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> date = ibis.date(2020, 1, 1)
+        >>> date
+        ┌────────────┐
+        │ 2020-01-01 │
+        └────────────┘
+        >>> date.epoch_days()
+        ┌───────┐
+        │ 18262 │
+        └───────┘
+        >>> t = date.name("date_col").as_table()
+        >>> t
+        ┏━━━━━━━━━━━━┓
+        ┃ date_col   ┃
+        ┡━━━━━━━━━━━━┩
+        │ date       │
+        ├────────────┤
+        │ 2020-01-01 │
+        └────────────┘
+        >>> t.mutate(epoch=t.date_col.epoch_days())
+        ┏━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ date_col   ┃ epoch ┃
+        ┡━━━━━━━━━━━━╇━━━━━━━┩
+        │ date       │ int64 │
+        ├────────────┼───────┤
+        │ 2020-01-01 │ 18262 │
+        └────────────┴───────┘
+        """
+        return self.delta(ibis.date(1970, 1, 1), unit="day")
 
 
 @public
@@ -478,7 +782,9 @@ class DateColumn(Column, DateValue):
 
 @public
 class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
-    def strftime(self, format_str: str) -> ir.StringValue:
+    """A date and time, eg 2024-12-31 23:59:59.999999."""
+
+    def strftime(self, format_str: str, /) -> ir.StringValue:
         """Format a timestamp according to `format_str`.
 
         Format string may depend on the backend, but we try to conform to ANSI
@@ -493,12 +799,65 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         -------
         StringValue
             Formatted version of `arg`
+
+        Examples
+        --------
+        >>> from datetime import datetime
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "timestamp_col": [
+        ...             datetime(2020, 10, 5, 8, 0, 0),
+        ...             datetime(2020, 11, 10, 10, 2, 15),
+        ...             datetime(2020, 12, 15, 12, 4, 30),
+        ...         ]
+        ...     },
+        ... )
+
+        Return a string with the year and month.
+
+        >>> t.timestamp_col.strftime("%Y-%m")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Strftime(timestamp_col, '%Y-%m') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                           │
+        ├──────────────────────────────────┤
+        │ 2020-10                          │
+        │ 2020-11                          │
+        │ 2020-12                          │
+        └──────────────────────────────────┘
+
+        Return a string with the month, day, and year.
+
+        >>> t.timestamp_col.strftime("%B %-d, %Y")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Strftime(timestamp_col, '%B %-d, %Y') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                                │
+        ├───────────────────────────────────────┤
+        │ October 5, 2020                       │
+        │ November 10, 2020                     │
+        │ December 15, 2020                     │
+        └───────────────────────────────────────┘
+
+        Return a string with the month, day, year, hour, minute, and AM/PM.
+
+        >>> t.timestamp_col.strftime("%B %-d, %Y at %I:%M %p")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Strftime(timestamp_col, '%B %-d, %Y at %I:%M %p') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                                            │
+        ├───────────────────────────────────────────────────┤
+        │ October 5, 2020 at 08:00 AM                       │
+        │ November 10, 2020 at 10:02 AM                     │
+        │ December 15, 2020 at 12:04 PM                     │
+        └───────────────────────────────────────────────────┘
         """
         return ops.Strftime(self, format_str).to_expr()
 
     def truncate(
-        self,
-        unit: Literal["Y", "Q", "M", "W", "D", "h", "m", "s", "ms", "us", "ns"],
+        self, unit: Literal["Y", "Q", "M", "W", "D", "h", "m", "s", "ms", "us", "ns"], /
     ) -> TimestampValue:
         """Truncate timestamp expression to units of `unit`.
 
@@ -511,6 +870,73 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         -------
         TimestampValue
             Truncated timestamp expression
+
+        Examples
+        --------
+        >>> from datetime import datetime
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "timestamp_col": [
+        ...             datetime(2020, 1, 5, 8, 0, 0),
+        ...             datetime(2020, 4, 10, 10, 2, 15),
+        ...             datetime(2020, 7, 15, 12, 4, 30),
+        ...             datetime(2020, 10, 20, 14, 6, 45),
+        ...         ]
+        ...     },
+        ... )
+
+        Return timestamp columns truncated to the start of the year, quarter, and month.
+
+        >>> t.select(
+        ...     year=t.timestamp_col.truncate("Y"),
+        ...     quarter=t.timestamp_col.truncate("Q"),
+        ...     month=t.timestamp_col.truncate("M"),
+        ... )
+        ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ year                ┃ quarter             ┃ month               ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+        │ timestamp           │ timestamp           │ timestamp           │
+        ├─────────────────────┼─────────────────────┼─────────────────────┤
+        │ 2020-01-01 00:00:00 │ 2020-01-01 00:00:00 │ 2020-01-01 00:00:00 │
+        │ 2020-01-01 00:00:00 │ 2020-04-01 00:00:00 │ 2020-04-01 00:00:00 │
+        │ 2020-01-01 00:00:00 │ 2020-07-01 00:00:00 │ 2020-07-01 00:00:00 │
+        │ 2020-01-01 00:00:00 │ 2020-10-01 00:00:00 │ 2020-10-01 00:00:00 │
+        └─────────────────────┴─────────────────────┴─────────────────────┘
+
+        Return timestamp columns truncated to the start of the week and day.
+
+        >>> t.select(week=t.timestamp_col.truncate("W"), day=t.timestamp_col.truncate("D"))
+        ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ week                ┃ day                 ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+        │ timestamp           │ timestamp           │
+        ├─────────────────────┼─────────────────────┤
+        │ 2019-12-30 00:00:00 │ 2020-01-05 00:00:00 │
+        │ 2020-04-06 00:00:00 │ 2020-04-10 00:00:00 │
+        │ 2020-07-13 00:00:00 │ 2020-07-15 00:00:00 │
+        │ 2020-10-19 00:00:00 │ 2020-10-20 00:00:00 │
+        └─────────────────────┴─────────────────────┘
+
+        Return timestamp columns truncated to the start of the hour, minute, and
+        second.
+
+        >>> t.select(
+        ...     hour=t.timestamp_col.truncate("h"),
+        ...     minute=t.timestamp_col.truncate("m"),
+        ...     second=t.timestamp_col.truncate("s"),
+        ... )
+        ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ hour                ┃ minute              ┃ second              ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+        │ timestamp           │ timestamp           │ timestamp           │
+        ├─────────────────────┼─────────────────────┼─────────────────────┤
+        │ 2020-01-05 08:00:00 │ 2020-01-05 08:00:00 │ 2020-01-05 08:00:00 │
+        │ 2020-04-10 10:00:00 │ 2020-04-10 10:02:00 │ 2020-04-10 10:02:15 │
+        │ 2020-07-15 12:00:00 │ 2020-07-15 12:04:00 │ 2020-07-15 12:04:30 │
+        │ 2020-10-20 14:00:00 │ 2020-10-20 14:06:00 │ 2020-10-20 14:06:45 │
+        └─────────────────────┴─────────────────────┴─────────────────────┘
         """
         return ops.TimestampTruncate(self, unit).to_expr()
 
@@ -518,6 +944,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
     def bucket(
         self,
         interval: Any = None,
+        /,
         *,
         years: int | None = None,
         quarters: int | None = None,
@@ -729,7 +1156,9 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
     def delta(
         self,
         other: datetime.datetime | Value[dt.Timestamp],
-        part: Literal[
+        /,
+        *,
+        unit: Literal[
             "year",
             "quarter",
             "month",
@@ -756,7 +1185,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         ----------
         other
             A timestamp expression
-        part
+        unit
             The unit of time to compute the difference in
 
         Returns
@@ -770,8 +1199,10 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         >>> ibis.options.interactive = True
         >>> start = ibis.time("01:58:00")
         >>> end = ibis.time("23:59:59")
-        >>> end.delta(start, "hour")
-        22
+        >>> end.delta(start, unit="hour")
+        ┌────┐
+        │ 22 │
+        └────┘
         >>> data = '''tpep_pickup_datetime,tpep_dropoff_datetime
         ... 2016-02-01T00:23:56,2016-02-01T00:42:28
         ... 2016-02-01T00:12:14,2016-02-01T00:21:41
@@ -782,7 +1213,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         ...     nbytes = f.write(data)  # nbytes is unused
         >>> taxi = ibis.read_csv("/tmp/triptimes.csv")
         >>> ride_duration = taxi.tpep_dropoff_datetime.delta(
-        ...     taxi.tpep_pickup_datetime, "minute"
+        ...     taxi.tpep_pickup_datetime, unit="minute"
         ... ).name("ride_minutes")
         >>> ride_duration
         ┏━━━━━━━━━━━━━━┓
@@ -797,7 +1228,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, Value):
         │            5 │
         └──────────────┘
         """
-        return ops.TimestampDelta(left=self, right=other, part=part).to_expr()
+        return ops.TimestampDelta(left=self, right=other, part=unit).to_expr()
 
 
 @public
@@ -812,7 +1243,18 @@ class TimestampColumn(Column, TimestampValue):
 
 @public
 class IntervalValue(Value):
-    def to_unit(self, target_unit: str) -> IntervalValue:
+    """A time duration, eg 6 day or 2 hours or 457 seconds.
+
+    This is the result from operations that compute the difference
+    between two date or timestamp expressions, such as Timestamp.delta().
+
+    This can be combined with date or timestamp expressions
+    using addition and subtraction, eg
+    `ibis.timestamp("2020-01-01") + ibis.interval(days=1)`,
+    which results in a new timestamp expression.
+    """
+
+    def as_unit(self, target_unit: str, /) -> IntervalValue:
         """Convert this interval to units of `target_unit`."""
         # TODO(kszucs): should use a separate operation for unit conversion
         # which we can rewrite/simplify to integer multiplication/division
@@ -829,62 +1271,66 @@ class IntervalValue(Value):
             value = util.convert_unit(
                 self.cast(dt.int64), current_unit.short, target_unit.short
             )
-            return value.to_interval(target_unit)
+            return value.as_interval(target_unit)
+
+    @deprecated(as_of="10.0", instead="use as_unit() instead")
+    def to_unit(self, target_unit: str, /) -> IntervalValue:
+        return self.as_unit(target_unit)
 
     @property
     def years(self) -> ir.IntegerValue:
         """The number of years (IntegerValue)."""
-        return self.to_unit("Y")
+        return self.as_unit("Y")
 
     @property
     def quarters(self) -> ir.IntegerValue:
         """The number of quarters (IntegerValue)."""
-        return self.to_unit("Q")
+        return self.as_unit("Q")
 
     @property
     def months(self) -> ir.IntegerValue:
         """The number of months (IntegerValue)."""
-        return self.to_unit("M")
+        return self.as_unit("M")
 
     @property
     def weeks(self) -> ir.IntegerValue:
         """The number of weeks (IntegerValue)."""
-        return self.to_unit("W")
+        return self.as_unit("W")
 
     @property
     def days(self) -> ir.IntegerValue:
         """The number of days (IntegerValue)."""
-        return self.to_unit("D")
+        return self.as_unit("D")
 
     @property
     def hours(self) -> ir.IntegerValue:
         """The number of hours (IntegerValue)."""
-        return self.to_unit("h")
+        return self.as_unit("h")
 
     @property
     def minutes(self) -> ir.IntegerValue:
         """The number of minutes (IntegerValue)."""
-        return self.to_unit("m")
+        return self.as_unit("m")
 
     @property
     def seconds(self) -> ir.IntegerValue:
         """The number of seconds (IntegerValue)."""
-        return self.to_unit("s")
+        return self.as_unit("s")
 
     @property
     def milliseconds(self) -> ir.IntegerValue:
         """The number of milliseconds (IntegerValue)."""
-        return self.to_unit("ms")
+        return self.as_unit("ms")
 
     @property
     def microseconds(self) -> ir.IntegerValue:
         """The number of microseconds (IntegerValue)."""
-        return self.to_unit("us")
+        return self.as_unit("us")
 
     @property
     def nanoseconds(self) -> ir.IntegerValue:
         """The number of nanoseconds (IntegerValue)."""
-        return self.to_unit("ns")
+        return self.as_unit("ns")
 
     def __add__(
         self,
@@ -938,6 +1384,23 @@ class IntervalValue(Value):
         -------
         IntervalValue
             A negated interval value expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+
+        Negate a positive interval of one day to subtract a day from a specific date.
+        >>> ibis.date(2024, 11, 1) + ibis.interval(days=1).negate()
+        ┌────────────┐
+        │ 2024-10-31 │
+        └────────────┘
+
+        Negate a negative interval of one day to add a day to a specific date.
+        >>> ibis.date(2024, 11, 1) + ibis.interval(days=-1).negate()
+        ┌────────────┐
+        │ 2024-11-02 │
+        └────────────┘
         """
         return ops.Negate(self).to_expr()
 
@@ -956,7 +1419,7 @@ class IntervalColumn(Column, IntervalValue):
 
 @public
 class DayOfWeek:
-    """A namespace of methods for extracting day of week information."""
+    """A namespace of methods for days of the week, eg 'Monday' or 'Tuesday'."""
 
     def __init__(self, expr):
         self._expr = expr
@@ -972,15 +1435,81 @@ class DayOfWeek:
         -------
         IntegerValue
             The index of the day of the week.
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "date_col": [
+        ...             date(2024, 10, 27),
+        ...             date(2024, 10, 28),
+        ...             date(2024, 10, 29),
+        ...             date(2024, 10, 30),
+        ...             date(2024, 10, 31),
+        ...             date(2024, 11, 1),
+        ...             date(2024, 11, 2),
+        ...         ]
+        ...     },
+        ... )
+        >>> t.date_col.day_of_week.index()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ DayOfWeekIndex(date_col) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ int16                    │
+        ├──────────────────────────┤
+        │                        6 │
+        │                        0 │
+        │                        1 │
+        │                        2 │
+        │                        3 │
+        │                        4 │
+        │                        5 │
+        └──────────────────────────┘
         """
         return ops.DayOfWeekIndex(self._expr).to_expr()
 
     def full_name(self):
-        """Get the name of the day of the week.
+        """Get the name of the day of the week, eg 'Monday' or 'Tuesday'.
 
         Returns
         -------
         StringValue
             The name of the day of the week
+
+        Examples
+        --------
+        >>> from datetime import date
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "date_col": [
+        ...             date(2024, 10, 27),
+        ...             date(2024, 10, 28),
+        ...             date(2024, 10, 29),
+        ...             date(2024, 10, 30),
+        ...             date(2024, 10, 31),
+        ...             date(2024, 11, 1),
+        ...             date(2024, 11, 2),
+        ...         ]
+        ...     },
+        ... )
+        >>> t.date_col.day_of_week.full_name()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ DayOfWeekName(date_col) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                  │
+        ├─────────────────────────┤
+        │ Sunday                  │
+        │ Monday                  │
+        │ Tuesday                 │
+        │ Wednesday               │
+        │ Thursday                │
+        │ Friday                  │
+        │ Saturday                │
+        └─────────────────────────┘
         """
         return ops.DayOfWeekName(self._expr).to_expr()

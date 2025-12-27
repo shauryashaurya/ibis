@@ -1,3 +1,5 @@
+"""Generic value operations."""
+
 from __future__ import annotations
 
 import itertools
@@ -11,17 +13,17 @@ import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
-from ibis.common.deferred import Deferred  # noqa: TCH001
+from ibis.common.deferred import Deferred
 from ibis.common.grounds import Singleton
-from ibis.common.patterns import InstanceOf, Length  # noqa: TCH001
-from ibis.common.typing import VarTuple  # noqa: TCH001
+from ibis.common.patterns import InstanceOf, Length
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Scalar, Unary, Value
-from ibis.expr.operations.relations import Relation  # noqa: TCH001
+from ibis.expr.operations.relations import Relation  # noqa: TC001
 
 
 @public
 class RowID(Value):
-    """The row number (an autonumeric) of the returned result."""
+    """The row number of the returned result."""
 
     name = "rowid"
     table: Relation
@@ -36,7 +38,7 @@ class RowID(Value):
 
 @public
 class Cast(Value):
-    """Explicitly cast value to a specific data type."""
+    """Explicitly cast a value to a specific data type."""
 
     arg: Value
     to: dt.DataType
@@ -54,7 +56,7 @@ class Cast(Value):
 
 @public
 class TryCast(Value):
-    """Explicitly try cast value to a specific data type."""
+    """Try to cast a value to a specific data type."""
 
     arg: Value
     to: dt.DataType
@@ -68,40 +70,28 @@ class TryCast(Value):
 
 @public
 class TypeOf(Unary):
+    """Return the _database_ data type of the input expression."""
+
     dtype = dt.string
 
 
 @public
 class IsNull(Unary):
-    """Return true if values are null.
-
-    Returns
-    -------
-    ir.BooleanValue
-        Value expression indicating whether values are null
-
-    """
+    """Return true if values are null."""
 
     dtype = dt.boolean
 
 
 @public
 class NotNull(Unary):
-    """Returns true if values are not null.
-
-    Returns
-    -------
-    ir.BooleanValue
-        Value expression indicating whether values are not null
-
-    """
+    """Returns true if values are not null."""
 
     dtype = dt.boolean
 
 
 @public
 class NullIf(Value):
-    """Set values to NULL if they equal the null_if_expr."""
+    """Return NULL if an expression equals some specific value."""
 
     arg: Value
     null_if_expr: Value
@@ -112,6 +102,8 @@ class NullIf(Value):
 
 @public
 class Coalesce(Value):
+    """Return the first non-null expression from a tuple of expressions."""
+
     arg: Annotated[VarTuple[Value], Length(at_least=1)]
 
     shape = rlz.shape_like("arg")
@@ -120,6 +112,8 @@ class Coalesce(Value):
 
 @public
 class Greatest(Value):
+    """Return the largest value from a tuple of expressions."""
+
     arg: Annotated[VarTuple[Value], Length(at_least=1)]
 
     shape = rlz.shape_like("arg")
@@ -128,6 +122,8 @@ class Greatest(Value):
 
 @public
 class Least(Value):
+    """Return the smallest value from a tuple of expressions."""
+
     arg: Annotated[VarTuple[Value], Length(at_least=1)]
 
     shape = rlz.shape_like("arg")
@@ -139,6 +135,8 @@ T = TypeVar("T", bound=dt.DataType, covariant=True)
 
 @public
 class Literal(Scalar[T]):
+    """A constant value."""
+
     value: Annotated[Any, ~InstanceOf(Deferred)]
     dtype: T
 
@@ -180,6 +178,8 @@ class ScalarParameter(Scalar):
 
 @public
 class Constant(Scalar, Singleton):
+    """A function that produces a constant."""
+
     shape = ds.scalar
 
 
@@ -189,39 +189,55 @@ class Impure(Value):
 
 
 @public
-class TimestampNow(Constant):
+class TimestampNow(Impure):
+    """Return the current timestamp."""
+
     dtype = dt.timestamp
+    shape = ds.scalar
 
 
 @public
-class DateNow(Constant):
+class DateNow(Impure):
+    """Return the current date."""
+
     dtype = dt.date
+    shape = ds.scalar
 
 
 @public
 class RandomScalar(Impure):
+    """Return a random scalar between 0 and 1."""
+
     dtype = dt.float64
     shape = ds.scalar
 
 
 @public
 class RandomUUID(Impure):
+    """Return a random UUID."""
+
     dtype = dt.uuid
     shape = ds.scalar
 
 
 @public
 class E(Constant):
+    """The mathematical constant e."""
+
     dtype = dt.float64
 
 
 @public
 class Pi(Constant):
+    """The mathematical constant pi."""
+
     dtype = dt.float64
 
 
 @public
 class Hash(Value):
+    """Return the hash of a value."""
+
     arg: Value
 
     dtype = dt.int64
@@ -253,6 +269,8 @@ class HashBytes(Value):
 
 @public
 class HexDigest(Value):
+    """Return the hexadecimal digest of a value."""
+
     arg: Value[dt.String | dt.Binary]
     how: LiteralType[
         "md5",
@@ -270,16 +288,27 @@ class HexDigest(Value):
 # api.py
 @public
 class SimpleCase(Value):
+    """Simple case statement."""
+
     base: Value
-    cases: VarTuple[Value]
-    results: VarTuple[Value]
+    cases: Annotated[VarTuple[Value], Length(at_least=1)]
+    results: Annotated[VarTuple[Value], Length(at_least=1)]
     default: Value
 
-    shape = rlz.shape_like("base")
-
-    def __init__(self, cases, results, **kwargs):
+    def __init__(self, base, cases, results, default):
         assert len(cases) == len(results)
-        super().__init__(cases=cases, results=results, **kwargs)
+        for case in cases:
+            if not rlz.comparable(base, case):
+                raise TypeError(
+                    f"Base expression {rlz.arg_type_error_format(base)} and "
+                    f"case {rlz.arg_type_error_format(case)} are not comparable"
+                )
+        super().__init__(base=base, cases=cases, results=results, default=default)
+
+    @attribute
+    def shape(self):
+        exprs = [self.base, *self.cases, *self.results, self.default]
+        return rlz.highest_precedence_shape(exprs)
 
     @attribute
     def dtype(self):
@@ -289,20 +318,19 @@ class SimpleCase(Value):
 
 @public
 class SearchedCase(Value):
-    cases: VarTuple[Value[dt.Boolean]]
-    results: VarTuple[Value]
+    """Searched case statement."""
+
+    cases: Annotated[VarTuple[Value[dt.Boolean]], Length(at_least=1)]
+    results: Annotated[VarTuple[Value], Length(at_least=1)]
     default: Value
 
     def __init__(self, cases, results, default):
         assert len(cases) == len(results)
-        if default.dtype.is_null():
-            default = Cast(default, rlz.highest_precedence_dtype(results))
         super().__init__(cases=cases, results=results, default=default)
 
     @attribute
     def shape(self):
-        # TODO(kszucs): can be removed after making Sequence iterable
-        return rlz.highest_precedence_shape(self.cases)
+        return rlz.highest_precedence_shape((*self.cases, *self.results, self.default))
 
     @attribute
     def dtype(self):

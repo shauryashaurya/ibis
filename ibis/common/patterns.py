@@ -41,7 +41,7 @@ from ibis.common.typing import (
     get_bound_typevars,
     get_type_params,
 )
-from ibis.util import import_object, is_iterable, unalias_package
+from ibis.util import import_object, is_iterable, promote_list, unalias_package
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -221,6 +221,9 @@ class Pattern(Hashable):
 
     @abstractmethod
     def __eq__(self, other: Pattern) -> bool: ...
+
+    @abstractmethod
+    def __hash__(self) -> int: ...
 
     def __invert__(self) -> Not:
         """Syntax sugar for matching the inverse of the pattern."""
@@ -547,7 +550,7 @@ class Option(Slotted, Pattern):
 
     """
 
-    __slots__ = ("pattern", "default")
+    __slots__ = ("default", "pattern")
     pattern: Pattern
     default: AnyType
 
@@ -646,8 +649,16 @@ class InstanceOf(Slotted, Singleton, Pattern):
     __slots__ = ("type",)
     type: _ClassInfo
 
-    def __init__(self, typ):
+    def __init__(self, typ: type | tuple[type, ...]) -> None:
         super().__init__(type=typ)
+
+    def __eq__(self, other: Pattern) -> bool:
+        return type(other) is type(self) and frozenset(
+            promote_list(self.type)
+        ) == frozenset(promote_list(other.type))
+
+    def __hash__(self) -> int:
+        return super().__hash__()
 
     def describe(self, plural=False):
         return _describe_type(self.type, plural=plural)
@@ -690,7 +701,7 @@ class GenericInstanceOf(Slotted, Pattern):
 
     """
 
-    __slots__ = ("type", "origin", "fields")
+    __slots__ = ("fields", "origin", "type")
     origin: type
     fields: FrozenDict[str, Pattern]
 
@@ -736,7 +747,7 @@ class LazyInstanceOf(Slotted, Pattern):
     """
 
     __fields__ = ("qualname", "package")
-    __slots__ = ("qualname", "package", "loaded")
+    __slots__ = ("loaded", "package", "qualname")
     qualname: str
     package: str
     loaded: type
@@ -773,7 +784,7 @@ class CoercedTo(Slotted, Pattern, Generic[T_co]):
 
     """
 
-    __slots__ = ("type", "func")
+    __slots__ = ("func", "type")
     type: T_co
 
     def __init__(self, type):
@@ -843,7 +854,7 @@ class GenericCoercedTo(Slotted, Pattern):
 
     """
 
-    __slots__ = ("origin", "params", "checker")
+    __slots__ = ("checker", "origin", "params")
     origin: type
     params: FrozenDict[str, type]
     checker: GenericInstanceOf
@@ -915,9 +926,16 @@ class AnyOf(Slotted, Pattern):
     __slots__ = ("patterns",)
     patterns: tuple[Pattern, ...]
 
-    def __init__(self, *pats):
-        patterns = tuple(map(pattern, pats))
-        super().__init__(patterns=patterns)
+    def __init__(self, *patterns: Pattern) -> None:
+        super().__init__(patterns=tuple(map(pattern, patterns)))
+
+    def __eq__(self, other: Pattern) -> bool:
+        return type(self) is type(other) and frozenset(self.patterns) == frozenset(
+            other.patterns
+        )
+
+    def __hash__(self) -> int:
+        return super().__hash__()
 
     def describe(self, plural=False):
         *rest, last = self.patterns
@@ -1162,7 +1180,7 @@ class GenericSequenceOf(Slotted, Pattern):
 
     """
 
-    __slots__ = ("item", "type", "length")
+    __slots__ = ("item", "length", "type")
     item: Pattern
     type: Pattern
     length: Length
@@ -1216,7 +1234,7 @@ class GenericMappingOf(Slotted, Pattern):
 
     """
 
-    __slots__ = ("key", "value", "type")
+    __slots__ = ("key", "type", "value")
     key: Pattern
     value: Pattern
     type: Pattern
@@ -1283,7 +1301,7 @@ class Object(Slotted, Pattern):
 
     """
 
-    __slots__ = ("type", "args", "kwargs")
+    __slots__ = ("args", "kwargs", "type")
     type: Pattern
     args: tuple[Pattern, ...]
     kwargs: FrozenDict[str, Pattern]
@@ -1339,7 +1357,7 @@ class Object(Slotted, Pattern):
 
 
 class Node(Slotted, Pattern):
-    __slots__ = ("type", "each_arg")
+    __slots__ = ("each_arg", "type")
     type: Pattern
 
     def __init__(self, type, each_arg):
@@ -1406,7 +1424,7 @@ class CallableWith(Slotted, Pattern):
 
 
 class SomeOf(Slotted, Pattern):
-    __slots__ = ("pattern", "delimiter")
+    __slots__ = ("delimiter", "pattern")
 
     @classmethod
     def __create__(cls, *args, **kwargs):
@@ -1430,7 +1448,7 @@ class SomeChunksOf(Slotted, Pattern):
     Designed to be used inside a `PatternList` pattern with the `*` syntax.
     """
 
-    __slots__ = ("pattern", "delimiter")
+    __slots__ = ("delimiter", "pattern")
 
     def __init__(self, *args, **kwargs):
         pattern = GenericSequenceOf(PatternList(args), **kwargs)

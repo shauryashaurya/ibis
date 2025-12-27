@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 from public import public
 
-import ibis
 import ibis.expr.operations as ops
 from ibis import util
 from ibis.common.deferred import Deferred
@@ -13,11 +12,11 @@ from ibis.common.egraph import DisjointSet
 from ibis.common.exceptions import (
     ExpressionError,
     IbisInputError,
+    IbisTypeError,
     InputTypeError,
     IntegrityError,
 )
-from ibis.expr.analysis import flatten_predicates
-from ibis.expr.rewrites import peel_join_field
+from ibis.expr.rewrites import flatten_predicates, peel_join_field
 from ibis.expr.types.generic import Value
 from ibis.expr.types.relations import (
     DerefMap,
@@ -158,7 +157,11 @@ def prepare_predicates(
         The comparison operation to construct if the input is a pair of
         expression-like objects
     """
-    reverse = {ops.Field(chain, k): v for k, v in chain.values.items()}
+    reverse = {
+        ops.Field(chain, k): v
+        for k, v in chain.values.items()
+        if isinstance(v, ops.Field)
+    }
     deref_right = DerefMap.from_targets(right)
     deref_left = DerefMap.from_targets(chain.tables, extra=reverse)
     deref_both = DerefMap.from_targets([*chain.tables, right], extra=reverse)
@@ -167,7 +170,7 @@ def prepare_predicates(
     for pred in util.promote_list(predicates):
         if isinstance(pred, (Value, Deferred, bool)):
             for bound in bind(left, pred):
-                yield deref_both.dereference(bound.op())
+                yield from deref_both.dereference(bound.op())
         else:
             if isinstance(pred, tuple):
                 if len(pred) != 2:
@@ -176,15 +179,12 @@ def prepare_predicates(
             else:
                 lk = rk = pred
 
-            # bind the predicates to the join chain
-            (left_value,) = bind(left, lk)
-            (right_value,) = bind(right, rk)
-
-            # dereference the left value to one of the relations in the join chain
-            left_value = deref_left.dereference(left_value.op())
-            right_value = deref_right.dereference(right_value.op())
-
-            yield comparison(left_value, right_value)
+            for lhs, rhs in zip(bind(left, lk), bind(right, rk)):
+                yield from map(
+                    comparison,
+                    deref_left.dereference(lhs.op()),
+                    deref_right.dereference(rhs.op()),
+                )
 
 
 def finished(method):
@@ -228,21 +228,16 @@ class Join(Table):
     def join(
         self,
         right,
-        predicates: Any,
-        how: JoinKind = "inner",
+        /,
+        predicates: Any = (),
         *,
+        how: JoinKind = "inner",
         lname: str = "",
         rname: str = "{name}_right",
     ):
-        import pandas as pd
-        import pyarrow as pa
-
-        # TODO(kszucs): factor out to a helper function
-        if isinstance(right, (pd.DataFrame, pa.Table)):
-            right = ibis.memtable(right)
-        elif not isinstance(right, Table):
-            raise TypeError(
-                f"right operand must be a Table, got {type(right).__name__}"
+        if not isinstance(right, Table):
+            raise IbisTypeError(
+                f"Right side of join must be an Ibis table, got {type(right)}."
             )
 
         if how == "left_semi":
@@ -258,7 +253,7 @@ class Join(Table):
         # bind and dereference the predicates
         preds = prepare_predicates(chain, right, predicates)
         preds = flatten_predicates(preds)
-        if not preds and how != "cross":
+        if not preds and how not in {"cross", "positional"}:
             # if there are no predicates, default to every row matching unless
             # the join is a cross join, because a cross join already has this
             # behavior
@@ -289,10 +284,11 @@ class Join(Table):
     def asof_join(
         self: Table,
         right: Table,
+        /,
         on,
         predicates=(),
-        tolerance=None,
         *,
+        tolerance=None,
         lname: str = "",
         rname: str = "{name}_right",
     ):
@@ -335,8 +331,9 @@ class Join(Table):
             result = self.left_join(
                 filtered, predicates=[left_on == right_on] + predicates
             )
-            values = {**self.op().values, **filtered.op().values}
-            return result.select(values)
+            values = {**filtered.op().values, **self.op().values}
+
+            return result.select(**values)
 
         chain = self.op()
         right = right.op()
@@ -369,21 +366,22 @@ class Join(Table):
     def cross_join(
         self: Table,
         right: Table,
+        /,
         *rest: Table,
         lname: str = "",
         rname: str = "{name}_right",
     ):
         left = self.join(right, how="cross", predicates=(), lname=lname, rname=rname)
-        for right in rest:
+        for table in rest:
             left = left.join(
-                right, how="cross", predicates=(), lname=lname, rname=rname
+                table, how="cross", predicates=(), lname=lname, rname=rname
             )
         return left
 
     @functools.wraps(Table.select)
     def select(self, *args, **kwargs):
         chain = self.op()
-        values = bind(self, (args, kwargs))
+        values = self.bind(*args, **kwargs)
         values = unwrap_aliases(values)
 
         links = [link.table for link in chain.rest if link.how not in ("semi", "anti")]
@@ -394,10 +392,20 @@ class Join(Table):
         values = {
             k: v.replace(peel_join_field, filter=ops.Value) for k, v in values.items()
         }
-        values = {k: derefmap.dereference(v) for k, v in values.items()}
+        new_values = {}
 
-        node = chain.copy(values=values)
+        for k, v in values.items():
+            # ensure that there's only a single thing returned from dereferencing
+            (new_value,) = derefmap.dereference(v)
+            new_values[k] = new_value
+
+        node = chain.copy(values=new_values)
         return Table(node)
+
+    @property
+    @functools.wraps(Table.columns)
+    def columns(self):
+        return self._finish().columns
 
     aggregate = finished(Table.aggregate)
     alias = finished(Table.alias)
@@ -409,7 +417,7 @@ class Join(Table):
     drop = finished(Table.drop)
     dropna = finished(Table.dropna)
     execute = finished(Table.execute)
-    fillna = finished(Table.fillna)
+    fill_null = finished(Table.fill_null)
     filter = finished(Table.filter)
     group_by = finished(Table.group_by)
     intersect = finished(Table.intersect)
@@ -418,6 +426,7 @@ class Join(Table):
     nunique = finished(Table.nunique)
     order_by = finished(Table.order_by)
     sample = finished(Table.sample)
+    schema = finished(Table.schema)
     sql = finished(Table.sql)
     unbind = finished(Table.unbind)
     union = finished(Table.union)

@@ -6,35 +6,70 @@ import contextlib
 from functools import cached_property
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_plus, urlparse
 
 import sqlglot as sg
 import sqlglot.expressions as sge
 import trino
+from trino.auth import BasicAuthentication
 
 import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as com
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
-from ibis.backends import CanCreateDatabase, CanCreateSchema, CanListCatalog, NoUrl
+from ibis.backends import (
+    CanCreateDatabase,
+    CanListCatalog,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    NoExampleLoader,
+)
 from ibis.backends.sql import SQLBackend
-from ibis.backends.sql.compiler import C
-from ibis.backends.trino.compiler import TrinoCompiler
+from ibis.backends.sql.compilers.base import AlterTable, C, RenameTable
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+    from urllib.parse import ParseResult
 
     import pandas as pd
+    import polars as pl
     import pyarrow as pa
 
     import ibis.expr.operations as ops
 
 
-class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, NoUrl):
+class Backend(
+    SQLBackend,
+    CanListCatalog,
+    CanCreateDatabase,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    NoExampleLoader,
+):
     name = "trino"
-    compiler = TrinoCompiler()
+    compiler = sc.trino.compiler
     supports_create_or_replace = False
-    supports_temporary_tables = False
+
+    def _from_url(self, url: ParseResult, **kwarg_overrides):
+        kwargs = {}
+        database, *schema = url.path.strip("/").split("/", 1)
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["auth"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if database:
+            kwargs["database"] = database
+        if url.port:
+            kwargs["port"] = url.port
+        if schema:
+            kwargs["schema"] = schema[0]
+        kwargs.update(kwarg_overrides)
+        self._convert_kwargs(kwargs)
+        return self.connect(**kwargs)
 
     def raw_sql(self, query: str | sg.Expression) -> Any:
         """Execute a raw SQL query."""
@@ -122,20 +157,18 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             Ibis schema
 
         """
-        conditions = [sg.column("table_name").eq(sge.convert(table_name))]
-
-        if database is not None:
-            conditions.append(sg.column("table_schema").eq(sge.convert(database)))
-
         query = (
             sg.select(
-                "column_name",
-                "data_type",
-                sg.column("is_nullable").eq(sge.convert("YES")).as_("nullable"),
+                C.column_name,
+                C.data_type,
+                C.is_nullable.eq(sge.convert("YES")).as_("nullable"),
             )
             .from_(sg.table("columns", db="information_schema", catalog=catalog))
-            .where(sg.and_(*conditions))
-            .order_by("ordinal_position")
+            .where(
+                C.table_name.eq(sge.convert(table_name)),
+                C.table_schema.eq(sge.convert(database or self.current_database)),
+            )
+            .order_by(C.ordinal_position)
         )
 
         with self._safe_raw_sql(query) as cur:
@@ -143,11 +176,13 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
 
         if not meta:
             fqn = sg.table(table_name, db=database, catalog=catalog).sql(self.name)
-            raise com.IbisError(f"Table not found: {fqn}")
+            raise com.TableNotFound(fqn)
+
+        type_mapper = self.compiler.type_mapper
 
         return sch.Schema(
             {
-                name: self.compiler.type_mapper.from_string(typ, nullable=nullable)
+                name: type_mapper.from_string(typ, nullable=nullable)
                 for name, typ, nullable in meta
             }
         )
@@ -170,14 +205,14 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             [(schema,)] = cur.fetchall()
         return schema
 
-    def list_catalogs(self, like: str | None = None) -> list[str]:
+    def list_catalogs(self, *, like: str | None = None) -> list[str]:
         query = "SHOW CATALOGS"
         with self._safe_raw_sql(query) as cur:
             catalogs = cur.fetchall()
         return self._filter_with_like(list(map(itemgetter(0), catalogs)), like=like)
 
     def list_databases(
-        self, like: str | None = None, catalog: str | None = None
+        self, *, like: str | None = None, catalog: str | None = None
     ) -> list[str]:
         query = "SHOW SCHEMAS"
 
@@ -192,34 +227,13 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
         return self._filter_with_like(list(map(itemgetter(0), databases)), like)
 
     def list_tables(
-        self,
-        like: str | None = None,
-        database: tuple[str, str] | str | None = None,
-        schema: str | None = None,
+        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
     ) -> list[str]:
-        """List the tables in the database.
-
-        Parameters
-        ----------
-        like
-            A pattern to use for listing tables.
-        database
-            The database location to perform the list against.
-
-            By default uses the current `database` (`self.current_database`) and
-            `catalog` (`self.current_catalog`).
-
-            To specify a table in a separate catalog, you can pass in the
-            catalog and database as a string `"catalog.database"`, or as a tuple of
-            strings `("catalog", "database")`.
-        schema
-            [deprecated] The schema inside `database` to perform the list against.
-        """
-        table_loc = self._warn_and_create_table_loc(database, schema)
+        table_loc = self._to_sqlglot_table(database)
 
         query = "SHOW TABLES"
 
-        if table_loc is not None:
+        if table_loc.catalog or table_loc.db:
             table_loc = table_loc.sql(dialect=self.dialect)
             query += f" IN {table_loc}"
 
@@ -231,7 +245,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
     def do_connect(
         self,
         user: str = "user",
-        password: str | None = None,
+        auth: str | None = None,
         host: str = "localhost",
         port: int = 8080,
         database: str | None = None,
@@ -246,8 +260,8 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
         ----------
         user
             Username to connect with
-        password
-            Password to connect with
+        auth
+            Authentication method or password to use for the connection.
         host
             Hostname of the Trino server
         port
@@ -275,25 +289,46 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
 
         Connect using a URL
 
-        >>> con = ibis.connect(f"trino://user:password@host:port/{catalog}/{schema}")
+        >>> con = ibis.connect(f"trino://user@localhost:8080/{catalog}/{schema}")
 
         Connect using keyword arguments
 
         >>> con = ibis.trino.connect(database=catalog, schema=schema)
         >>> con = ibis.trino.connect(database=catalog, schema=schema, source="my-app")
-
         """
+        if (
+            isinstance(auth, str)
+            and (scheme := urlparse(host).scheme)
+            and scheme != "http"
+        ):
+            auth = BasicAuthentication(user, auth)
+
         self.con = trino.dbapi.connect(
             user=user,
-            auth=password,
             host=host,
             port=port,
             catalog=database,
             schema=schema,
             source=source or "ibis",
             timezone=timezone,
+            auth=auth,
             **kwargs,
         )
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: trino.dbapi.Connection, /) -> Backend:
+        """Create an Ibis client from an existing connection to a Trino database.
+
+        Parameters
+        ----------
+        con
+            An existing connection to a Trino database.
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        return new_backend
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
         name = util.gen_name(f"{self.name}_metadata")
@@ -317,7 +352,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
         )
 
     def create_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         with self._safe_raw_sql(
             sge.Create(
@@ -329,7 +364,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             pass
 
     def drop_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         with self._safe_raw_sql(
             sge.Drop(
@@ -343,9 +378,15 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | pa.Table | ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema: sch.Schema | None = None,
+        schema: sch.SchemaLike | None = None,
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
@@ -365,7 +406,12 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             The schema of the table to create; optional, but one of `obj` or
             `schema` must be specified
         database
-            Not yet implemented.
+            The database to insert the table into.
+            If not provided, the current database is used.
+            You can provide a single database name, like `"mydb"`. For
+            multi-level hierarchies, you can pass in a dotted string path like
+            `"catalog.database"` or a tuple of strings like `("catalog",
+            "database")`.
         temp
             This parameter is not yet supported in the Trino backend, because
             Trino doesn't implement temporary tables
@@ -376,37 +422,33 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             Add a comment to the table
         properties
             Table properties to set on creation
-
         """
         if obj is None and schema is None:
             raise com.IbisError("One of the `schema` or `obj` parameter is required")
+        if schema is not None:
+            schema = ibis.schema(schema)
 
         if temp:
             raise NotImplementedError(
                 "Temporary tables are not supported in the Trino backend"
             )
 
+        table_loc = self._to_sqlglot_table(database)
+        catalog, db = self._to_catalog_db_tuple(table_loc)
+
         quoted = self.compiler.quoted
-        orig_table_ref = sg.to_identifier(name, quoted=quoted)
+        orig_table_ref = sg.table(name, catalog=catalog, db=db, quoted=quoted)
 
         if overwrite:
             name = util.gen_name(f"{self.name}_overwrite")
 
-        table_ref = sg.table(name, catalog=database, quoted=quoted)
+        table_ref = sg.table(name, catalog=catalog, db=db, quoted=quoted)
 
         if schema is not None and obj is None:
-            column_defs = [
-                sg.exp.ColumnDef(
-                    this=sg.to_identifier(name, quoted=self.compiler.quoted),
-                    kind=self.compiler.type_mapper.from_ibis(typ),
-                    # TODO(cpcloud): not null constraints are unreliable in
-                    # trino, so we ignore them
-                    # https://github.com/trinodb/trino/issues/2923
-                    constraints=None,
-                )
-                for name, typ in schema.items()
-            ]
-            target = sge.Schema(this=table_ref, expressions=column_defs)
+            target = sge.Schema(
+                this=table_ref,
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
+            )
         else:
             target = table_ref
 
@@ -422,14 +464,10 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
             property_list.append(sge.SchemaCommentProperty(this=sge.convert(comment)))
 
         if obj is not None:
-            import pandas as pd
-            import pyarrow as pa
-            import pyarrow_hotfix  # noqa: F401
-
-            if isinstance(obj, (pd.DataFrame, pa.Table)):
-                table = ibis.memtable(obj, schema=schema)
-            else:
+            if isinstance(obj, ir.Table):
                 table = obj
+            else:
+                table = ibis.memtable(obj, schema=schema)
 
             self._run_pre_execute_hooks(table)
 
@@ -442,7 +480,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
                     )
                     for name, typ in (schema or table.schema()).items()
                 )
-            ).from_(self._to_sqlglot(table).subquery())
+            ).from_(self.compiler.to_sqlglot(table).subquery())
         else:
             select = None
 
@@ -466,14 +504,14 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
 
                 # rename the new table to the original table name
                 cur.execute(
-                    sge.AlterTable(
+                    AlterTable(
                         this=table_ref,
                         exists=True,
-                        actions=[sge.RenameTable(this=orig_table_ref, exists=True)],
+                        actions=[RenameTable(this=orig_table_ref, exists=True)],
                     ).sql(self.name)
                 )
 
-        return self.table(orig_table_ref.name)
+        return self.table(orig_table_ref.name, database=(catalog, db))
 
     def _fetch_from_cursor(self, cursor, schema: sch.Schema) -> pd.DataFrame:
         import pandas as pd
@@ -496,40 +534,26 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, CanCreateSchema, No
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         schema = op.schema
-        if null_columns := [col for col, dtype in schema.items() if dtype.is_null()]:
+        if null_columns := schema.null_fields:
             raise com.IbisTypeError(
                 "Trino cannot yet reliably handle `null` typed columns; "
                 f"got null typed columns: {null_columns}"
             )
 
-        # only register if we haven't already done so
-        if (name := op.name) not in self.list_tables():
-            quoted = self.compiler.quoted
-            column_defs = [
-                sg.exp.ColumnDef(
-                    this=sg.to_identifier(colname, quoted=quoted),
-                    kind=self.compiler.type_mapper.from_ibis(typ),
-                    # we don't support `NOT NULL` constraints in trino because
-                    # because each trino connector differs in whether it
-                    # supports nullability constraints, and whether the
-                    # connector supports it isn't visible to ibis via a
-                    # metadata query
-                )
-                for colname, typ in schema.items()
-            ]
+        name = op.name
+        quoted = self.compiler.quoted
 
-            create_stmt = sg.exp.Create(
-                kind="TABLE",
-                this=sg.exp.Schema(
-                    this=sg.to_identifier(name, quoted=quoted), expressions=column_defs
-                ),
-            ).sql(self.name, pretty=True)
+        create_stmt = sg.exp.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
+            ),
+        ).sql(self.name)
 
-            data = op.data.to_frame().itertuples(index=False)
-            specs = ", ".join("?" * len(schema))
-            table = sg.table(name, quoted=quoted).sql(self.name)
-            insert_stmt = f"INSERT INTO {table} VALUES ({specs})"
-            with self.begin() as cur:
-                cur.execute(create_stmt)
-                for row in data:
-                    cur.execute(insert_stmt, row)
+        data = op.data.to_frame().itertuples(index=False)
+        insert_stmt = self._build_insert_template(name, schema=schema)
+        with self.begin() as cur:
+            cur.execute(create_stmt)
+            for row in data:
+                cur.execute(insert_stmt, row)

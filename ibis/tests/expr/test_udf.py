@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import pytest
 
 import ibis
@@ -33,7 +35,7 @@ def table():
 )
 def test_vectorized_udf_operations(table, klass, output_type):
     udf = klass(
-        func=lambda a, b, c: a,
+        func=lambda a, *_: a,
         func_args=[table.a, table.b, table.c],
         input_type=[dt.int8(), dt.string(), dt.boolean()],
         return_type=dt.int8(),
@@ -58,7 +60,7 @@ def test_vectorized_udf_operations(table, klass, output_type):
     with pytest.raises(ValidationError):
         # scalar type instead of column type
         klass(
-            func=lambda a, b, c: a,
+            func=lambda a, *_: a,
             func_args=[ibis.literal(1), table.b, table.c],
             input_type=[dt.int8(), dt.string(), dt.boolean()],
             return_type=dt.int8(),
@@ -67,7 +69,7 @@ def test_vectorized_udf_operations(table, klass, output_type):
     with pytest.raises(ValidationError):
         # wrong input type
         klass(
-            func=lambda a, b, c: a,
+            func=lambda a, *_: a,
             func_args=[ibis.literal(1), table.b, table.c],
             input_type="int8",
             return_type=dt.int8(),
@@ -76,7 +78,7 @@ def test_vectorized_udf_operations(table, klass, output_type):
     with pytest.raises(ValidationError):
         # wrong return type
         klass(
-            func=lambda a, b, c: a,
+            func=lambda a, *_: a,
             func_args=[ibis.literal(1), table.b, table.c],
             input_type=[dt.int8(), dt.string(), dt.boolean()],
             return_type=table,
@@ -152,3 +154,22 @@ def test_builtin_scalar_noargs():
     expr = version()
     assert expr.type().is_string()
     assert type(expr.op().shape) is ibis.expr.datashape.Scalar
+
+
+def test_None_type_hint(table):
+    @ibis.udf.scalar.python
+    def claims_to_return_nullable(x: Optional[int]) -> Optional[int]: ...
+
+    expr = claims_to_return_nullable(table.a)
+    assert isinstance(expr, ir.IntegerColumn)
+    assert expr.type().nullable
+
+    # Even if the signature is annotated with a non-nullable type,
+    # we still interpret the output as nullable, consistent with
+    # how `ibis.dtype(int)` results in a nullable type.
+    @ibis.udf.scalar.python
+    def claims_to_return_nonnullable(x: int) -> int: ...
+
+    expr = claims_to_return_nonnullable(table.a)
+    assert isinstance(expr, ir.IntegerColumn)
+    assert expr.type().nullable

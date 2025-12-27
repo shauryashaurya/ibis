@@ -2,33 +2,41 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import re
 import warnings
 from functools import cached_property
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import unquote_plus
 
 import oracledb
 import sqlglot as sg
 import sqlglot.expressions as sge
 
 import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as exc
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
-from ibis.backends import CanListDatabase, CanListSchema
-from ibis.backends.oracle.compiler import OracleCompiler
-from ibis.backends.sql import STAR, SQLBackend
-from ibis.backends.sql.compiler import C
+from ibis.backends import (
+    CanListDatabase,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    PyArrowExampleLoader,
+)
+from ibis.backends.sql import SQLBackend
+from ibis.backends.sql.compilers.base import STAR, C
 
 if TYPE_CHECKING:
+    from urllib.parse import ParseResult
+
     import pandas as pd
-    import pyrrow as pa
+    import polars as pl
+    import pyarrow as pa
 
 
 def metadata_row_to_type(
@@ -65,16 +73,23 @@ def metadata_row_to_type(
         and precision is not None
         and (scale is not None and scale > 0)
     ):
-        typ = dt.Decimal(precision=precision, scale=scale, nullable=nullable)
+        typ = dt.Decimal(precision=int(precision), scale=int(scale), nullable=nullable)
 
     else:
         typ = type_mapper.from_string(type_string, nullable=nullable)
     return typ
 
 
-class Backend(SQLBackend, CanListDatabase, CanListSchema):
+class Backend(
+    SQLBackend,
+    CanListDatabase,
+    HasCurrentDatabase,
+    HasCurrentCatalog,
+    PyArrowExampleLoader,
+):
     name = "oracle"
-    compiler = OracleCompiler()
+    compiler = sc.oracle.compiler
+    supports_temporary_tables = True
 
     @cached_property
     def version(self):
@@ -118,6 +133,33 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
             An Oracle Data Source Name.  If provided, overrides all other
             connection arguments except username and password.
 
+        Examples
+        --------
+        >>> import os
+        >>> import ibis
+        >>> host = os.environ.get("IBIS_TEST_ORACLE_HOST", "localhost")
+        >>> user = os.environ.get("IBIS_TEST_ORACLE_USER", "ibis")
+        >>> password = os.environ.get("IBIS_TEST_ORACLE_PASSWORD", "ibis")
+        >>> database = os.environ.get("IBIS_TEST_ORACLE_DATABASE", "IBIS_TESTING")
+        >>> con = ibis.oracle.connect(database=database, host=host, user=user, password=password)
+        >>> con.list_tables()  # doctest: +ELLIPSIS
+        [...]
+        >>> t = con.table("functional_alltypes")
+        >>> t
+        DatabaseTable: functional_alltypes
+          id              int64
+          bool_col        int64
+          tinyint_col     int64
+          smallint_col    int64
+          int_col         int64
+          bigint_col      int64
+          float_col       float64
+          double_col      float64
+          date_string_col string
+          string_col      string
+          timestamp_col   timestamp(3)
+          year            int64
+          month           int64
         """
         # SID: unique name of an INSTANCE running an oracle process (a single, identifiable machine)
         # service name: an ALIAS to one (or many) individual instances that can
@@ -149,6 +191,25 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
         # https://python-oracledb.readthedocs.io/en/latest/user_guide/appendix_b.html#statement-caching-in-thin-and-thick-modes
         self.con = oracledb.connect(dsn, user=user, password=password, stmtcachesize=0)
 
+        self._post_connect()
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: oracledb.Connection, /) -> Backend:
+        """Create an Ibis client from an existing connection to an Oracle database.
+
+        Parameters
+        ----------
+        con
+            An existing connection to an Oracle database.
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        new_backend._post_connect()
+        return new_backend
+
+    def _post_connect(self) -> None:
         # turn on autocommit
         # TODO: it would be great if this worked but it doesn't seem to do the trick
         # I had to hack in the commit lines to the compiler
@@ -157,12 +218,33 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
         # Set to ensure decimals come back as decimals
         oracledb.defaults.fetch_decimals = True
 
-    def _from_url(self, url: str, **kwargs):
-        return self.do_connect(user=url.username, password=url.password, dsn=url.host)
+    def _from_url(self, url: ParseResult, **kwarg_overrides):
+        kwargs = {}
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["password"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if database := url.path.removeprefix("/"):
+            kwargs["database"] = database
+        if url.port:
+            kwargs["port"] = url.port
+        kwargs.update(kwarg_overrides)
+        self._convert_kwargs(kwargs)
+        return self.connect(**kwargs)
+
+    @property
+    def current_catalog(self) -> str:
+        with self._safe_raw_sql(sg.select(STAR).from_("global_name")) as cur:
+            [(catalog,)] = cur.fetchall()
+        return catalog
 
     @property
     def current_database(self) -> str:
-        with self._safe_raw_sql(sg.select(STAR).from_("global_name")) as cur:
+        # databases correspond to users, other than that there's
+        # no notion of a database inside a catalog for oracle
+        with self._safe_raw_sql(sg.select("user").from_("dual")) as cur:
             [(database,)] = cur.fetchall()
         return database
 
@@ -203,82 +285,44 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
             return cursor
 
     def list_tables(
-        self,
-        like: str | None = None,
-        schema: str | None = None,
-        database: tuple[str, str] | str | None = None,
+        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
     ) -> list[str]:
-        """List the tables in the database.
-
-        Parameters
-        ----------
-        like
-            A pattern to use for listing tables.
-        schema
-            [deprecated] The schema to perform the list against.
-        database
-            Database to list tables from. Default behavior is to show tables in
-            the current database.
-
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
-
-        """
-        if schema is not None and database is not None:
-            raise exc.IbisInputError(
-                "Using both the `schema` and `database` kwargs is not supported. "
-                "`schema` is deprecated and will be removed in Ibis 10.0"
-                "\nUse the `database` kwarg with one of the following patterns:"
-                '\ndatabase="database"'
-                '\ndatabase=("catalog", "database")'
-                '\ndatabase="catalog.database"',
-            )
-        if schema is not None:
-            # TODO: remove _warn_schema when the schema kwarg is removed
-            self._warn_schema()
-            table_loc = schema
-        elif database is not None:
+        if database is not None:
             table_loc = database
         else:
             table_loc = self.con.username.upper()
+
         table_loc = self._to_sqlglot_table(table_loc)
+
+        dialect = self.dialect
 
         # Deeply frustrating here where if we call `convert` on `table_loc`,
         # which is a sg.exp.Table, the quotes are rendered as double-quotes
-        # which are invalid. With no `convert`, the same thing happens.
-        # If we call `convert` on the stringified SQL output, they get reparsed
-        # as literal strings and those are rendered correctly.
-        conditions = C.owner.eq(sge.convert(table_loc.sql(self.name)))
+        # which are invalid. So, we unquote the database name here.
+        def unquote(node):
+            if isinstance(node, sg.exp.Identifier):
+                return sg.to_identifier(node.name, quoted=False)
+            return node
+
+        conditions = C.owner.eq(sge.convert(table_loc.transform(unquote).sql(dialect)))
 
         tables = (
-            sg.select("table_name", "owner")
-            .from_(sg.table("all_tables"))
+            sg.select(C.table_name)
+            .from_("all_tables")
             .distinct()
             .where(conditions)
+            .union(
+                sg.select(C.view_name).from_("all_views").distinct().where(conditions)
+            )
         )
-        views = (
-            sg.select("view_name", "owner")
-            .from_(sg.table("all_views"))
-            .distinct()
-            .where(conditions)
-        )
-        sql = tables.union(views).sql(self.name)
 
-        with self._safe_raw_sql(sql) as cur:
+        with self._safe_raw_sql(tables) as cur:
             out = cur.fetchall()
 
         return self._filter_with_like(map(itemgetter(0), out), like)
 
     def list_databases(
-        self, like: str | None = None, catalog: str | None = None
+        self, *, like: str | None = None, catalog: str | None = None
     ) -> list[str]:
         if catalog is not None:
             raise exc.UnsupportedArgumentError(
@@ -316,7 +360,7 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
             results = cur.fetchall()
 
         if not results:
-            raise exc.IbisError(f"Table not found: {name!r}")
+            raise exc.TableNotFound(name)
 
         type_mapper = self.compiler.type_mapper
         fields = {
@@ -335,9 +379,15 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | pa.Table | ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema: ibis.Schema | None = None,
+        schema: sch.SchemaLike | None = None,
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
@@ -362,10 +412,11 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
         overwrite
             If `True`, replace the table if it already exists, otherwise fail
             if the table exists
-
         """
         if obj is None and schema is None:
             raise ValueError("Either `obj` or `schema` must be specified")
+        if schema is not None:
+            schema = ibis.schema(schema)
 
         properties = []
 
@@ -380,22 +431,9 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
 
             self._run_pre_execute_hooks(table)
 
-            query = self._to_sqlglot(table)
+            query = self.compiler.to_sqlglot(table)
         else:
             query = None
-
-        column_defs = [
-            sge.ColumnDef(
-                this=sg.to_identifier(colname, quoted=self.compiler.quoted),
-                kind=self.compiler.type_mapper.from_ibis(typ),
-                constraints=(
-                    None
-                    if typ.nullable
-                    else [sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())]
-                ),
-            )
-            for colname, typ in (schema or table.schema()).items()
-        ]
 
         if overwrite:
             temp_name = util.gen_name(f"{self.name}_table")
@@ -403,7 +441,10 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
             temp_name = name
 
         initial_table = sg.table(temp_name, db=database, quoted=self.compiler.quoted)
-        target = sge.Schema(this=initial_table, expressions=column_defs)
+        target = sge.Schema(
+            this=initial_table,
+            expressions=(schema or table.schema()).to_sqlglot_column_defs(self.dialect),
+        )
 
         create_stmt = sge.Create(
             kind="TABLE",
@@ -421,9 +462,7 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
                 cur.execute(insert_stmt)
 
             if overwrite:
-                self.drop_table(
-                    name=final_table.name, database=final_table.db, force=True
-                )
+                self.drop_table(final_table.name, database=final_table.db, force=True)
                 cur.execute(
                     f"ALTER TABLE IF EXISTS {initial_table.sql(self.name)} RENAME TO {final_table.sql(self.name)}"
                 )
@@ -439,6 +478,8 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
     def drop_table(
         self,
         name: str,
+        /,
+        *,
         database: tuple[str, str] | str | None = None,
         force: bool = False,
     ) -> None:
@@ -461,45 +502,33 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         schema = op.schema
+        if null_columns := schema.null_fields:
+            raise exc.IbisTypeError(
+                f"{self.name} cannot yet reliably handle `null` typed columns; "
+                f"got null typed columns: {null_columns}"
+            )
 
-        # only register if we haven't already done so
-        if (name := op.name) not in self.list_tables():
-            quoted = self.compiler.quoted
-            column_defs = [
-                sge.ColumnDef(
-                    this=sg.to_identifier(colname, quoted=quoted),
-                    kind=self.compiler.type_mapper.from_ibis(typ),
-                    constraints=(
-                        None
-                        if typ.nullable
-                        else [
-                            sg.exp.ColumnConstraint(
-                                kind=sg.exp.NotNullColumnConstraint()
-                            )
-                        ]
-                    ),
+        name = op.name
+        quoted = self.compiler.quoted
+        create_stmt = sge.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
+            ),
+            properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
+        ).sql(self.name)
+
+        data = op.data.to_frame().replace(float("nan"), None)
+        insert_stmt = self._build_insert_template(
+            name, schema=schema, placeholder=":{i:d}"
+        )
+        with self.begin() as cur:
+            cur.execute(create_stmt)
+            for start, end in util.chunks(len(data), chunk_size=128):
+                cur.executemany(
+                    insert_stmt, list(data.iloc[start:end].itertuples(index=False))
                 )
-                for colname, typ in schema.items()
-            ]
-
-            create_stmt = sge.Create(
-                kind="TABLE",
-                this=sg.exp.Schema(
-                    this=sg.to_identifier(name, quoted=quoted), expressions=column_defs
-                ),
-                properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
-            ).sql(self.name, pretty=True)
-
-            data = op.data.to_frame().itertuples(index=False)
-            specs = ", ".join(f":{i}" for i, _ in enumerate(schema))
-            table = sg.table(name, quoted=quoted).sql(self.name)
-            insert_stmt = f"INSERT INTO {table} VALUES ({specs})"
-            with self.begin() as cur:
-                cur.execute(create_stmt)
-                for row in data:
-                    cur.execute(insert_stmt, row)
-
-        atexit.register(self._clean_up_tmp_table, name)
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
         name = util.gen_name("oracle_metadata")
@@ -537,10 +566,10 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
                 C.data_type,
                 C.data_precision,
                 C.data_scale,
-                C.nullable.eq("Y"),
+                C.nullable.eq(sge.convert("Y")),
             )
             .from_("all_tab_columns")
-            .where(C.table_name.eq(name))
+            .where(C.table_name.eq(sge.convert(name)))
             .order_by(C.column_id)
             .sql(dialect)
         )
@@ -576,21 +605,17 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
 
         from ibis.backends.oracle.converter import OraclePandasData
 
-        try:
-            df = pd.DataFrame.from_records(
-                cursor, columns=schema.names, coerce_float=True
-            )
-        except Exception:
-            # clean up the cursor if we fail to create the DataFrame
-            #
-            # in the sqlite case failing to close the cursor results in
-            # artificially locked tables
-            cursor.close()
-            raise
-        df = OraclePandasData.convert_table(df, schema)
-        return df
+        df = pd.DataFrame.from_records(cursor, columns=schema.names, coerce_float=True)
+        return OraclePandasData.convert_table(df, schema)
 
     def _clean_up_tmp_table(self, name: str) -> None:
+        dialect = self.dialect
+
+        ident = sg.to_identifier(name, quoted=self.compiler.quoted)
+
+        truncate = sge.TruncateTable(expressions=[ident]).sql(dialect)
+        drop = sge.Drop(kind="TABLE", this=ident).sql(dialect)
+
         with self.begin() as bind:
             # global temporary tables cannot be dropped without first truncating them
             #
@@ -599,9 +624,39 @@ class Backend(SQLBackend, CanListDatabase, CanListSchema):
             # ignore DatabaseError exceptions because the table may not exist
             # because it's already been deleted
             with contextlib.suppress(oracledb.DatabaseError):
-                bind.execute(f'TRUNCATE TABLE "{name}"')
+                bind.execute(truncate)
             with contextlib.suppress(oracledb.DatabaseError):
-                bind.execute(f'DROP TABLE "{name}"')
+                bind.execute(drop)
 
-    def _clean_up_cached_table(self, op):
-        self._clean_up_tmp_table(op.name)
+    _drop_cached_table = _clean_up_tmp_table
+
+    def _make_memtable_finalizer(self, name: str) -> Callable[..., None]:
+        dialect = self.dialect
+
+        ident = sg.to_identifier(name, quoted=self.compiler.quoted)
+
+        truncate = sge.TruncateTable(expressions=[ident]).sql(dialect)
+        drop = sge.Drop(kind="TABLE", this=ident).sql(dialect)
+
+        def finalizer(con=self.con, name: str = name) -> None:
+            cursor = con.cursor()
+            try:
+                # global temporary tables cannot be dropped without first truncating them
+                #
+                # https://stackoverflow.com/questions/32423397/force-oracle-drop-global-temp-table
+                #
+                # ignore DatabaseError exceptions because the table may not exist
+                # because it's already been deleted
+                with contextlib.suppress(oracledb.DatabaseError):
+                    cursor.execute(truncate)
+                with contextlib.suppress(oracledb.DatabaseError):
+                    cursor.execute(drop)
+            except Exception:
+                con.rollback()
+                raise
+            else:
+                con.commit()
+            finally:
+                cursor.close()
+
+        return finalizer

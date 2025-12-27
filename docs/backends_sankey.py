@@ -40,9 +40,10 @@ backend_categories = {
         "RisingWave",
         "Snowflake",
         "SQLite",
+        "Theseus",
         "Trino",
     ],
-    list(category_colors.keys())[2]: ["Dask", "pandas", "Polars"],
+    list(category_colors.keys())[2]: ["Polars"],
 }
 
 nodes, links = [], []
@@ -94,7 +95,7 @@ fig = go.Figure(
 
 fig.update_layout(
     title_text="Ibis backend types",
-    font_size=24,
+    font_size=20,
     # font_family="Arial",
     title_font_size=30,
     margin=dict(l=30, r=30, t=80, b=30),

@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import itertools
+import re
+import zoneinfo
 from typing import TYPE_CHECKING, Any
 
 import sqlglot as sg
 import sqlglot.expressions as sge
 
+import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as exc
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-from ibis.backends import CanCreateDatabase, NoUrl
-from ibis.backends.flink.compiler import FlinkCompiler
+from ibis import util
+from ibis.backends import (
+    CanCreateDatabase,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    NoUrl,
+    PyArrowExampleLoader,
+    SupportsTempTables,
+)
 from ibis.backends.flink.ddl import (
     CreateDatabase,
     CreateTableWithSchema,
@@ -40,16 +51,22 @@ if TYPE_CHECKING:
 _INPUT_TYPE_TO_FUNC_TYPE = {InputType.PYTHON: "general", InputType.PANDAS: "pandas"}
 
 
-class Backend(SQLBackend, CanCreateDatabase, NoUrl):
+class Backend(
+    SupportsTempTables,
+    SQLBackend,
+    CanCreateDatabase,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    NoUrl,
+    PyArrowExampleLoader,
+):
     name = "flink"
-    compiler = FlinkCompiler()
+    compiler = sc.flink.compiler
     supports_temporary_tables = True
     supports_python_udfs = True
 
-    @property
-    def dialect(self):
-        # TODO: remove when ported to sqlglot
-        return self.compiler.dialect
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        """No-op."""
 
     def do_connect(self, table_env: TableEnvironment) -> None:
         """Create a Flink `Backend` for use with Ibis.
@@ -64,11 +81,22 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         >>> import ibis
         >>> from pyflink.table import EnvironmentSettings, TableEnvironment
         >>> table_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
-        >>> ibis.flink.connect(table_env)
-        <ibis.backends.flink.Backend at 0x...>
-
+        >>> ibis.flink.connect(table_env)  # doctest: +ELLIPSIS
+        <ibis.backends.flink.Backend object at 0x...>
         """
         self._table_env = table_env
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, table_env: TableEnvironment, /) -> Backend:
+        """Create a Flink `Backend` from an existing table environment.
+
+        Parameters
+        ----------
+        table_env
+            A table environment.
+        """
+        return ibis.flink.connect(table_env)
 
     def disconnect(self) -> None:
         pass
@@ -86,7 +114,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         )
         return sch.Schema.from_pyarrow(pa_schema)
 
-    def list_databases(self, like: str | None = None) -> list[str]:
+    def list_databases(self, *, like: str | None = None) -> list[str]:
         databases = self._table_env.list_databases()
         return self._filter_with_like(databases, like)
 
@@ -101,6 +129,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def create_database(
         self,
         name: str,
+        /,
+        *,
         db_properties: dict | None = None,
         catalog: str | None = None,
         force: bool = False,
@@ -126,7 +156,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         self.raw_sql(statement.compile())
 
     def drop_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         """Drop a database with name `name`.
 
@@ -145,8 +175,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
     def list_tables(
         self,
-        like: str | None = None,
         *,
+        like: str | None = None,
         database: str | None = None,
         catalog: str | None = None,
         temp: bool = False,
@@ -160,20 +190,19 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
         Parameters
         ----------
-        like : str, optional
+        like
             A pattern in Python's regex format.
-        temp : bool, optional
+        temp
             Whether to list temporary tables or permanent tables.
-        database : str, optional
+        database
             The database to list tables of, if not the current one.
-        catalog : str, optional
+        catalog
             The catalog to list tables of, if not the current one.
 
         Returns
         -------
         list[str]
             The list of the table/view names that match the pattern `like`.
-
         """
         catalog = catalog or self.current_catalog
         database = database or self.current_database
@@ -225,6 +254,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def table(
         self,
         name: str,
+        /,
+        *,
         database: str | None = None,
         catalog: str | None = None,
     ) -> ir.Table:
@@ -289,7 +320,21 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         qualified_name = sg.table(table_name, db=catalog, catalog=database).sql(
             self.name
         )
-        table = self._table_env.from_path(qualified_name)
+        try:
+            table = self._table_env.from_path(qualified_name)
+        except Py4JJavaError as e:
+            # This seems too msg specific but not sure what a good work around is
+            #
+            # Flink doesn't have a way to check whether a table exists other
+            # than to all tables and check potentially every element in the list
+            if re.search(
+                "table .+ was not found",
+                str(e.java_exception.toString()),
+                flags=re.IGNORECASE,
+            ):
+                raise exc.TableNotFound(table_name) from e
+            raise
+
         pyflink_schema = table.get_schema()
 
         return sch.Schema.from_pyarrow(
@@ -307,50 +352,77 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def _register_udfs(self, expr: ir.Expr) -> None:
         for udf_node in expr.op().find(ops.ScalarUDF):
             register_func = getattr(
-                self, f"_compile_{udf_node.__input_type__.name.lower()}_udf"
+                self, f"_register_{udf_node.__input_type__.name.lower()}_udf"
             )
             register_func(udf_node)
 
     def _register_udf(self, udf_node: ops.ScalarUDF):
-        import pyflink.table.udf
+        from pyflink.table.udf import udf
 
         from ibis.backends.flink.datatypes import FlinkType
 
         name = type(udf_node).__name__
         self._table_env.drop_temporary_function(name)
-        udf = pyflink.table.udf.udf(
+
+        func = udf(
             udf_node.__func__,
             result_type=FlinkType.from_ibis(udf_node.dtype),
             func_type=_INPUT_TYPE_TO_FUNC_TYPE[udf_node.__input_type__],
         )
-        self._table_env.create_temporary_function(name, udf)
+        self._table_env.create_temporary_function(name, func)
 
-    _compile_pandas_udf = _register_udf
-    _compile_python_udf = _register_udf
+    _register_pandas_udf = _register_udf
+    _register_python_udf = _register_udf
 
     def compile(
         self,
         expr: ir.Expr,
+        /,
+        *,
+        limit: str | None = None,
         params: Mapping[ir.Expr, Any] | None = None,
         pretty: bool = False,
         **_: Any,
-    ) -> Any:
+    ) -> str:
         """Compile an Ibis expression to Flink."""
         return super().compile(
             expr, params=params, pretty=pretty
-        )  # Discard `limit` and other kwargs.
+        )  # Discard `limit` and other kwargs
 
-    def _to_sqlglot(
-        self, expr: ir.Expr, params: Mapping[ir.Expr, Any] | None = None, **_: Any
-    ) -> str:
-        return super()._to_sqlglot(expr, params=params)
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        if null_columns := op.schema.null_fields:
+            raise exc.IbisTypeError(
+                f"{self.name} cannot yet reliably handle `null` typed columns; "
+                f"got null typed columns: {null_columns}"
+            )
+        self.create_view(op.name, op.data.to_frame(), schema=op.schema, temp=True)
 
-    def execute(self, expr: ir.Expr, **kwargs: Any) -> Any:
-        """Execute an expression."""
-        self._register_udfs(expr)
+    def execute(
+        self,
+        expr: ir.Expr,
+        /,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame | pd.Series | Any:
+        """Execute an Ibis expression and return a pandas `DataFrame`, `Series`, or scalar.
 
-        table_expr = expr.as_table()
-        sql = self.compile(table_expr, **kwargs)
+        Parameters
+        ----------
+        expr
+            Ibis expression to execute.
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            no limit. The default is in `ibis/config.py`.
+        kwargs
+            Keyword arguments
+        """
+        self._run_pre_execute_hooks(expr)
+
+        sql = self.compile(expr.as_table(), params=params, **kwargs)
         df = self._table_env.sql_query(sql).to_pandas()
 
         return expr.__pandas_result__(df)
@@ -358,6 +430,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def create_table(
         self,
         name: str,
+        /,
         obj: pd.DataFrame | pa.Table | ir.Table | None = None,
         *,
         schema: sch.Schema | None = None,
@@ -417,7 +490,6 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         -------
         Table
             The table that was created.
-
         """
         import pandas as pd
         import pyarrow as pa
@@ -436,36 +508,26 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         if overwrite:
             if self.list_tables(like=name, temp=temp):
                 self.drop_table(
-                    name=name,
-                    catalog=catalog,
-                    database=database,
-                    temp=temp,
-                    force=True,
+                    name, catalog=catalog, database=database, temp=temp, force=True
                 )
 
         # In-memory data is created as views in `pyflink`
         if obj is not None:
-            if isinstance(obj, pd.DataFrame):
-                dataframe = obj
+            if not isinstance(obj, ir.Table):
+                obj = ibis.memtable(obj)
 
-            elif isinstance(obj, pa.Table):
-                dataframe = obj.to_pandas()
-
-            elif isinstance(obj, ir.Table):
-                # Note (mehmet): If obj points to in-memory data, we create a view.
-                # Other cases are unsupported for now, e.g., obj is of UnboundTable.
-                # See TODO right below for more context on how we handle in-memory data.
-                op = obj.op()
-                if isinstance(op, ops.InMemoryTable):
-                    dataframe = op.data.to_frame()
-                else:
-                    raise exc.IbisError(
-                        "`obj` is of type ibis.expr.types.Table but it is not in-memory. "
-                        "Currently, only in-memory tables are supported. "
-                        "See ibis.memtable() for info on creating in-memory table."
-                    )
+            # Note (mehmet): If obj points to in-memory data, we create a view.
+            # Other cases are unsupported for now, e.g., obj is of UnboundTable.
+            # See TODO right below for more context on how we handle in-memory data.
+            op = obj.op()
+            if isinstance(op, ops.InMemoryTable):
+                dataframe = op.data.to_frame()
             else:
-                raise exc.IbisError(f"Unsupported `obj` type: {type(obj)}")
+                raise exc.IbisError(
+                    "`obj` is of type ibis.expr.types.Table but it is not in-memory. "
+                    "Currently, only in-memory tables are supported. "
+                    "See ibis.memtable() for info on creating in-memory table."
+                )
 
             # TODO (mehmet): Flink requires a source connector to create regular tables.
             # In-memory data can only be created as a view (virtual table). So we decided
@@ -474,7 +536,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
             # which may not be ideal. We plan to get back to this later.
             # Ref: https://github.com/ibis-project/ibis/pull/7479#discussion_r1416237088
             return self.create_view(
-                name=name,
+                name,
                 obj=dataframe,
                 schema=schema,
                 database=database,
@@ -514,6 +576,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def drop_table(
         self,
         name: str,
+        /,
         *,
         database: str | None = None,
         catalog: str | None = None,
@@ -534,7 +597,6 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
             Whether the table is temporary or not.
         force
             If `False`, an exception is raised if the table does not exist.
-
         """
         statement = DropTable(
             table_name=name,
@@ -574,6 +636,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def create_view(
         self,
         name: str,
+        /,
         obj: pd.DataFrame | ir.Table,
         *,
         schema: sch.Schema | None = None,
@@ -613,7 +676,6 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         -------
         Table
             The view that was created.
-
         """
         import pandas as pd
 
@@ -627,11 +689,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
         if overwrite and self.list_views(like=name, temp=temp):
             self.drop_view(
-                name=name,
-                database=database,
-                catalog=catalog,
-                temp=temp,
-                force=True,
+                name, database=database, catalog=catalog, temp=temp, force=True
             )
 
         if isinstance(obj, pd.DataFrame):
@@ -666,11 +724,12 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         else:
             raise exc.IbisError(f"Unsupported `obj` type: {type(obj)}")
 
-        return self.table(name=name, database=database, catalog=catalog)
+        return self.table(name, database=database, catalog=catalog)
 
     def drop_view(
         self,
         name: str,
+        /,
         *,
         database: str | None = None,
         catalog: str | None = None,
@@ -691,10 +750,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
             Whether the view is temporary or not.
         force
             If `False`, an exception is raised if the view does not exist.
-
         """
         # TODO(deepyaman): Support (and differentiate) permanent views.
-
         statement = DropView(
             name=name,
             database=database,
@@ -750,14 +807,14 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         }
 
         return self.create_table(
-            name=table_name,
-            schema=schema,
-            tbl_properties=tbl_properties,
+            table_name, schema=schema, tbl_properties=tbl_properties
         )
 
     def read_parquet(
         self,
         path: str | Path,
+        /,
+        *,
         schema: sch.Schema | None = None,
         table_name: str | None = None,
     ) -> ir.Table:
@@ -786,6 +843,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def read_csv(
         self,
         path: str | Path,
+        /,
+        *,
         schema: sch.Schema | None = None,
         table_name: str | None = None,
     ) -> ir.Table:
@@ -814,6 +873,8 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def read_json(
         self,
         path: str | Path,
+        /,
+        *,
         schema: sch.Schema | None = None,
         table_name: str | None = None,
     ) -> ir.Table:
@@ -833,7 +894,6 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
         -------
         ir.Table
             The just-registered table
-
         """
         return self._read_file(
             file_type="json", path=path, schema=schema, table_name=table_name
@@ -841,8 +901,10 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
     def insert(
         self,
-        table_name: str,
+        name: str,
+        /,
         obj: pa.Table | pd.DataFrame | ir.Table | list | dict,
+        *,
         database: str | None = None,
         catalog: str | None = None,
         overwrite: bool = False,
@@ -851,7 +913,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
         Parameters
         ----------
-        table_name
+        name
             The name of the table to insert data into.
         obj
             The source data or expression to insert.
@@ -879,7 +941,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
 
         if isinstance(obj, ir.Table):
             statement = InsertSelect(
-                table_name,
+                name,
                 self.compile(obj),
                 database=database,
                 catalog=catalog,
@@ -887,18 +949,22 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
             )
             return self.raw_sql(statement.compile())
 
+        identifier = sg.table(
+            name, db=database, catalog=catalog, quoted=self.compiler.quoted
+        ).sql(self.dialect)
+
         if isinstance(obj, pa.Table):
             obj = obj.to_pandas()
         if isinstance(obj, dict):
             obj = pd.DataFrame.from_dict(obj)
         if isinstance(obj, pd.DataFrame):
             table = self._table_env.from_pandas(obj)
-            return table.execute_insert(table_name, overwrite=overwrite)
+            return table.execute_insert(identifier, overwrite=overwrite)
 
         if isinstance(obj, list):
             # pyflink infers datatypes, which may sometimes result in incompatible types
             table = self._table_env.from_elements(obj)
-            return table.execute_insert(table_name, overwrite=overwrite)
+            return table.execute_insert(identifier, overwrite=overwrite)
 
         raise ValueError(
             "No operation is being performed. Either the obj parameter "
@@ -909,6 +975,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def to_pyarrow(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -934,6 +1001,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     def to_pyarrow_batches(
         self,
         expr: ir.Table,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         chunk_size: int | None = None,
@@ -992,7 +1060,6 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
     ):
         import pyarrow as pa
         import pyarrow_hotfix  # noqa: F401
-        import pytz
         from pyflink.java_gateway import get_gateway
         from pyflink.table.serializers import ArrowSerializer
         from pyflink.table.types import create_arrow_schema
@@ -1021,7 +1088,7 @@ class Backend(SQLBackend, CanCreateDatabase, NoUrl):
             pyflink_schema.get_field_names(), get_field_data_types(pyflink_schema)
         )
 
-        timezone = pytz.timezone(
+        timezone = zoneinfo.ZoneInfo(
             table._j_table.getTableEnvironment().getConfig().getLocalTimeZone().getId()
         )
         serializer = ArrowSerializer(

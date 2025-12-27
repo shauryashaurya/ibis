@@ -1,4 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS hstore;
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS plpython3u;
 CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
@@ -250,23 +249,43 @@ CREATE INDEX IF NOT EXISTS idx_geo_geo_polygon ON geo USING GIST (geo_polygon);
 
 DROP TABLE IF EXISTS json_t CASCADE;
 
-CREATE TABLE IF NOT EXISTS json_t (js JSON);
+CREATE TABLE IF NOT EXISTS json_t (rowid BIGINT, js JSON);
 
 INSERT INTO json_t VALUES
-    ('{"a": [1,2,3,4], "b": 1}'),
-    ('{"a":null,"b":2}'),
-    ('{"a":"foo", "c":null}'),
-    ('null'),
-    ('[42,47,55]'),
-    ('[]'),
-    ('"a"'),
-    ('""'),
-    ('"b"'),
-    (NULL),
-    ('true'),
-    ('false'),
-    ('42'),
-    ('37.37');
+    (1, '{"a": [1,2,3,4], "b": 1}'),
+    (2, '{"a":null,"b":2}'),
+    (3, '{"a":"foo", "c":null}'),
+    (4, 'null'),
+    (5, '[42,47,55]'),
+    (6, '[]'),
+    (7, '"a"'),
+    (8, '""'),
+    (9, '"b"'),
+    (10, NULL),
+    (11, 'true'),
+    (12, 'false'),
+    (13, '42'),
+    (14, '37.37');
+
+DROP TABLE IF EXISTS jsonb_t CASCADE;
+
+CREATE TABLE IF NOT EXISTS jsonb_t (rowid BIGINT, js JSONB);
+
+INSERT INTO jsonb_t VALUES
+    (1, '{"a": [1,2,3,4], "b": 1}'),
+    (2, '{"a":null,"b":2}'),
+    (3, '{"a":"foo", "c":null}'),
+    (4, 'null'),
+    (5, '[42,47,55]'),
+    (6, '[]'),
+    (7, '"a"'),
+    (8, '""'),
+    (9, '"b"'),
+    (10, NULL),
+    (11, 'true'),
+    (12, 'false'),
+    (13, '42'),
+    (14, '37.37');
 
 DROP TABLE IF EXISTS win CASCADE;
 CREATE TABLE win (g TEXT, x BIGINT NOT NULL, y BIGINT);
@@ -278,10 +297,10 @@ INSERT INTO win VALUES
     ('a', 4, 1);
 
 DROP TABLE IF EXISTS map CASCADE;
-CREATE TABLE map (idx BIGINT, kv HSTORE);
+CREATE TABLE map (idx BIGINT, kv JSONB);
 INSERT INTO map VALUES
-    (1, 'a=>1,b=>2,c=>3'),
-    (2, 'd=>4,e=>5,c=>6');
+    (1, '{"a": 1, "b": 2, "c": 3}'),
+    (2, '{"d": 4, "e": 5, "f": 6}');
 
 DROP TABLE IF EXISTS topk;
 

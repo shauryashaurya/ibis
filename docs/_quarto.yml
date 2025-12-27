@@ -22,8 +22,6 @@ interlinks:
   sources:
     python:
       url: https://docs.python.org/3/
-    sqlalchemy:
-      url: https://docs.sqlalchemy.org/
     arrow:
       url: https://arrow.apache.org/docs/
     pandas:
@@ -45,8 +43,8 @@ website:
     type: overlay
     algolia:
       index-name: prod_ibis
-      application-id: HS77W8GWM1
-      search-only-api-key: 8ca4fcd24da322db857322ae4f79d6f3
+      application-id: TNU9HG3L41
+      search-only-api-key: 26350948d1961209df16d9717a7e01d6
       analytics-events: true
       show-logo: true
 
@@ -106,11 +104,13 @@ website:
       style: "docked"
       collapse-level: 2
       contents:
+        - tutorials/basics.qmd
         - install.qmd
-        - auto: tutorials/*.qmd
-        - auto: tutorials/browser
-        - auto: tutorials/cloud-data-platforms
-        - auto: tutorials/open-source-software
+        - tutorials/browser/repl.qmd
+        - section: Coming from ...
+          contents: tutorials/coming-from/*
+        - section: Backend examples
+          contents: tutorials/backends/**/*
     - id: concepts
       title: "Concepts"
       style: "docked"
@@ -124,7 +124,11 @@ website:
       collapse-level: 2
       contents:
         - auto: backends/*.qmd
-        - support_matrix.qmd
+        - section: Support
+          contents:
+            - backends/cloud_support_policy.qmd
+            - auto: backends/support/*.qmd
+            - reference/operations.qmd
     - id: how-to
       title: "How-to"
       style: "docked"
@@ -160,7 +164,9 @@ website:
             - reference/expression-strings.qmd
             - reference/expression-temporal.qmd
             - reference/expression-collections.qmd
+            - reference/expression-json.qmd
             - reference/expression-geospatial.qmd
+            - reference/expression-misc.qmd
 
         - section: Type system
           contents:
@@ -170,6 +176,7 @@ website:
         - section: UDFs
           contents:
             - reference/scalar-udfs.qmd
+            - reference/aggregate-udfs.qmd
 
         - section: Connection APIs
           contents:
@@ -181,6 +188,10 @@ website:
             - reference/Options.qmd
             - reference/Repr.qmd
             - reference/SQL.qmd
+
+        - section: Cursed Knowledge
+          contents:
+            - reference/cursed_knowledge.qmd
 
 format:
   html:
@@ -214,6 +225,7 @@ quartodoc:
           contents:
             - name: Table
               package: ibis.expr.types.relations
+              include_inherited: true
             - name: GroupedTable
               package: ibis.expr.types.groupby
             - name: read_csv
@@ -286,47 +298,63 @@ quartodoc:
             name: Generic expressions
             desc: Scalars and columns of any element type.
           contents:
+            # types
             - name: Value
               package: ibis.expr.types.generic
+              include_inherited: true
             - name: Column
               package: ibis.expr.types.generic
+              include_inherited: true
+            - name: Deferred
+              package: ibis.common.deferred
             - name: Scalar
               package: ibis.expr.types.generic
+
+            # constants
+            - name: deferred
+              package: ibis.expr.api
             - name: literal
               dynamic: true
               signature_name: full
             - name: param
               dynamic: true
               signature_name: full
-            - name: NA
-              # Ideally exposed under `ibis` but that doesn't seem to work??
-              package: ibis.expr.api
-              signature_name: full
             - name: "null"
+              dynamic: true
+              signature_name: full
+            - name: range
               dynamic: true
               signature_name: full
             - name: coalesce
               dynamic: true
               signature_name: full
+
+            # comparisons
             - name: least
               dynamic: true
               signature_name: full
             - name: greatest
               dynamic: true
               signature_name: full
+            - name: ifelse
+              dynamic: true
+              signature_name: full
+            - name: cases
+              dynamic: true
+              signature_name: full
+
+            # sorting
             - name: asc
               dynamic: true
               signature_name: full
             - name: desc
               dynamic: true
               signature_name: full
-            - name: ifelse
-              dynamic: true
-              signature_name: full
-            - name: case
-              dynamic: true
-              signature_name: full
+
+            # conversions
+            # TODO: add decompile here once the API is not experimental
             - name: to_sql
+              package: ibis.expr.sql
               dynamic: true
               signature_name: full
 
@@ -350,6 +378,8 @@ quartodoc:
               package: ibis.expr.types.numeric
             - name: BooleanValue
               package: ibis.expr.types.logical
+            - name: BooleanColumn
+              package: ibis.expr.types.logical
             - name: and_
               dynamic: true
               signature_name: full
@@ -359,6 +389,12 @@ quartodoc:
             - name: random
               dynamic: true
               signature_name: full
+
+            # constants
+            - name: e
+              package: ibis.expr.api
+            - name: pi
+              package: ibis.expr.api
 
         - kind: page
           path: expression-strings
@@ -495,6 +531,16 @@ quartodoc:
               signature_name: full
 
         - kind: page
+          path: expression-json
+          package: ibis
+          summary:
+            name: JSON expressions
+            desc: Expressions for manipulating JSON values.
+          contents:
+            - name: JSONValue
+              package: ibis.expr.types.json
+
+        - kind: page
           path: expression-geospatial
           package: ibis.expr.types.geospatial
           summary:
@@ -505,31 +551,56 @@ quartodoc:
             - GeoSpatialColumn
             - name: NumericValue.point
               package: ibis.expr.types.numeric
+        - kind: page
+          path: expression-misc
+          package: ibis
+          summary:
+            name: UUIDs, INET, MACADDR expressions
+            desc: Expressions of miscellaneous other types.
+          contents:
+            - name: uuid
+              dynamic: true
+              signature_name: full
+            - name: UUIDValue
+              package: ibis.expr.types.uuid
+            - name: INETValue
+              package: ibis.expr.types.inet
+            - name: MACADDRValue
+              package: ibis.expr.types.inet
 
         - kind: page
+          path: operations
+          package: ibis.expr.operations
+          summary:
+            name: Operations
+            desc: Low level operation classes. Subject to change in non-major releases.
+          contents:
+            - analytic
+            - arrays
+            - generic
+            - geospatial
+            - histograms
+            - json
+            - logical
+            - maps
+            - numeric
+            - reductions
+            - relations
+            - sortkeys
+            - strings
+            - structs
+            - subqueries
+            - temporal
+            - temporal_windows
+            - udf
+            - window
+        - kind: page
+          path: selectors
+          package: ibis
           summary:
             name: Column selectors
-            desc: Choose Table columns based on dtype, regex, and other criteria
-          path: selectors
-          package: ibis.selectors
           contents:
-            - where
-            - numeric
-            - of_type
-            - startswith
-            - endswith
-            - contains
-            - matches
-            - any_of
-            - all_of
-            - c
-            - across
-            - if_any
-            - if_all
-            - r
-            - first
-            - last
-            - all
+            - selectors
 
     - title: Type System
       desc: "Data types and schemas"
@@ -545,10 +616,10 @@ quartodoc:
               package: ibis
               dynamic: true
               signature_name: full
+            - DataType
             - Array
             - Binary
             - Boolean
-            - DataType
             - Date
             - Decimal
             - Float16
@@ -620,6 +691,13 @@ quartodoc:
             desc: "Scalar user-defined function APIs"
           contents:
             - scalar
+        - kind: page
+          path: aggregate-udfs
+          summary:
+            name: Aggregate UDFs (experimental)
+            desc: "Aggregate user-defined function APIs"
+          contents:
+            - agg
 
     - title: Configuration
       desc: "Ibis configuration"

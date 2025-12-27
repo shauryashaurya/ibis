@@ -27,7 +27,6 @@ except ImportError:
         None
     )
 
-
 try:
     from pyexasol.exceptions import ExaQueryError
 except ImportError:
@@ -47,27 +46,45 @@ except ImportError:
 
 try:
     # PySpark 3.5.0
-    from pyspark.errors.exceptions.captured import (
+    from pyspark.errors.exceptions.base import (
+        AnalysisException as PySparkAnalysisException,
+    )
+    from pyspark.errors.exceptions.base import (
         ArithmeticException as PySparkArithmeticException,
     )
+    from pyspark.errors.exceptions.base import ParseException as PySparkParseException
+    from pyspark.errors.exceptions.base import PySparkValueError
+    from pyspark.errors.exceptions.base import PythonException as PySparkPythonException
+    from pyspark.errors.exceptions.base import (
+        UnsupportedOperationException as PySparkUnsupportedOperationException,
+    )
+    from pyspark.errors.exceptions.connect import (
+        SparkConnectGrpcException as PySparkConnectGrpcException,
+    )
 except ImportError:
-    PySparkArithmeticException = None
+    PySparkParseException = PySparkAnalysisException = PySparkArithmeticException = (
+        PySparkPythonException
+    ) = PySparkUnsupportedOperationException = PySparkConnectGrpcException = (
+        PySparkValueError
+    ) = None
 
 try:
     from google.api_core.exceptions import BadRequest as GoogleBadRequest
+    from google.api_core.exceptions import NotFound as GoogleNotFound
 except ImportError:
-    GoogleBadRequest = None
+    GoogleBadRequest = GoogleNotFound = None
 
 try:
-    from polars import ComputeError as PolarsComputeError
-    from polars import PanicException as PolarsPanicException
     from polars.exceptions import ColumnNotFoundError as PolarsColumnNotFoundError
+    from polars.exceptions import ComputeError as PolarsComputeError
     from polars.exceptions import InvalidOperationError as PolarsInvalidOperationError
+    from polars.exceptions import PanicException as PolarsPanicException
     from polars.exceptions import SchemaError as PolarsSchemaError
+    from polars.exceptions import SQLInterfaceError as PolarsSQLInterfaceError
 except ImportError:
     PolarsComputeError = PolarsPanicException = PolarsInvalidOperationError = (
         PolarsSchemaError
-    ) = PolarsColumnNotFoundError = None
+    ) = PolarsColumnNotFoundError = PolarsSQLInterfaceError = None
 
 try:
     from pyarrow import ArrowInvalid, ArrowNotImplementedError
@@ -101,6 +118,7 @@ except ImportError:
     TrinoUserError = None
 
 try:
+    from psycopg2.errors import ArraySubscriptError as PsycoPg2ArraySubscriptError
     from psycopg2.errors import DivisionByZero as PsycoPg2DivisionByZero
     from psycopg2.errors import IndeterminateDatatype as PsycoPg2IndeterminateDatatype
     from psycopg2.errors import InternalError_ as PsycoPg2InternalError
@@ -116,12 +134,31 @@ except ImportError:
         PsycoPg2InvalidTextRepresentation
     ) = PsycoPg2DivisionByZero = PsycoPg2InternalError = PsycoPg2ProgrammingError = (
         PsycoPg2OperationalError
-    ) = PsycoPg2UndefinedObject = None
+    ) = PsycoPg2UndefinedObject = PsycoPg2ArraySubscriptError = None
 
 try:
-    from pymysql.err import NotSupportedError as MySQLNotSupportedError
-    from pymysql.err import OperationalError as MySQLOperationalError
-    from pymysql.err import ProgrammingError as MySQLProgrammingError
+    from psycopg.errors import ArraySubscriptError as PsycoPgArraySubscriptError
+    from psycopg.errors import DivisionByZero as PsycoPgDivisionByZero
+    from psycopg.errors import IndeterminateDatatype as PsycoPgIndeterminateDatatype
+    from psycopg.errors import InternalError_ as PsycoPgInternalError
+    from psycopg.errors import (
+        InvalidTextRepresentation as PsycoPgInvalidTextRepresentation,
+    )
+    from psycopg.errors import OperationalError as PsycoPgOperationalError
+    from psycopg.errors import ProgrammingError as PsycoPgProgrammingError
+    from psycopg.errors import SyntaxError as PsycoPgSyntaxError
+    from psycopg.errors import UndefinedObject as PsycoPgUndefinedObject
+except ImportError:
+    PsycoPgSyntaxError = PsycoPgIndeterminateDatatype = (
+        PsycoPgInvalidTextRepresentation
+    ) = PsycoPgDivisionByZero = PsycoPgInternalError = PsycoPgProgrammingError = (
+        PsycoPgOperationalError
+    ) = PsycoPgUndefinedObject = PsycoPgArraySubscriptError = None
+
+try:
+    from MySQLdb import NotSupportedError as MySQLNotSupportedError
+    from MySQLdb import OperationalError as MySQLOperationalError
+    from MySQLdb import ProgrammingError as MySQLProgrammingError
 except ImportError:
     MySQLNotSupportedError = MySQLProgrammingError = MySQLOperationalError = None
 
@@ -132,11 +169,25 @@ except ImportError:
 
 try:
     from oracledb.exceptions import DatabaseError as OracleDatabaseError
+    from oracledb.exceptions import InterfaceError as OracleInterfaceError
 except ImportError:
-    OracleDatabaseError = None
+    OracleDatabaseError = OracleInterfaceError = None
 
 try:
     from pyodbc import DataError as PyODBCDataError
     from pyodbc import ProgrammingError as PyODBCProgrammingError
 except ImportError:
     PyODBCProgrammingError = PyODBCDataError = None
+
+try:
+    from databricks.sql.exc import (
+        ServerOperationError as DatabricksServerOperationError,
+    )
+except ImportError:
+    DatabricksServerOperationError = None
+
+try:
+    from pyathena.error import DatabaseError as PyAthenaDatabaseError
+    from pyathena.error import OperationalError as PyAthenaOperationalError
+except ImportError:
+    PyAthenaDatabaseError = PyAthenaOperationalError = None

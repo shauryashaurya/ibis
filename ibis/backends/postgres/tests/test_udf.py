@@ -13,7 +13,7 @@ import ibis.expr.datatypes as dt
 from ibis import udf
 from ibis.util import guid
 
-pytest.importorskip("psycopg2")
+pytest.importorskip("psycopg")
 
 
 @pytest.fixture(scope="session")
@@ -69,7 +69,7 @@ $$"""
 
 
 @pytest.fixture(scope="session")
-def con_for_udf(con, sql_table_setup, sql_define_udf, sql_define_py_udf, test_database):
+def con_for_udf(con, sql_table_setup, sql_define_udf, sql_define_py_udf, test_database):  # noqa: ARG001
     with con.begin() as c:
         c.execute(sql_table_setup)
         c.execute(sql_define_udf)
@@ -86,7 +86,9 @@ def test_existing_sql_udf(con_for_udf, test_database, table):
     """Test creating ibis UDF object based on existing UDF in the database."""
     # Create ibis UDF objects referring to UDFs already created in the database
     custom_length_udf = con_for_udf.function("custom_len", database=test_database)
-    result_obj = table[table, custom_length_udf(table["user_name"]).name("custom_len")]
+    result_obj = table.select(
+        table, custom_length_udf(table["user_name"]).name("custom_len")
+    )
     result = result_obj.execute()
     assert result["custom_len"].sum() == result["name_length"].sum()
 
@@ -94,7 +96,9 @@ def test_existing_sql_udf(con_for_udf, test_database, table):
 def test_existing_plpython_udf(con_for_udf, test_database, table):
     # Create ibis UDF objects referring to UDFs already created in the database
     py_length_udf = con_for_udf.function("pylen", database=test_database)
-    result_obj = table[table, py_length_udf(table["user_name"]).name("custom_len")]
+    result_obj = table.select(
+        table, py_length_udf(table["user_name"]).name("custom_len")
+    )
     result = result_obj.execute()
     assert result["custom_len"].sum() == result["name_length"].sum()
 

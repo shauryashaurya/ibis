@@ -11,44 +11,55 @@ on:
 # instances of this job running at one time
 concurrency: benchmarks-${{ github.repository }}
 
-permissions:
-  # increase the rate limit for github operations, but limit token permissions
-  # to read-only
-  contents: read
-
 jobs:
   benchmarks:
     runs-on: ubuntu-latest
+
+    # this allows extractions/setup-just to list releases for `just` at a higher
+    # rate limit while restricting GITHUB_TOKEN permissions elsewhere
+    permissions:
+      contents: "read"
+      # required for GCP workload identity federation
+      id-token: "write"
+
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         id: install_python
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
-      - name: install poetry
-        run: pip install 'poetry==1.8.2'
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.1.4
+
+      - uses: extractions/setup-just@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: spin up services
+        run: just up postgres
+
+      - name: download testing data
+        run: just download-data
 
       - name: install system dependencies
         run: sudo apt-get install -qq -y build-essential libgeos-dev freetds-dev unixodbc-dev
-
-      - name: install ibis
-        run: poetry install --without dev --without docs --all-extras
 
       - name: make benchmark output dir
         run: mkdir .benchmarks
 
       - name: benchmark
-        run: poetry run pytest --benchmark-enable --benchmark-json .benchmarks/output.json ibis/tests/benchmarks
+        run: uv run --all-extras --group tests pytest --benchmark-enable --benchmark-json .benchmarks/output.json ibis/tests/benchmarks
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+          project_id: "ibis-gbq"
+          workload_identity_provider: "${{ vars.WIF_PROVIDER_NAME }}"
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v3
 
       - name: show gcloud info
         run: gcloud info

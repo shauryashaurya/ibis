@@ -6,7 +6,8 @@ from public import public
 
 import ibis
 import ibis.expr.operations as ops
-from ibis.expr.types.core import _binop
+from ibis import util
+from ibis.expr.types.generic import _binop
 from ibis.expr.types.numeric import NumericColumn, NumericScalar, NumericValue
 
 if TYPE_CHECKING:
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 
 @public
 class BooleanValue(NumericValue):
-    def ifelse(self, true_expr: ir.Value, false_expr: ir.Value) -> ir.Value:
+    def ifelse(self, true_expr: ir.Value, false_expr: ir.Value, /) -> ir.Value:
         """Construct a ternary conditional expression.
 
         Parameters
@@ -227,34 +228,16 @@ class BooleanValue(NumericValue):
         │ NULL     │
         └──────────┘
         """
-        return self.negate()
+        return ops.Not(self).to_expr()
 
     def negate(self) -> BooleanValue:
-        """Negate a boolean expression.
-
-        Returns
-        -------
-        BooleanValue
-            A boolean value expression
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"values": [True, False, False, None]})
-        >>> t.values.negate()
-        ┏━━━━━━━━━━━━━┓
-        ┃ Not(values) ┃
-        ┡━━━━━━━━━━━━━┩
-        │ boolean     │
-        ├─────────────┤
-        │ False       │
-        │ True        │
-        │ True        │
-        │ NULL        │
-        └─────────────┘
-        """
-        return ops.Not(self).to_expr()
+        """DEPRECATED."""
+        util.warn_deprecated(
+            "`-bool_val`/`bool_val.negate()`",
+            instead="use `~bool_val` instead",
+            as_of="9.5",
+        )
+        return ~self
 
 
 @public
@@ -264,7 +247,7 @@ class BooleanScalar(NumericScalar, BooleanValue):
 
 @public
 class BooleanColumn(NumericColumn, BooleanValue):
-    def any(self, where: BooleanValue | None = None) -> BooleanValue:
+    def any(self, *, where: BooleanValue | None = None) -> BooleanValue:
         """Return whether at least one element is `True`.
 
         If the expression does not reference any foreign tables, the result
@@ -322,12 +305,17 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, None]})
         >>> (t.arr > 2).any()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr > 4).any()
-        False
-        >>> m = ibis.memtable({"arr": [True, True, True, False]})
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == None).any(where=t.arr != None)
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         """
         from ibis.common.deferred import Call, Deferred, _
 
@@ -342,7 +330,7 @@ class BooleanColumn(NumericColumn, BooleanValue):
         if len(parents) == 2:
             return Deferred(Call(resolve_exists_subquery, _))
         elif len(parents) == 1:
-            op = ops.Any(self, where=self._bind_reduction_filter(where))
+            op = ops.Any(self, where=self._bind_to_parent_table(where))
         else:
             raise NotImplementedError(
                 f'Cannot compute "any" for expression of type {type(self)} '
@@ -351,7 +339,7 @@ class BooleanColumn(NumericColumn, BooleanValue):
 
         return op.to_expr()
 
-    def notany(self, where: BooleanValue | None = None) -> BooleanValue:
+    def notany(self, *, where: BooleanValue | None = None) -> BooleanValue:
         """Return whether no elements are `True`.
 
         Parameters
@@ -370,16 +358,22 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr > 1).notany()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr > 4).notany()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> m = ibis.memtable({"arr": [True, True, True, False]})
         >>> (t.arr == None).notany(where=t.arr != None)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         """
         return ~self.any(where=where)
 
-    def all(self, where: BooleanValue | None = None) -> BooleanScalar:
+    def all(self, *, where: BooleanValue | None = None) -> BooleanScalar:
         """Return whether all elements are `True`.
 
         Parameters
@@ -398,18 +392,25 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr >= 1).all()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr > 2).all()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == 2).all(where=t.arr == 2)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr == 2).all(where=t.arr >= 2)
-        False
-
+        ┌───────┐
+        │ False │
+        └───────┘
         """
-        return ops.All(self, where=self._bind_reduction_filter(where)).to_expr()
+        return ops.All(self, where=self._bind_to_parent_table(where)).to_expr()
 
-    def notall(self, where: BooleanValue | None = None) -> BooleanScalar:
+    def notall(self, *, where: BooleanValue | None = None) -> BooleanScalar:
         """Return whether not all elements are `True`.
 
         Parameters
@@ -428,13 +429,21 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr >= 1).notall()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr > 2).notall()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr == 2).notall(where=t.arr == 2)
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == 2).notall(where=t.arr >= 2)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         """
         return ~self.all(where=where)
 

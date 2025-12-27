@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 from numpy import testing
@@ -81,7 +83,14 @@ def test_literal_geospatial_explicit(expr, assert_sql):
         shp_polygon_0,
         shp_multipolygon_0,
         shp_multilinestring_0,
-        shp_multipoint_0,
+        param(
+            shp_multipoint_0,
+            marks=pytest.mark.xfail(
+                sys.version_info[:2] < (3, 10),
+                raises=AssertionError,
+                reason="different code generated for python 3.9",
+            ),
+        ),
     ],
 )
 def test_literal_geospatial_inferred(shp, assert_sql):
@@ -164,12 +173,12 @@ def test_geo_spatial_unops(geotable, expr_fn, expected):
             id="disjoint",
         ),
         param(
-            lambda t: t["geo_point"].d_within(point_geom_1_srid0, 2.0),
+            lambda t: t["geo_point"].d_within(point_geom_1_srid0, distance=2.0),
             [True, True, True, False, False],
             id="d_within",
         ),
         param(
-            lambda t: t["geo_point"].d_fully_within(t["geo_linestring"], 2.0),
+            lambda t: t["geo_point"].d_fully_within(t["geo_linestring"], distance=2.0),
             [True, True, True, True, True],
             id="d_fully_within",
         ),
@@ -232,7 +241,7 @@ def test_get_point(geotable, expr_fn, expected):
     # boundaries with the contains predicate. Work around this by adding a
     # small buffer.
     expr = geotable["geo_linestring"].buffer(0.01).contains(arg)
-    result = geotable[geotable, expr.name("tmp")].execute()["tmp"]
+    result = geotable.select(geotable, expr.name("tmp")).execute()["tmp"]
     testing.assert_almost_equal(result, expected, decimal=2)
 
 
@@ -257,7 +266,7 @@ def test_area(con, geotable):
 )
 def test_srid(geotable, condition, expected):
     """Testing for geo spatial srid operation."""
-    expr = geotable[geotable.id, condition(geotable).name("tmp")]
+    expr = geotable.select(geotable.id, condition(geotable).name("tmp"))
     result = expr.execute()["tmp"][[0]]
     assert np.all(result == expected)
 
@@ -275,7 +284,7 @@ def test_srid(geotable, condition, expected):
 )
 def test_set_srid(geotable, condition, expected):
     """Testing for geo spatial set_srid operation."""
-    expr = geotable[geotable.id, condition(geotable).name("tmp")]
+    expr = geotable.select(geotable.id, condition(geotable).name("tmp"))
     result = expr.execute()["tmp"][[0]]
     assert np.all(result == expected)
 
@@ -283,8 +292,8 @@ def test_set_srid(geotable, condition, expected):
 @pytest.mark.parametrize(
     ("condition", "expected"),
     [
-        (lambda t: point_geom_0.transform(900913).srid(), 900913),
-        (lambda t: point_geom_2.transform(900913).srid(), 900913),
+        (lambda _: point_geom_0.transform(900913).srid(), 900913),
+        (lambda _: point_geom_2.transform(900913).srid(), 900913),
         (
             lambda t: t.geo_point.set_srid(4326).transform(900913).srid(),
             900913,
@@ -305,7 +314,7 @@ def test_set_srid(geotable, condition, expected):
 )
 def test_transform(geotable, condition, expected):
     """Testing for geo spatial transform operation."""
-    expr = geotable[geotable.id, condition(geotable).name("tmp")]
+    expr = geotable.select(geotable.id, condition(geotable).name("tmp"))
     result = expr.execute()["tmp"][[0]]
     assert np.all(result == expected)
 
@@ -314,18 +323,18 @@ def test_transform(geotable, condition, expected):
     "expr_fn",
     [
         param(lambda t: t.geo_point.set_srid(4326), id="geom_geo_point"),
-        param(lambda t: point_geom_0, id="point_geom_0"),
-        param(lambda t: point_geom_1, id="point_geom_1"),
-        param(lambda t: point_geom_2, id="point_geom_2"),
-        param(lambda t: point_geog_0, id="point_geog_0"),
-        param(lambda t: point_geog_1, id="point_geog_1"),
-        param(lambda t: point_geog_2, id="point_geog_2"),
+        param(lambda _: point_geom_0, id="point_geom_0"),
+        param(lambda _: point_geom_1, id="point_geom_1"),
+        param(lambda _: point_geom_2, id="point_geom_2"),
+        param(lambda _: point_geog_0, id="point_geog_0"),
+        param(lambda _: point_geog_1, id="point_geog_1"),
+        param(lambda _: point_geog_2, id="point_geog_2"),
     ],
 )
 def test_cast_geography(geotable, expr_fn):
     """Testing for geo spatial transform operation."""
     p = expr_fn(geotable).cast("geography")
-    expr = geotable[geotable.id, p.distance(p).name("tmp")]
+    expr = geotable.select(geotable.id, p.distance(p).name("tmp"))
     result = expr.execute()["tmp"][[0]]
     # distance from a point to a same point should be 0
     assert np.all(result == 0)
@@ -346,7 +355,7 @@ def test_cast_geography(geotable, expr_fn):
 def test_cast_geometry(geotable, expr_fn):
     """Testing for geo spatial transform operation."""
     p = expr_fn(geotable).cast("geometry")
-    expr = geotable[geotable.id, p.distance(p).name("tmp")]
+    expr = geotable.select(geotable.id, p.distance(p).name("tmp"))
     result = expr.execute()["tmp"][[0]]
     # distance from a point to a same point should be 0
     assert np.all(result == 0)
@@ -388,7 +397,16 @@ def test_geo_dataframe(geotable):
             id="polygon_single",
         ),
         # Multipart geometries (2D)
-        param("multipoint", ((10, 40), (40, 30), (20, 20), (30, 10)), id="multipoint"),
+        param(
+            "multipoint",
+            ((10, 40), (40, 30), (20, 20), (30, 10)),
+            id="multipoint",
+            marks=pytest.mark.xfail(
+                sys.version_info[:2] < (3, 10),
+                raises=AssertionError,
+                reason="different code generated for python 3.9",
+            ),
+        ),
         param(
             "multilinestring",
             (((10, 10), (20, 20), (10, 40)), ((40, 40), (30, 30), (40, 20), (30, 10))),
@@ -407,7 +425,7 @@ def test_geo_dataframe(geotable):
         ),
     ],
 )
-def test_geo_literals_smoke(con, shape, value, modifier, assert_sql):
+def test_geo_literals_smoke(shape, value, modifier, assert_sql):
     """Smoke tests for geo spatial literals."""
     expr = ibis.literal(value, type=getattr(dt, shape).copy(**modifier))
     assert_sql(expr)

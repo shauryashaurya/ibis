@@ -1,17 +1,30 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 import pytest
 from pytest import param
 
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
-from ibis.backends.conftest import is_older_than
+from ibis.backends.tests.errors import PySparkPythonException
+from ibis.conftest import IS_SPARK_REMOTE
 from ibis.legacy.udf.vectorized import analytic, elementwise, reduction
 
-pytestmark = pytest.mark.notimpl(["druid", "oracle", "risingwave"])
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
+
+pytestmark = [
+    pytest.mark.notimpl(["druid", "oracle", "risingwave"]),
+    pytest.mark.notyet(
+        ["pyspark"],
+        condition=IS_SPARK_REMOTE,
+        raises=PySparkPythonException,
+        # TODO(cpcloud): this API is deprecated in 10.0.0, no use copypasting a
+        # bunch of markers just for two passing tests
+        strict=False,
+        reason="remote udfs not yet tested due to environment complexities",
+    ),
+]
 
 
 def _format_udf_return_type(func, result_formatter):
@@ -37,7 +50,7 @@ def _format_struct_udf_return_type(func, result_formatter):
 
 
 # elementwise UDF
-def add_one(s):
+def add_one(s: pd.Series) -> pd.Series:
     assert isinstance(s, pd.Series), type(s)
     return s + 1
 
@@ -46,7 +59,7 @@ def create_add_one_udf(result_formatter, id):
     with pytest.warns(FutureWarning, match="v9.0"):
 
         @elementwise(input_type=[dt.double], output_type=dt.double)
-        def add_one_legacy(s):
+        def add_one_legacy(s: pd.Series) -> pd.Series:
             return result_formatter(add_one(s))
 
     @ibis.udf.scalar.pandas
@@ -54,11 +67,7 @@ def create_add_one_udf(result_formatter, id):
         return result_formatter(add_one(s))
 
     yield param(add_one_legacy, id=f"add_one_legacy_{id}")
-    yield param(
-        add_one_udf,
-        marks=[pytest.mark.notimpl(["pandas", "dask"])],
-        id=f"add_one_modern_{id}",
-    )
+    yield param(add_one_udf, id=f"add_one_modern_{id}")
 
 
 add_one_udfs = [
@@ -69,7 +78,7 @@ add_one_udfs = [
 
 
 # analytic UDF
-def calc_zscore(s):
+def calc_zscore(s: pd.Series) -> pd.Series:
     assert isinstance(s, pd.Series)
     return (s - s.mean()) / s.std()
 
@@ -90,13 +99,13 @@ calc_zscore_udfs = [
 with pytest.warns(FutureWarning, match="v9.0"):
 
     @reduction(input_type=[dt.double], output_type=dt.double)
-    def calc_mean(s):
+    def calc_mean(s: pd.Series) -> float:
         assert isinstance(s, (np.ndarray, pd.Series))
         return s.mean()
 
 
 # elementwise multi-column UDF
-def add_one_struct(v):
+def add_one_struct(v: pd.Series) -> pd.DataFrame:
     assert isinstance(v, pd.Series)
     return v + 1, v + 2
 
@@ -150,7 +159,7 @@ with pytest.warns(FutureWarning, match="v9.0"):
         input_type=[dt.double],
         output_type=dt.Struct({"double_col": dt.double, "col2": dt.double}),
     )
-    def overwrite_struct_elementwise(v):
+    def overwrite_struct_elementwise(v: pd.Series) -> pd.DataFrame:
         assert isinstance(v, pd.Series)
         return v + 1, v + 2
 
@@ -160,7 +169,7 @@ with pytest.warns(FutureWarning, match="v9.0"):
             {"double_col": dt.double, "col2": dt.double, "float_col": dt.double}
         ),
     )
-    def multiple_overwrite_struct_elementwise(v):
+    def multiple_overwrite_struct_elementwise(v: pd.Series) -> pd.DataFrame:
         assert isinstance(v, pd.Series)
         return v + 1, v + 2, v + 3
 
@@ -171,14 +180,14 @@ with pytest.warns(FutureWarning, match="v9.0"):
         input_type=[dt.double, dt.double],
         output_type=dt.Struct({"double_col": dt.double, "demean_weight": dt.double}),
     )
-    def overwrite_struct_analytic(v, w):
+    def overwrite_struct_analytic(v: pd.Series, w: pd.Series) -> pd.DataFrame:
         assert isinstance(v, pd.Series)
         assert isinstance(w, pd.Series)
         return v - v.mean(), w - w.mean()
 
 
 # analytic multi-column UDF
-def demean_struct(v, w):
+def demean_struct(v: pd.Series, w: pd.Series) -> pd.DataFrame:
     assert isinstance(v, pd.Series)
     assert isinstance(w, pd.Series)
     return v - v.mean(), w - w.mean()
@@ -217,7 +226,7 @@ demean_struct_udfs = [
 
 
 # reduction multi-column UDF
-def mean_struct(v, w):
+def mean_struct(v: pd.Series, w: pd.Series) -> tuple[float, float]:
     assert isinstance(v, (np.ndarray, pd.Series))
     assert isinstance(w, (np.ndarray, pd.Series))
     return v.mean(), w.mean()
@@ -247,16 +256,13 @@ with pytest.warns(FutureWarning, match="v9.0"):
         input_type=[dt.double, dt.int64],
         output_type=dt.Struct({"double_col": dt.double, "mean_weight": dt.double}),
     )
-    def overwrite_struct_reduction(v, w):
+    def overwrite_struct_reduction(v: pd.Series, w: pd.Series) -> tuple[float, float]:
         assert isinstance(v, (np.ndarray, pd.Series))
         assert isinstance(w, (np.ndarray, pd.Series))
         return v.mean(), w.mean()
 
-    @reduction(
-        input_type=[dt.double],
-        output_type=dt.Array(dt.double),
-    )
-    def quantiles(series, *, quantiles):
+    @reduction(input_type=[dt.double], output_type=dt.Array(dt.double))
+    def quantiles(series: pd.Series, *, quantiles: pd.Series) -> list[float]:
         return series.quantile(quantiles)
 
 
@@ -268,9 +274,9 @@ def test_elementwise_udf(udf_backend, udf_alltypes, udf_df, udf):
     result = expr.execute()
 
     expected_func = getattr(expr.op(), "__func__", getattr(udf, "func", None))
-    assert (
-        expected_func is not None
-    ), f"neither __func__ nor func attributes found on {udf} or expr object"
+    assert expected_func is not None, (
+        f"neither __func__ nor func attributes found on {udf} or expr object"
+    )
 
     expected = expected_func(udf_df["double_col"])
     udf_backend.assert_series_equal(result, expected, check_names=False)
@@ -283,9 +289,9 @@ def test_elementwise_udf_mutate(udf_backend, udf_alltypes, udf_df, udf):
     result = expr.execute()
 
     expected_func = getattr(udf_expr.op(), "__func__", getattr(udf, "func", None))
-    assert (
-        expected_func is not None
-    ), f"neither __func__ nor func attributes found on {udf} or expr object"
+    assert expected_func is not None, (
+        f"neither __func__ nor func attributes found on {udf} or expr object"
+    )
 
     expected = udf_df.assign(incremented=expected_func(udf_df["double_col"]))
     udf_backend.assert_series_equal(result["incremented"], expected["incremented"])
@@ -330,15 +336,10 @@ def test_reduction_udf_array_return_type(udf_backend, udf_alltypes, udf_df):
     udf_backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.broken(
-    ["pandas"],
-    condition=is_older_than("pandas", "2.0.0"),
-    reason="FutureWarning: Not prepending group keys to the result index of transform-like apply",
-)
 def test_reduction_udf_on_empty_data(udf_backend, udf_alltypes):
     """Test that summarization can handle empty data."""
     # First filter down to zero rows
-    t = udf_alltypes[udf_alltypes["int_col"] > np.inf]
+    t = udf_alltypes.filter(udf_alltypes["int_col"] > np.inf)
     result = t.group_by("year").aggregate(mean=calc_mean(t["int_col"])).execute()
     expected = pd.DataFrame({"year": [], "mean": []})
     # We check that the result is an empty DataFrame,
@@ -351,7 +352,7 @@ def test_output_type_in_list_invalid():
 
     with pytest.raises(
         com.IbisTypeError,
-        match="The output type of a UDF must be a single datatype.",
+        match=r"The output type of a UDF must be a single datatype.",
     ):
         with pytest.warns(FutureWarning, match="v9.0"):
 
@@ -472,7 +473,7 @@ def test_invalid_kwargs():
     # Test that defining a UDF with a non-column argument that is not a
     # keyword argument raises an error
 
-    with pytest.raises(TypeError, match=".*must be defined as keyword only.*"):
+    with pytest.raises(TypeError, match=r".*must be defined as keyword only.*"):
         with pytest.warns(FutureWarning, match="v9.0"):
 
             @elementwise(input_type=[dt.double], output_type=dt.double)
@@ -482,9 +483,9 @@ def test_invalid_kwargs():
 
 @pytest.mark.parametrize("udf", add_one_struct_udfs)
 def test_elementwise_udf_destruct(udf_backend, udf_alltypes, udf):
-    result = udf_alltypes.mutate(
-        udf(udf_alltypes["double_col"]).destructure()
-    ).execute()
+    col = udf(udf_alltypes["double_col"])
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         col1=udf_alltypes["double_col"] + 1,
@@ -495,9 +496,9 @@ def test_elementwise_udf_destruct(udf_backend, udf_alltypes, udf):
 
 
 def test_elementwise_udf_overwrite_destruct(udf_backend, udf_alltypes):
-    result = udf_alltypes.mutate(
-        overwrite_struct_elementwise(udf_alltypes["double_col"]).destructure()
-    ).execute()
+    col = overwrite_struct_elementwise(udf_alltypes["double_col"])
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         double_col=udf_alltypes["double_col"] + 1,
@@ -514,11 +515,12 @@ def test_elementwise_udf_overwrite_destruct(udf_backend, udf_alltypes):
 
 
 def test_elementwise_udf_overwrite_destruct_and_assign(udf_backend, udf_alltypes):
+    col = overwrite_struct_elementwise(udf_alltypes["double_col"])
+
     result = (
-        udf_alltypes.mutate(
-            overwrite_struct_elementwise(udf_alltypes["double_col"]).destructure()
-        )
-        .mutate(col3=udf_alltypes["int_col"] * 3)
+        udf_alltypes.mutate(destruct=col)
+        .unpack("destruct")
+        .mutate(col3=udf_alltypes.int_col * 3)
         .execute()
     )
 
@@ -537,9 +539,12 @@ def test_elementwise_udf_overwrite_destruct_and_assign(udf_backend, udf_alltypes
     udf_backend.assert_frame_equal(result, expected, check_like=True)
 
 
-@pytest.mark.xfail_version(pyspark=["pyspark<3.1"])
-@pytest.mark.parametrize("method", ["destructure", "unpack"])
-def test_elementwise_udf_destructure_exact_once(udf_alltypes, method, tmp_path):
+@pytest.mark.parametrize(
+    "func",
+    [lambda t: t.struct.lift(), lambda t: t.unpack("struct")],
+    ids=["lift", "unpack"],
+)
+def test_elementwise_udf_destructure_exact_once(udf_alltypes, func, tmp_path):
     with pytest.warns(FutureWarning, match="v9.0"):
 
         @elementwise(
@@ -555,21 +560,15 @@ def test_elementwise_udf_destructure_exact_once(udf_alltypes, method, tmp_path):
 
     struct = add_one_struct_exact_once(udf_alltypes["id"])
 
-    if method == "destructure":
-        expr = udf_alltypes.mutate(struct.destructure())
-    elif method == "unpack":
-        expr = udf_alltypes.mutate(struct=struct).unpack("struct")
-    else:
-        raise ValueError(f"Invalid method {method}")
-    result = expr.execute()
+    expr = func(udf_alltypes.mutate(struct=struct))
 
-    assert len(result) > 0
+    assert expr.count().execute()
 
 
 def test_elementwise_udf_multiple_overwrite_destruct(udf_backend, udf_alltypes):
-    result = udf_alltypes.mutate(
-        multiple_overwrite_struct_elementwise(udf_alltypes["double_col"]).destructure()
-    ).execute()
+    col = multiple_overwrite_struct_elementwise(udf_alltypes["double_col"])
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         double_col=udf_alltypes["double_col"] + 1,
@@ -592,11 +591,10 @@ def test_elementwise_udf_named_destruct(udf_alltypes):
     add_one_struct_udf = create_add_one_struct_udf(
         result_formatter=lambda v1, v2: (v1, v2)
     )
-    msg = "Duplicate column name 'new_struct' in result set"
-    with pytest.raises(com.IntegrityError, match=msg):
-        udf_alltypes.mutate(
-            new_struct=add_one_struct_udf(udf_alltypes["double_col"]).destructure()
-        )
+
+    col = add_one_struct_udf(udf_alltypes["double_col"])
+
+    udf_alltypes.mutate(new_struct=col)
 
 
 def test_elementwise_udf_struct(udf_backend, udf_alltypes):
@@ -621,13 +619,12 @@ def test_elementwise_udf_struct(udf_backend, udf_alltypes):
 
 @pytest.mark.parametrize("udf", demean_struct_udfs)
 @pytest.mark.notimpl(["pyspark"])
-@pytest.mark.broken(["dask"], strict=False)
 def test_analytic_udf_destruct(udf_backend, udf_alltypes, udf):
     w = ibis.window(preceding=None, following=None, group_by="year")
 
-    result = udf_alltypes.mutate(
-        udf(udf_alltypes["double_col"], udf_alltypes["int_col"]).over(w).destructure()
-    ).execute()
+    col = udf(udf_alltypes["double_col"], udf_alltypes["int_col"]).over(w)
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         demean=udf_alltypes["double_col"] - udf_alltypes["double_col"].mean().over(w),
@@ -643,11 +640,9 @@ def test_analytic_udf_destruct_no_group_by(udf_backend, udf_alltypes):
     demean_struct_udf = create_demean_struct_udf(
         result_formatter=lambda v1, v2: (v1, v2)
     )
-    result = udf_alltypes.mutate(
-        demean_struct_udf(udf_alltypes["double_col"], udf_alltypes["int_col"])
-        .over(w)
-        .destructure()
-    ).execute()
+    col = demean_struct_udf(udf_alltypes["double_col"], udf_alltypes["int_col"]).over(w)
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         demean=udf_alltypes["double_col"] - udf_alltypes["double_col"].mean().over(w),
@@ -661,11 +656,11 @@ def test_analytic_udf_destruct_no_group_by(udf_backend, udf_alltypes):
 def test_analytic_udf_destruct_overwrite(udf_backend, udf_alltypes):
     w = ibis.window(preceding=None, following=None, group_by="year")
 
-    result = udf_alltypes.mutate(
-        overwrite_struct_analytic(udf_alltypes["double_col"], udf_alltypes["int_col"])
-        .over(w)
-        .destructure()
-    ).execute()
+    col = overwrite_struct_analytic(
+        udf_alltypes["double_col"], udf_alltypes["int_col"]
+    ).over(w)
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         double_col=udf_alltypes["double_col"]
@@ -685,13 +680,15 @@ def test_analytic_udf_destruct_overwrite(udf_backend, udf_alltypes):
 @pytest.mark.parametrize("udf", mean_struct_udfs)
 @pytest.mark.notimpl(["pyspark"])
 def test_reduction_udf_destruct_group_by(udf_backend, udf_alltypes, udf):
+    col = udf(udf_alltypes["double_col"], udf_alltypes["int_col"])
+
     result = (
         udf_alltypes.group_by("year")
-        .aggregate(
-            udf(udf_alltypes["double_col"], udf_alltypes["int_col"]).destructure()
-        )
+        .aggregate(destruct=col)
+        .unpack("destruct")
         .execute()
-    ).sort_values("year")
+        .sort_values("year")
+    )
 
     expected = (
         udf_alltypes.group_by("year")
@@ -708,11 +705,9 @@ def test_reduction_udf_destruct_group_by(udf_backend, udf_alltypes, udf):
 @pytest.mark.notimpl(["pyspark"])
 def test_reduction_udf_destruct_no_group_by(udf_backend, udf_alltypes):
     mean_struct_udf = create_mean_struct_udf(result_formatter=lambda v1, v2: (v1, v2))
-    result = udf_alltypes.aggregate(
-        mean_struct_udf(
-            udf_alltypes["double_col"], udf_alltypes["int_col"]
-        ).destructure()
-    ).execute()
+    col = mean_struct_udf(udf_alltypes["double_col"], udf_alltypes["int_col"])
+
+    result = udf_alltypes.aggregate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.aggregate(
         mean=udf_alltypes["double_col"].mean(),
@@ -723,11 +718,11 @@ def test_reduction_udf_destruct_no_group_by(udf_backend, udf_alltypes):
 
 @pytest.mark.notimpl(["pyspark"])
 def test_reduction_udf_destruct_no_group_by_overwrite(udf_backend, udf_alltypes):
-    result = udf_alltypes.aggregate(
-        overwrite_struct_reduction(
-            udf_alltypes["double_col"], udf_alltypes["int_col"]
-        ).destructure()
-    ).execute()
+    col = overwrite_struct_reduction(
+        udf_alltypes["double_col"], udf_alltypes["int_col"]
+    )
+
+    result = udf_alltypes.aggregate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.aggregate(
         double_col=udf_alltypes["double_col"].mean(),
@@ -753,11 +748,9 @@ def test_reduction_udf_destruct_window(udf_backend, udf_alltypes):
     )
     mean_struct_udf = create_mean_struct_udf(result_formatter=lambda v1, v2: (v1, v2))
 
-    result = udf_alltypes.mutate(
-        mean_struct_udf(udf_alltypes["double_col"], udf_alltypes["int_col"])
-        .over(win)
-        .destructure()
-    ).execute()
+    col = mean_struct_udf(udf_alltypes["double_col"], udf_alltypes["int_col"]).over(win)
+
+    result = udf_alltypes.mutate(destruct=col).unpack("destruct").execute()
 
     expected = udf_alltypes.mutate(
         mean=udf_alltypes["double_col"].mean().over(win),

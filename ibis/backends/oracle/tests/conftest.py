@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 ORACLE_USER = os.environ.get("IBIS_TEST_ORACLE_USER", "ibis")
 ORACLE_PASS = os.environ.get("IBIS_TEST_ORACLE_PASSWORD", "ibis")
 ORACLE_HOST = os.environ.get("IBIS_TEST_ORACLE_HOST", "localhost")
-ORACLE_PORT = int(os.environ.get("IBIS_TEST_ORACLE_PORT", 1521))
+ORACLE_PORT = int(os.environ.get("IBIS_TEST_ORACLE_PORT", "1521"))
 
 # Creating test DB and user
 # The ORACLE_DB env-var needs to be set in the compose.yaml file
@@ -92,7 +92,6 @@ class TestConf(ServiceBackendTest):
             dsn=oracledb.makedsn(host, port, service_name=database),
             user=user,
             password=password,
-            database=database,
             schema=self.ddl_script,
         )
 
@@ -117,7 +116,7 @@ class TestConf(ServiceBackendTest):
                 fut.result()
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw):
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
         return ibis.oracle.connect(
             host=ORACLE_HOST,
             user=ORACLE_USER,
@@ -133,34 +132,19 @@ class TestConf(ServiceBackendTest):
 
 
 @pytest.fixture(scope="session")
-def con(data_dir, tmp_path_factory, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+def con(tmp_path_factory, data_dir, worker_id):
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
 def init_oracle_database(
-    user: str,
-    password: str,
-    dsn: str,
-    database: str,
-    schema: str | None = None,
-    **kwargs: Any,
+    user: str, password: str, dsn: str, schema: str | None = None
 ) -> None:
-    """Initialise `database` at `url` with `schema`.
-
-    Parameters
-    ----------
-    database : str
-        Name of the database to be dropped
-    schema : TextIO
-        File object containing schema to use
-    """
-
-    con = oracledb.connect(dsn, user=user, password=password, stmtcachesize=0)
-
-    if schema:
-        with con.cursor() as cursor:
-            for stmt in schema:
-                # XXX: maybe should just remove the comments in the sql file
-                # so we don't end up writing an entire parser here.
-                if not stmt.startswith("--"):
-                    cursor.execute(stmt)
+    with oracledb.connect(
+        dsn, user=user, password=password, stmtcachesize=0
+    ).cursor() as cursor:
+        for stmt in schema:
+            # XXX: maybe should just remove the comments in the sql file
+            # so we don't end up writing an entire parser here.
+            if not stmt.startswith("--"):
+                cursor.execute(stmt)

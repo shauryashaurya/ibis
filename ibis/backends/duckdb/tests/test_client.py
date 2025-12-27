@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 import sys
+from datetime import datetime
 
 import duckdb
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
 from pytest import param
 
 import ibis
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis.conftest import LINUX, SANDBOXED, not_windows
 from ibis.util import gen_name
@@ -78,13 +82,12 @@ def test_cross_db(tmpdir):
 
     con2.attach(path1, name="test1", read_only=True)
 
-    with pytest.warns(FutureWarning):
-        t1_from_con2 = con2.table("t1", schema="main", database="test1")
+    t1_from_con2 = con2.table("t1", database="test1.main")
     assert t1_from_con2.schema() == t2.schema()
     assert t1_from_con2.execute().equals(t2.execute())
 
-    with pytest.warns(FutureWarning):
-        foo_t1_from_con2 = con2.table("t1", schema="foo", database="test1")
+    foo_t1_from_con2 = con2.table("t1", database="test1.foo")
+
     assert foo_t1_from_con2.schema() == t2.schema()
     assert foo_t1_from_con2.execute().equals(t2.execute())
 
@@ -266,9 +269,11 @@ def test_connect_duckdb(url, tmp_path):
 @pytest.mark.parametrize(
     "out_method, extension", [("to_csv", "csv"), ("to_parquet", "parquet")]
 )
-def test_connect_local_file(out_method, extension, test_employee_data_1, tmp_path):
-    getattr(test_employee_data_1, out_method)(tmp_path / f"out.{extension}")
-    con = ibis.connect(tmp_path / f"out.{extension}")
+def test_connect_local_file(out_method, extension, tmp_path):
+    df = pd.DataFrame({"a": [1, 2, 3]})
+    path = tmp_path / f"out.{extension}"
+    getattr(df, out_method)(path)
+    con = ibis.connect(path)
     t = next(iter(con.tables.values()))
     assert not t.head().execute().empty
 
@@ -280,7 +285,7 @@ def test_invalid_connect(tmp_path):
         ibis.connect(url)
 
 
-def test_list_tables_schema_warning_refactor(con):
+def test_list_tables(con):
     assert {
         "astronauts",
         "awards_players",
@@ -292,8 +297,224 @@ def test_list_tables_schema_warning_refactor(con):
 
     icecream_table = ["ice_cream"]
 
-    with pytest.warns(FutureWarning):
-        assert con.list_tables(schema="shops") == icecream_table
-
     assert con.list_tables(database="shops") == icecream_table
     assert con.list_tables(database=("shops",)) == icecream_table
+
+
+def test_settings_repr():
+    con = ibis.duckdb.connect()
+    view = repr(con.settings)
+    assert "name" in view
+    assert "value" in view
+
+
+def test_connect_named_in_memory_db():
+    con_named_db = ibis.duckdb.connect(":memory:mydb")
+
+    con_named_db.create_table("ork", schema=ibis.schema(dict(bork="int32")))
+    assert "ork" in con_named_db.list_tables()
+
+    con_named_db_2 = ibis.duckdb.connect(":memory:mydb")
+    assert "ork" in con_named_db_2.list_tables()
+
+    unnamed_memory_db = ibis.duckdb.connect(":memory:")
+    assert "ork" not in unnamed_memory_db.list_tables()
+
+    default_memory_db = ibis.duckdb.connect()
+    assert "ork" not in default_memory_db.list_tables()
+
+
+@pytest.mark.parametrize(
+    "database_file",
+    [
+        "with spaces.ddb",
+        "space catalog.duckdb.db",
+    ],
+)
+def test_create_table_quoting(database_file, tmp_path):
+    conn = ibis.duckdb.connect(tmp_path / database_file)
+    t = conn.create_table("t", {"a": [0, 1, 2]})
+    result = set(conn.execute(t.a))
+    assert result == {0, 1, 2}
+
+
+@pytest.mark.parametrize(
+    ("url", "method_name"),
+    [
+        ("hf://datasets/datasets-examples/doc-formats-csv-1/data.csv", "read_csv"),
+        ("hf://datasets/datasets-examples/doc-formats-jsonl-1/data.jsonl", "read_json"),
+        (
+            "hf://datasets/datasets-examples/doc-formats-parquet-1/data/train-00000-of-00001.parquet",
+            "read_parquet",
+        ),
+    ],
+    ids=["csv", "jsonl", "parquet"],
+)
+@pytest.mark.xfail(
+    LINUX and SANDBOXED,
+    reason="nix on linux is not allowed to access the network and cannot download the httpfs extension",
+    raises=duckdb.Error,
+)
+def test_hugging_face(con, url, method_name):
+    method = getattr(con, method_name)
+    t = method(url)
+    assert t.count().execute() > 0
+
+
+def test_multiple_tables_with_the_same_name(tmp_path):
+    # check within the same database
+    path = tmp_path / "test1.ddb"
+    with duckdb.connect(str(path)) as con:
+        con.execute("CREATE TABLE t (x INT)")
+        con.execute("CREATE SCHEMA s")
+        con.execute("CREATE TABLE s.t (y STRING)")
+
+    con = ibis.duckdb.connect(path)
+    t1 = con.table("t")
+    t2 = con.table("t", database="s")
+    assert t1.schema() == ibis.schema({"x": "int32"})
+    assert t2.schema() == ibis.schema({"y": "string"})
+
+    path = tmp_path / "test2.ddb"
+    with duckdb.connect(str(path)) as c:
+        c.execute("CREATE TABLE t (y DOUBLE[])")
+
+    # attach another catalog and check that too
+    con.attach(path, name="w")
+    t1 = con.table("t")
+    t2 = con.table("t", database="s")
+    assert t1.schema() == ibis.schema({"x": "int32"})
+    assert t2.schema() == ibis.schema({"y": "string"})
+
+    t3 = con.table("t", database="w.main")
+
+    assert t3.schema() == ibis.schema({"y": "array<float64>"})
+
+
+@pytest.mark.parametrize(
+    "input",
+    [
+        {"columns": {"lat": "double", "lon": "float", "geom": "geometry"}},
+        {"types": {"geom": "geometry", "lon": "float"}},
+    ],
+    ids=["columns", "types"],
+)
+@pytest.mark.parametrize("all_varchar", [True, False], ids=["varchar", "not_varchar"])
+@pytest.mark.xfail(
+    LINUX and SANDBOXED,
+    reason="nix on linux cannot download duckdb extensions or data due to sandboxing",
+    raises=duckdb.IOException,
+)
+@pytest.mark.xdist_group(name="duckdb-extensions")
+def test_read_csv_with_types(tmp_path, input, all_varchar):
+    con = ibis.duckdb.connect()
+    data = b"""\
+lat,lon,geom
+1.0,2.0,POINT (1 2)
+2.0,3.0,POINT (2 3)"""
+    path = tmp_path / "data.csv"
+    path.write_bytes(data)
+    t = con.read_csv(path, all_varchar=all_varchar, **input)
+    assert t.schema()["geom"].is_geospatial()
+
+
+def test_pyarrow_batches_chunk_size(con):  # 10443
+    t = ibis.memtable(
+        {
+            "id": np.arange(10_000),
+            "name": random.choices(["Alice", "Bob", "Carol", "Dave"], k=10_000),  # noqa: S311
+            "age": random.choices(range(20, 71), k=10_000),  # noqa: S311
+        }
+    )
+    batches = con.to_pyarrow_batches(t, chunk_size=4096)
+    assert len(next(batches)) == 4096
+    assert len(next(batches)) == 4096
+
+    batches = con.to_pyarrow_batches(t, chunk_size=800)
+    assert len(next(batches)) == 800
+    assert len(next(batches)) == 800
+
+    batches = con.to_pyarrow_batches(t, chunk_size=-1)
+    with pytest.raises(TypeError):
+        next(batches)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(obj=ibis.memtable({"a": [None]})),
+        dict(obj=ibis.memtable({"a": [None]}), schema=ibis.schema({"a": "null"})),
+        dict(schema=ibis.schema({"a": "null"})),
+    ],
+    ids=["obj", "obj-schema", "schema"],
+)
+def test_create_table_with_nulls(con, kwargs):
+    t = ibis.memtable({"a": [None]})
+    schema = t.schema()
+
+    assert schema == ibis.schema({"a": "null"})
+    assert schema.null_fields == ("a",)
+
+    name = gen_name("duckdb_all_nulls")
+
+    with pytest.raises(com.IbisTypeError, match="NULL typed columns"):
+        con.create_table(name, **kwargs)
+
+
+def test_create_temp_table_in_nondefault_schema():
+    con = ibis.duckdb.connect()
+    database = gen_name("nondefault_schema")
+    con.create_database(database)
+    con.con.execute(f"USE {database}")
+    con.create_table("foo", {"id": [1, 2, 3]}, temp=True)
+
+    assert not con.list_tables(database=database) and not con.list_tables()
+    assert con.list_tables(database="main") == ["foo"]
+
+
+@pytest.mark.parametrize("temp", [False, True])
+def test_create_table_from_in_memory_data(temp):
+    con = ibis.duckdb.connect()
+    con.create_table("foo", pd.DataFrame({"id": [1, 2, 3]}), temp=temp)
+
+    assert con.list_tables() == ["foo"]
+    assert con.con.execute("SHOW TABLES").fetchall() == [("foo",)]
+
+
+def test_create_table_with_quoted_columns():
+    con = ibis.duckdb.connect()
+    name = gen_name("quoted_columns_table")
+    df = pd.DataFrame(
+        {"group": ["G1"], "value": ["E1"], "id": [1], "date": [datetime(2025, 5, 13)]}
+    )
+    con.create_table(name, df, temp=True)
+    assert con.list_tables() == [name]
+
+
+def test_create_table_with_out_of_order_columns(con):
+    name = gen_name("out_of_order_columns_table")
+    df = pd.DataFrame({"value": ["E1"], "id": [1], "date": [datetime(2025, 5, 13)]})
+    schema = ibis.schema({"id": "int", "value": "str", "date": "timestamp"})
+    assert list(df.columns) == ["value", "id", "date"]
+    assert list(schema.names) == ["id", "value", "date"]
+    con.create_table(name, df, schema=schema, temp=True)
+
+
+@pytest.mark.parametrize(
+    "converter",
+    [
+        lambda expr: expr.to_pyarrow().to_pylist(),
+        lambda expr: expr.to_pandas().tolist(),
+    ],
+    ids=["pyarrow", "pandas"],
+)
+def test_basic_enum_schema_inference(con, converter):
+    name = gen_name("basic_enum_schema_inference")
+    con.con.execute(
+        f"CREATE TEMP TABLE {name} AS "
+        "SELECT CAST('a' AS ENUM('a', 'b')) e UNION ALL "
+        "SELECT CAST('b' AS ENUM('a', 'b')) e"
+    )
+    t = con.table(name)
+    assert t.e.type() == dt.string
+    assert set(converter(t.e)) == {"a", "b"}

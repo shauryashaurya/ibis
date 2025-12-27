@@ -6,7 +6,7 @@ ci:
     - actionlint-system
     - deadnix
     - just
-    - nixpkgs-fmt
+    - nixfmt
     - prettier
     - ruff
     - ruff-format
@@ -15,14 +15,14 @@ ci:
     - statix
     - taplo
 default_stages:
-  - commit
+  - pre-commit
 repos:
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.6.27
+    rev: v1.7.7
     hooks:
       - id: actionlint-system
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.2.6
+    rev: v2.4.0
     hooks:
       - id: codespell
         additional_dependencies:
@@ -58,10 +58,10 @@ repos:
     hooks:
       - id: yamllint
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
+    rev: v5.0.0
     hooks:
       - id: check-added-large-files
-        args: ["--maxkb=710"]
+        args: ["--maxkb=800"]
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-merge-conflict
@@ -78,6 +78,7 @@ repos:
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
         exclude: .+/snapshots/.+
+      - id: forbid-submodules
   - repo: meta
     hooks:
       - id: check-hooks-apply
@@ -105,6 +106,7 @@ repos:
         name: shellcheck
         language: system
         entry: shellcheck
+        args: ["--shell", "bash"]
         types_or:
           - sh
           - shell
@@ -133,10 +135,10 @@ repos:
         args: ["--fmt", "--unstable"]
         files: ^justfile$
         pass_filenames: false
-      - id: nixpkgs-fmt
-        name: nixpkgs-fmt
+      - id: nixfmt
+        name: nixfmt
         language: system
-        entry: nixpkgs-fmt
+        entry: nixfmt
         types:
           - nix
       - id: statix

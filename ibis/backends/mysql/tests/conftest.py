@@ -16,8 +16,8 @@ if TYPE_CHECKING:
 MYSQL_USER = os.environ.get("IBIS_TEST_MYSQL_USER", "ibis")
 MYSQL_PASS = os.environ.get("IBIS_TEST_MYSQL_PASSWORD", "ibis")
 MYSQL_HOST = os.environ.get("IBIS_TEST_MYSQL_HOST", "localhost")
-MYSQL_PORT = int(os.environ.get("IBIS_TEST_MYSQL_PORT", 3306))
-IBIS_TEST_MYSQL_DB = os.environ.get("IBIS_TEST_MYSQL_DATABASE", "ibis_testing")
+MYSQL_PORT = int(os.environ.get("IBIS_TEST_MYSQL_PORT", "3306"))
+IBIS_TEST_MYSQL_DB = os.environ.get("IBIS_TEST_MYSQL_DATABASE", "ibis-testing")
 
 
 class TestConf(ServiceBackendTest):
@@ -29,7 +29,7 @@ class TestConf(ServiceBackendTest):
     supports_structs = False
     rounding_method = "half_to_even"
     service_name = "mysql"
-    deps = ("pymysql",)
+    deps = ("MySQLdb",)
 
     @property
     def test_files(self) -> Iterable[Path]:
@@ -61,7 +61,7 @@ class TestConf(ServiceBackendTest):
                 cur.execute("\n".join(lines))
 
     @staticmethod
-    def connect(*, tmpdir, worker_id, **kw):
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
         return ibis.mysql.connect(
             host=MYSQL_HOST,
             user=MYSQL_USER,
@@ -76,4 +76,5 @@ class TestConf(ServiceBackendTest):
 
 @pytest.fixture(scope="session")
 def con(tmp_path_factory, data_dir, worker_id):
-    return TestConf.load_data(data_dir, tmp_path_factory, worker_id).connection
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection

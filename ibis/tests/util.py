@@ -65,7 +65,7 @@ def assert_decompile_roundtrip(
 
     # execute the rendered python code
     locals_ = {}
-    exec(rendered, {}, locals_)
+    exec(rendered, {}, locals_)  # noqa: S102
     restored = locals_["result"]
 
     assert eq(expr.unbind(), restored)

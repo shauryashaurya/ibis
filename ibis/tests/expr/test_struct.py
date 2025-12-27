@@ -31,17 +31,24 @@ def test_struct_operations():
         ]
     )
     expr = ibis.literal(value)
-    assert isinstance(expr, ir.StructValue)
-    assert isinstance(expr["b"], ir.ArrayValue)
-    assert isinstance(expr["a"].op(), ops.StructField)
+    assert isinstance(expr, ir.StructScalar)
+    assert isinstance(expr["b"], ir.ArrayScalar)
+    assert isinstance(expr["a"], ir.IntegerScalar)
 
 
 def test_struct_getattr():
     expr = ibis.struct({"a": 1, "b": 2})
     assert isinstance(expr.a, ir.IntegerValue)
-    assert expr.a.get_name() == "a"
     with pytest.raises(AttributeError, match="bad"):
         expr.bad  # # noqa: B018
+
+
+def test_null_literal_getitem():
+    expr = ibis.literal(None, type="struct<a: int64, b: string>")
+    field = expr["a"]
+    assert isinstance(field, ir.IntegerValue)
+    assert isinstance(field.op(), ops.Literal)
+    assert field.op().value is None
 
 
 def test_struct_tab_completion():
@@ -62,23 +69,23 @@ def test_struct_pickle():
 
 
 def test_lift(t):
-    assert t.a.lift().equals(t[_.a.b, _.a.c])
+    assert t.a.lift().equals(t.select(_.a.b, _.a.c))
 
 
 def test_unpack_from_table(t):
-    assert t.unpack("a").equals(t[_.a.b, _.a.c, _.d])
+    assert t.unpack("a").equals(t.select(_.a.b, _.a.c, _.d))
 
 
 def test_lift_join(t, s):
     join = t.join(s, t.d == s.a.g)
     result = join.a_right.lift()
-    with join_tables(join) as (t, s):
+    with join_tables(join) as (tt, ss):
         expected = ops.JoinChain(
-            first=t,
+            first=tt,
             rest=[
-                ops.JoinLink("inner", s, [t.d == s.a.g]),
+                ops.JoinLink("inner", ss, [tt.d == ss.a.g]),
             ],
-            values={"f": s.a.f, "g": s.a.g},
+            values={"f": ss.a.f, "g": ss.a.g},
         )
         assert result.op() == expected
 
@@ -86,7 +93,7 @@ def test_lift_join(t, s):
 def test_unpack_join_from_table(t, s):
     join = t.join(s, t.d == s.a.g)
     result = join.unpack("a_right")
-    expected = join[_.a, _.d, _.a_right.f, _.a_right.g]
+    expected = join.select(_.a, _.d, _.a_right.f, _.a_right.g)
     assert result.equals(expected)
 
 

@@ -1,3 +1,5 @@
+"""Relational operations."""
+
 from __future__ import annotations
 
 import itertools
@@ -10,7 +12,11 @@ from public import public
 import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 from ibis.common.annotations import attribute
-from ibis.common.collections import FrozenDict
+from ibis.common.collections import (
+    ConflictingValuesError,
+    FrozenDict,
+    FrozenOrderedDict,
+)
 from ibis.common.exceptions import IbisTypeError, IntegrityError, RelationError
 from ibis.common.grounds import Concrete
 from ibis.common.patterns import Between, InstanceOf
@@ -18,7 +24,7 @@ from ibis.common.typing import Coercible, VarTuple
 from ibis.expr.operations.core import Alias, Column, Node, Scalar, Value
 from ibis.expr.operations.sortkeys import SortKey
 from ibis.expr.schema import Schema
-from ibis.formats import TableProxy  # noqa: TCH001
+from ibis.formats import TableProxy  # noqa: TC001
 
 T = TypeVar("T")
 
@@ -28,6 +34,8 @@ NonSortKey = Annotated[T, ~InstanceOf(SortKey)]
 
 @public
 class Relation(Node, Coercible):
+    """Base class for relational operations."""
+
     @classmethod
     def __coerce__(cls, value):
         from ibis.expr.types import Table
@@ -41,7 +49,7 @@ class Relation(Node, Coercible):
 
     @property
     @abstractmethod
-    def values(self) -> FrozenDict[str, Value]:
+    def values(self) -> FrozenOrderedDict[str, Value]:
         """A mapping of column names to expressions which build up the relation.
 
         This attribute is heavily used in rewrites as well as during field
@@ -59,13 +67,13 @@ class Relation(Node, Coercible):
         ...
 
     @property
-    def fields(self) -> FrozenDict[str, Column]:
+    def fields(self) -> FrozenOrderedDict[str, Column]:
         """A mapping of column names to fields of the relation.
 
         This calculated property shouldn't be overridden in subclasses since it
         is mostly used for convenience.
         """
-        return FrozenDict({k: Field(self, k) for k in self.schema})
+        return FrozenOrderedDict({k: Field(self, k) for k in self.schema})
 
     def to_expr(self):
         from ibis.expr.types import Table
@@ -75,6 +83,8 @@ class Relation(Node, Coercible):
 
 @public
 class Field(Value):
+    """A field of a relation."""
+
     rel: Relation
     name: str
 
@@ -109,8 +119,10 @@ def _check_integrity(values, allowed_parents):
 
 @public
 class Project(Relation):
+    """Project a subset of columns from a relation."""
+
     parent: Relation
-    values: FrozenDict[str, NonSortKey[Unaliased[Value]]]
+    values: FrozenOrderedDict[str, NonSortKey[Unaliased[Value]]]
 
     def __init__(self, parent, values):
         _check_integrity(values.values(), {parent})
@@ -134,6 +146,28 @@ class Simple(Relation):
 
 
 @public
+class DropColumns(Relation):
+    """Drop columns from a relation."""
+
+    parent: Relation
+    columns_to_drop: frozenset[str]
+
+    @attribute
+    def schema(self):
+        schema = self.parent.schema.fields.copy()
+        for column in self.columns_to_drop:
+            del schema[column]
+        return Schema(schema)
+
+    @attribute
+    def values(self):
+        fields = self.parent.fields.copy()
+        for column in self.columns_to_drop:
+            del fields[column]
+        return fields
+
+
+@public
 class Reference(Relation):
     _uid_counter = itertools.count()
     parent: Relation
@@ -152,7 +186,9 @@ class Reference(Relation):
 # TODO(kszucs): remove in favor of View
 @public
 class SelfReference(Reference):
-    values = FrozenDict()
+    """A self-referential relation."""
+
+    values = FrozenOrderedDict()
 
 
 @public
@@ -173,6 +209,7 @@ JoinKind = Literal[
     "any_inner",
     "any_left",
     "cross",
+    "positional",
 ]
 
 
@@ -187,7 +224,7 @@ class JoinLink(Node):
 class JoinChain(Relation):
     first: Reference
     rest: VarTuple[JoinLink]
-    values: FrozenDict[str, Unaliased[Value]]
+    values: FrozenOrderedDict[str, Unaliased[Value]]
 
     def __init__(self, first, rest, values):
         allowed_parents = {first}
@@ -221,6 +258,8 @@ class JoinChain(Relation):
 
 @public
 class Sort(Simple):
+    """Sort a table by a set of keys."""
+
     keys: VarTuple[SortKey]
 
     def __init__(self, parent, keys):
@@ -230,16 +269,21 @@ class Sort(Simple):
 
 @public
 class Filter(Simple):
+    """Filter a table by a set of predicates."""
+
     predicates: VarTuple[Value[dt.Boolean]]
 
     def __init__(self, parent, predicates):
-        from ibis.expr.rewrites import ReductionLike
+        from ibis.expr.rewrites import ReductionLike, p
 
         for pred in predicates:
-            if pred.find(ReductionLike, filter=Value):
+            # bare reductions that are not window functions are not allowed
+            if pred.find(ReductionLike, filter=Value) and not pred.find(
+                p.WindowFunction, filter=Value
+            ):
                 raise IntegrityError(
                     f"Cannot add {pred!r} to filter, it is a reduction which "
-                    "must be converted to a scalar subquery first"
+                    "must be converted to a scalar subquery or window function first"
                 )
             if pred.relations and parent not in pred.relations:
                 raise IntegrityError(
@@ -250,6 +294,8 @@ class Filter(Simple):
 
 @public
 class Limit(Simple):
+    """Limit and/or offset the number of records in a table."""
+
     # TODO(kszucs): dynamic limit should contain ScalarSubqueries rather than
     # plain scalar values
     n: typing.Union[int, Scalar[dt.Integer], None] = None
@@ -258,9 +304,11 @@ class Limit(Simple):
 
 @public
 class Aggregate(Relation):
+    """Aggregate a table by a set of group by columns and metrics."""
+
     parent: Relation
-    groups: FrozenDict[str, Unaliased[Column]]
-    metrics: FrozenDict[str, Unaliased[Scalar]]
+    groups: FrozenOrderedDict[str, Unaliased[Value]]
+    metrics: FrozenOrderedDict[str, Unaliased[Scalar]]
 
     def __init__(self, parent, groups, metrics):
         _check_integrity(groups.values(), {parent})
@@ -273,7 +321,7 @@ class Aggregate(Relation):
 
     @attribute
     def values(self):
-        return FrozenDict({**self.groups, **self.metrics})
+        return FrozenOrderedDict({**self.groups, **self.metrics})
 
     @attribute
     def schema(self):
@@ -282,16 +330,29 @@ class Aggregate(Relation):
 
 @public
 class Set(Relation):
+    """Base class for set operations."""
+
     left: Relation
     right: Relation
     distinct: bool = False
-    values = FrozenDict()
+    values = FrozenOrderedDict()
 
     def __init__(self, left, right, **kwargs):
-        # convert to dictionary first, to get key-unordered comparison semantics
-        if dict(left.schema) != dict(right.schema):
-            raise RelationError("Table schemas must be equal for set operations")
-        elif left.schema.names != right.schema.names:
+        err_msg = "Table schemas must be equal for set operations."
+        try:
+            missing_from_left = right.schema - left.schema
+            missing_from_right = left.schema - right.schema
+        except ConflictingValuesError as e:
+            raise RelationError(err_msg + "\n" + str(e)) from e
+        if missing_from_left or missing_from_right:
+            msgs = [err_msg]
+            if missing_from_left:
+                msgs.append(f"Columns missing from the left:\n{missing_from_left}.")
+            if missing_from_right:
+                msgs.append(f"Columns missing from the right:\n{missing_from_right}.")
+            raise RelationError("\n".join(msgs))
+
+        if left.schema.names != right.schema.names:
             # rewrite so that both sides have the columns in the same order making it
             # easier for the backends to implement set operations
             cols = {name: Field(right, name) for name in left.schema.names}
@@ -305,39 +366,51 @@ class Set(Relation):
 
 @public
 class Union(Set):
-    pass
+    """Union two tables."""
 
 
 @public
 class Intersection(Set):
-    pass
+    """Intersect two tables."""
 
 
 @public
 class Difference(Set):
-    pass
+    """Subtract one table from another."""
 
 
 @public
 class PhysicalTable(Relation):
+    """Base class for tables with a name."""
+
     name: str
-    values = FrozenDict()
+    values = FrozenOrderedDict()
 
 
 @public
 class Namespace(Concrete):
+    """Object to model namespaces for tables.
+
+    Maps to the concept of database and/or catalog in SQL databases that support
+    them.
+    """
+
     catalog: Optional[str] = None
     database: Optional[str] = None
 
 
 @public
 class UnboundTable(PhysicalTable):
+    """A table that is not bound to a specific backend."""
+
     schema: Schema
     namespace: Namespace = Namespace()
 
 
 @public
 class DatabaseTable(PhysicalTable):
+    """A table that is bound to a specific backend."""
+
     schema: Schema
     source: Any
     namespace: Namespace = Namespace()
@@ -345,18 +418,20 @@ class DatabaseTable(PhysicalTable):
 
 @public
 class InMemoryTable(PhysicalTable):
+    """A table whose data is stored in memory."""
+
     schema: Schema
     data: TableProxy
 
 
 @public
 class SQLQueryResult(Relation):
-    """A table sourced from the result set of a select query."""
+    """A table sourced from the result set of a SQL SELECT statement."""
 
     query: str
     schema: Schema
     source: Any
-    values = FrozenDict()
+    values = FrozenOrderedDict()
 
 
 @public
@@ -378,12 +453,14 @@ class SQLStringView(Relation):
     child: Relation
     query: str
     schema: Schema
-    values = FrozenDict()
+    values = FrozenOrderedDict()
 
 
 @public
 class DummyTable(Relation):
-    values: FrozenDict[str, Value]
+    """A table constructed from literal values."""
+
+    values: FrozenOrderedDict[str, Annotated[Value, ~InstanceOf(Alias)]]
 
     @attribute
     def schema(self):
@@ -391,14 +468,14 @@ class DummyTable(Relation):
 
 
 @public
-class FillNa(Simple):
+class FillNull(Simple):
     """Fill null values in the table."""
 
     replacements: typing.Union[Value[dt.Numeric | dt.String], FrozenDict[str, Any]]
 
 
 @public
-class DropNa(Simple):
+class DropNull(Simple):
     """Drop null values in the table."""
 
     how: typing.Literal["any", "all"]
@@ -416,7 +493,32 @@ class Sample(Simple):
 
 @public
 class Distinct(Simple):
-    """Distinct is a table-level unique-ing operation."""
+    """Compute the distinct rows of a table."""
+
+
+@public
+class TableUnnest(Relation):
+    """Cross join unnest operation."""
+
+    parent: Relation
+    column: Value[dt.Array]
+    column_name: str
+    offset: typing.Union[str, None]
+    keep_empty: bool
+
+    @attribute
+    def values(self):
+        return self.parent.fields
+
+    @attribute
+    def schema(self):
+        base = self.parent.schema.fields.copy()
+        base[self.column_name] = self.column.dtype.value_type
+
+        if self.offset is not None:
+            base[self.offset] = dt.int64
+
+        return Schema(base)
 
 
 # TODO(kszucs): support t.select(*t) syntax by implementing Table.__iter__()

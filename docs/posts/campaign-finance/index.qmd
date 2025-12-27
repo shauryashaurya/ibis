@@ -73,7 +73,7 @@ raw
 ```
 
 ```{python}
-# For a more comprehesive description of the columns and their meaning, see
+# For a more comprehensive description of the columns and their meaning, see
 # https://www.fec.gov/campaign-finance-data/contributions-individuals-file-description/
 columns = {
     "CMTE_ID": "keep",  # Committee ID
@@ -101,9 +101,9 @@ columns = {
     "SUB_ID": "drop",  # Submission ID. Unique number assigned to each transaction.
 }
 
-renaming = {old: new for old, new in zip(raw.columns, columns.keys())}
+renaming = dict(zip(columns.keys(), raw.columns))
 to_keep = [k for k, v in columns.items() if v == "keep"]
-kept = raw.relabel(renaming)[to_keep]
+kept = raw.rename(renaming)[to_keep]
 kept
 ```
 
@@ -214,7 +214,7 @@ from ibis.expr.types import StringValue, DateValue
 
 
 def mmddyyyy_to_date(val: StringValue) -> DateValue:
-    return val.cast(str).lpad(8, "0").to_timestamp("%m%d%Y").date()
+    return val.cast(str).lpad(8, "0").nullif("").to_timestamp("%m%d%Y").date()
 
 
 cleaned = cleaned.mutate(date=mmddyyyy_to_date(_.TRANSACTION_DT)).drop("TRANSACTION_DT")
@@ -245,7 +245,7 @@ def get_election_type(pgi: StringValue) -> StringValue:
         "E": "recount",
     }
     first_letter = pgi[0]
-    return first_letter.substitute(election_types, else_=ibis.NA)
+    return first_letter.substitute(election_types, else_=ibis.null())
 
 
 cleaned = cleaned.mutate(election_type=get_election_type(_.TRANSACTION_PGI)).drop(

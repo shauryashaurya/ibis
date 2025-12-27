@@ -8,6 +8,7 @@ import pandas as pd
 import pandas.testing as tm
 import pyarrow as pa
 import pytest
+from pytest import param
 
 import ibis
 import ibis.common.exceptions as exc
@@ -62,6 +63,66 @@ def test_create_table(con, awards_players_schema, temp_table, csv_source_configs
     assert temp_table not in con.list_tables()
 
 
+@pytest.mark.parametrize(
+    "obj, table_name",
+    [
+        param(lambda: pa.table({"a": ["a"], "b": [1]}), "df_arrow", id="pyarrow table"),
+        param(lambda: pd.DataFrame({"a": ["a"], "b": [1]}), "df_pandas", id="pandas"),
+        param(
+            lambda: pytest.importorskip("polars").DataFrame({"a": ["a"], "b": [1]}),
+            "df_polars_eager",
+            id="polars dataframe",
+        ),
+        param(
+            lambda: pytest.importorskip("polars").LazyFrame({"a": ["a"], "b": [1]}),
+            "df_polars_lazy",
+            id="polars lazyframe",
+        ),
+        param(
+            lambda: ibis.memtable([("a", 1)], columns=["a", "b"]),
+            "memtable",
+            id="memtable_list",
+        ),
+        param(
+            lambda: ibis.memtable(pa.table({"a": ["a"], "b": [1]})),
+            "memtable_pa",
+            id="memtable pyarrow",
+        ),
+        param(
+            lambda: ibis.memtable(pd.DataFrame({"a": ["a"], "b": [1]})),
+            "memtable_pandas",
+            id="memtable pandas",
+        ),
+        param(
+            lambda: ibis.memtable(
+                pytest.importorskip("polars").DataFrame({"a": ["a"], "b": [1]})
+            ),
+            "memtable_polars_eager",
+            id="memtable polars dataframe",
+        ),
+        param(
+            lambda: ibis.memtable(
+                pytest.importorskip("polars").LazyFrame({"a": ["a"], "b": [1]})
+            ),
+            "memtable_polars_lazy",
+            id="memtable polars lazyframe",
+        ),
+    ],
+)
+def test_create_table_in_memory(con, obj, table_name, monkeypatch):
+    """Same as in ibis/backends/tests/test_client.py, with temp=True."""
+    monkeypatch.setattr(ibis.options, "default_backend", con)
+    obj = obj()
+    t = con.create_table(table_name, obj, temp=True)
+
+    result = pa.table({"a": ["a"], "b": [1]})
+    assert table_name in con.list_tables()
+
+    assert result.equals(t.to_pyarrow())
+
+    con.drop_table(table_name, force=True)
+
+
 def test_recreate_table_from_schema(
     con, awards_players_schema, temp_table, csv_source_configs
 ):
@@ -77,7 +138,7 @@ def test_recreate_table_from_schema(
     # create the same table a second time should fail
     with pytest.raises(
         Py4JJavaError,
-        match="org.apache.flink.table.catalog.exceptions.TableAlreadyExistException",
+        match=r"org\.apache\.flink\.table\.catalog\.exceptions\.TableAlreadyExistException",
     ):
         new_table = con.create_table(
             temp_table,
@@ -125,7 +186,7 @@ def test_recreate_in_mem_table(con, schema, table_name, temp_table, csv_source_c
         tbl_properties = None
 
     new_table = con.create_table(
-        name=temp_table,
+        temp_table,
         obj=employee_df,
         schema=schema,
         tbl_properties=tbl_properties,
@@ -142,7 +203,7 @@ def test_recreate_in_mem_table(con, schema, table_name, temp_table, csv_source_c
             match=r"An error occurred while calling o\d+\.createTemporaryView",
         ):
             new_table = con.create_table(
-                name=temp_table,
+                temp_table,
                 obj=employee_df,
                 schema=schema,
                 tbl_properties=tbl_properties,
@@ -168,7 +229,7 @@ def test_force_recreate_in_mem_table(con, schema_props, temp_table, csv_source_c
         tbl_properties = None
 
     new_table = con.create_table(
-        name=temp_table,
+        temp_table,
         obj=employee_df,
         schema=schema,
         tbl_properties=tbl_properties,
@@ -181,7 +242,7 @@ def test_force_recreate_in_mem_table(con, schema_props, temp_table, csv_source_c
 
         # force recreate the same table a second time should succeed
         new_table = con.create_table(
-            name=temp_table,
+            temp_table,
             obj=employee_df,
             schema=schema,
             tbl_properties=tbl_properties,
@@ -286,14 +347,14 @@ def test_create_view(
     con, temp_table, awards_players_schema, csv_source_configs, temp_view, temp
 ):
     table = con.create_table(
-        name=temp_table,
+        temp_table,
         schema=awards_players_schema,
         tbl_properties=csv_source_configs("awards_players"),
     )
     assert temp_table in con.list_tables()
 
     con.create_view(
-        name=temp_view,
+        temp_view,
         obj=table,
         force=False,
         temp=temp,
@@ -305,7 +366,7 @@ def test_create_view(
     # Try to re-create the same view with `force=False`
     with pytest.raises(Py4JJavaError):
         con.create_view(
-            name=temp_view,
+            temp_view,
             obj=table,
             force=False,
             temp=temp,
@@ -315,7 +376,7 @@ def test_create_view(
 
     # Try to re-create the same view with `force=True`
     con.create_view(
-        name=temp_view,
+        temp_view,
         obj=table,
         force=True,
         temp=temp,
@@ -325,7 +386,7 @@ def test_create_view(
 
     # Overwrite the view
     con.create_view(
-        name=temp_view,
+        temp_view,
         obj=table,
         force=False,
         temp=temp,
@@ -333,14 +394,14 @@ def test_create_view(
     )
     assert view_list == sorted(con.list_tables())
 
-    con.drop_view(name=temp_view, temp=temp, force=True)
+    con.drop_view(temp_view, temp=temp, force=True)
     assert temp_view not in con.list_tables()
 
 
 def test_rename_table(con, awards_players_schema, temp_table, csv_source_configs):
     table_name = temp_table
     con.create_table(
-        name=table_name,
+        table_name,
         schema=awards_players_schema,
         tbl_properties=csv_source_configs("awards_players"),
     )
@@ -362,10 +423,8 @@ def test_rename_table(con, awards_players_schema, temp_table, csv_source_configs
 @pytest.mark.parametrize(
     "obj",
     [
-        pytest.param(
-            [("fred flintstone", 35, 1.28), ("barney rubble", 32, 2.32)], id="list"
-        ),
-        pytest.param(
+        param([("fred flintstone", 35, 1.28), ("barney rubble", 32, 2.32)], id="list"),
+        param(
             {
                 "name": ["fred flintstone", "barney rubble"],
                 "age": [35, 32],
@@ -373,14 +432,14 @@ def test_rename_table(con, awards_players_schema, temp_table, csv_source_configs
             },
             id="dict",
         ),
-        pytest.param(
+        param(
             pd.DataFrame(
                 [("fred flintstone", 35, 1.28), ("barney rubble", 32, 2.32)],
                 columns=["name", "age", "gpa"],
             ),
             id="pandas_dataframe",
         ),
-        pytest.param(
+        param(
             pa.Table.from_arrays(
                 [
                     pa.array(["fred flintstone", "barney rubble"]),
@@ -448,9 +507,7 @@ def test_insert_simple_select(con, tempdir_sink_configs):
 def test_read_csv(con, awards_players_schema, csv_source_configs, table_name):
     source_configs = csv_source_configs("awards_players")
     table = con.read_csv(
-        path=source_configs["path"],
-        schema=awards_players_schema,
-        table_name=table_name,
+        source_configs["path"], schema=awards_players_schema, table_name=table_name
     )
     try:
         if table_name is None:
@@ -467,9 +524,7 @@ def test_read_parquet(con, data_dir, tmp_path, table_name, functional_alltypes_s
     fname = Path("functional_alltypes.parquet")
     fname = Path(data_dir) / "parquet" / fname.name
     table = con.read_parquet(
-        path=tmp_path / fname.name,
-        schema=functional_alltypes_schema,
-        table_name=table_name,
+        tmp_path / fname.name, schema=functional_alltypes_schema, table_name=table_name
     )
 
     try:
@@ -494,7 +549,7 @@ def test_read_json(con, data_dir, tmp_path, table_name, functional_alltypes_sche
     path = tmp_path / "functional_alltypes.json"
     df.to_json(path, orient="records", lines=True, date_format="iso")
     table = con.read_json(
-        path=path, schema=functional_alltypes_schema, table_name=table_name
+        path, schema=functional_alltypes_schema, table_name=table_name
     )
 
     try:

@@ -7,22 +7,86 @@ import uuid as pyuuid
 from abc import abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from numbers import Integral, Real
-from typing import Any, Generic, Literal, NamedTuple, Optional, TypeVar, get_type_hints
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    NamedTuple,
+    Optional,
+    TypeVar,
+    Union,
+    get_type_hints,
+    overload,
+)
 
 import toolz
 from public import public
 from typing_extensions import Self, get_args, get_origin
 
 from ibis.common.annotations import attribute
-from ibis.common.collections import FrozenDict, MapSet
+from ibis.common.collections import FrozenOrderedDict, MapSet
 from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.grounds import Concrete, Singleton
-from ibis.common.patterns import Coercible, CoercionError
+from ibis.common.patterns import Between, Coercible, CoercionError
 from ibis.common.temporal import IntervalUnit, TimestampUnit
+from ibis.common.typing import UnionType
+
+if TYPE_CHECKING:
+    import numpy as np
+    import polars as pl
+    import pyarrow as pa
+    from pandas.api.extensions import ExtensionDtype
+
+
+@overload
+def dtype(value: type[int] | Literal["int"], nullable: bool = True) -> Int64: ...
+@overload
+def dtype(
+    value: type[str] | Literal["str", "string"], nullable: bool = True
+) -> String: ...
+@overload
+def dtype(
+    value: type[bool] | Literal["bool", "boolean"], nullable: bool = True
+) -> Boolean: ...
+@overload
+def dtype(value: type[bytes] | Literal["bytes"], nullable: bool = True) -> Binary: ...
+@overload
+def dtype(value: type[Real] | Literal["float"], nullable: bool = True) -> Float64: ...
+@overload
+def dtype(
+    value: type[pydecimal.Decimal] | Literal["decimal"], nullable: bool = True
+) -> Decimal: ...
+@overload
+def dtype(
+    value: type[pydatetime.datetime] | Literal["timestamp"], nullable: bool = True
+) -> Timestamp: ...
+@overload
+def dtype(
+    value: type[pydatetime.date] | Literal["date"], nullable: bool = True
+) -> Date: ...
+@overload
+def dtype(
+    value: type[pydatetime.time] | Literal["time"], nullable: bool = True
+) -> Time: ...
+@overload
+def dtype(
+    value: type[pydatetime.timedelta] | Literal["interval"], nullable: bool = True
+) -> Interval: ...
+@overload
+def dtype(
+    value: type[pyuuid.UUID] | Literal["uuid"], nullable: bool = True
+) -> UUID: ...
+@overload
+def dtype(
+    value: DataType | str | np.dtype | ExtensionDtype | pl.DataType | pa.DataType,
+    nullable: bool = True,
+) -> DataType: ...
 
 
 @lazy_singledispatch
-def dtype(value: Any, nullable: bool = True) -> DataType:
+def dtype(value, nullable=True) -> DataType:
     """Create a DataType object.
 
     Parameters
@@ -33,21 +97,24 @@ def dtype(value: Any, nullable: bool = True) -> DataType:
         pyarrow types.
     nullable
         Whether the type should be nullable. Defaults to True.
+        If `value` is a string prefixed by "!", the type is always non-nullable.
 
     Examples
     --------
     >>> import ibis
     >>> ibis.dtype("int32")
     Int32(nullable=True)
+    >>> ibis.dtype("!int32")
+    Int32(nullable=False)
     >>> ibis.dtype("array<float>")
-    Array(value_type=Float64(nullable=True), nullable=True)
+    Array(value_type=Float64(nullable=True), length=None, nullable=True)
 
     DataType objects may also be created from Python types:
 
-    >>> ibis.dtype(int)
-    Int64(nullable=True)
+    >>> ibis.dtype(int, nullable=False)
+    Int64(nullable=False)
     >>> ibis.dtype(list[float])
-    Array(value_type=Float64(nullable=True), nullable=True)
+    Array(value_type=Float64(nullable=True), length=None, nullable=True)
 
     Or other type systems, like numpy/pandas/pyarrow types:
 
@@ -59,12 +126,12 @@ def dtype(value: Any, nullable: bool = True) -> DataType:
     if isinstance(value, DataType):
         return value
     else:
-        return DataType.from_typehint(value)
+        return DataType.from_typehint(value, nullable)
 
 
 @dtype.register(str)
-def from_string(value):
-    return DataType.from_string(value)
+def from_string(value, nullable: bool = True):
+    return DataType.from_string(value, nullable)
 
 
 @dtype.register("numpy.dtype")
@@ -95,10 +162,21 @@ del dtype.register
 class DataType(Concrete, Coercible):
     """Base class for all data types.
 
+    Don't instantiate this class directly, use the
+    [ibis.dtype](./datatypes.qmd#ibis.dtype) function instead.
     Instances are immutable.
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.dtype("int32")
+    Int32(nullable=True)
+    >>> isinstance(ibis.dtype("int32"), ibis.DataType)
+    True
     """
 
     nullable: bool = True
+    """A bool of whether the type is nullable."""
 
     @property
     @abstractmethod
@@ -112,12 +190,6 @@ class DataType(Concrete, Coercible):
     @property
     def _pretty_piece(self) -> str:
         return ""
-
-    # TODO(kszucs): should remove it, only used internally
-    @property
-    def name(self) -> str:
-        """Return the name of the data type."""
-        return self.__class__.__name__
 
     @classmethod
     def __coerce__(cls, value, **kwargs):
@@ -133,38 +205,55 @@ class DataType(Concrete, Coercible):
 
     def __str__(self) -> str:
         prefix = "!" * (not self.nullable)
-        return f"{prefix}{self.name.lower()}{self._pretty_piece}"
+        name = self.__class__.__name__.lower()
+        return f"{prefix}{name}{self._pretty_piece}"
 
-    def equals(self, other):
+    def equals(self, other: DataType) -> bool:
         if not isinstance(other, DataType):
             raise TypeError(
                 f"invalid equality comparison between DataType and {type(other)}"
             )
         return self == other
 
-    def cast(self, other, **kwargs):
+    def cast(self, other: str | DataType, **kwargs) -> DataType:
         # TODO(kszucs): remove it or deprecate it?
         from ibis.expr.datatypes.cast import cast
 
         return cast(self, other, **kwargs)
 
-    def castable(self, to, **kwargs) -> bool:
+    def castable(self, to: DataType, **kwargs) -> bool:
         """Check whether this type is castable to another."""
         from ibis.expr.datatypes.cast import castable
 
         return castable(self, to, **kwargs)
 
     @classmethod
-    def from_string(cls, value) -> Self:
+    def from_string(cls, value: str, nullable: bool = True) -> Self:
         from ibis.expr.datatypes.parse import parse
 
         try:
-            return parse(value)
+            typ = parse(value)
         except SyntaxError:
             raise TypeError(f"{value!r} cannot be parsed as a datatype")
 
+        if not nullable:
+            return typ.copy(nullable=nullable)
+        return typ
+
     @classmethod
     def from_typehint(cls, typ, nullable=True) -> Self:
+        # All types are nullable by default
+        # (eg `ibis.dtype(int)` results in `Int64(nullable=True)`),
+        # so if we are handed Union[None, T], simplify it to T.
+        #
+        # Depending on if you use `Union[A, B]` vs `A | B`, the type differs
+        #
+        # with Optional, you get __origin__ and with | syntax you get a UnionType
+        if getattr(typ, "__origin__", None) is Union or isinstance(typ, UnionType):
+            not_nones = [t for t in get_args(typ) if t is not type(None)]
+            if len(not_nones) == 1:
+                typ = not_nones[0]
+
         origin_type = get_origin(typ)
 
         if origin_type is None:
@@ -220,52 +309,54 @@ class DataType(Concrete, Coercible):
             raise TypeError(f"Value {typ!r} is not a valid datatype")
 
     @classmethod
-    def from_numpy(cls, numpy_type, nullable=True) -> Self:
+    def from_numpy(cls, numpy_type: np.dtype, nullable: bool = True) -> Self:
         """Return the equivalent ibis datatype."""
         from ibis.formats.numpy import NumpyType
 
         return NumpyType.to_ibis(numpy_type, nullable=nullable)
 
     @classmethod
-    def from_pandas(cls, pandas_type, nullable=True) -> Self:
+    def from_pandas(
+        cls, pandas_type: np.dtype | ExtensionDtype, nullable: bool = True
+    ) -> Self:
         """Return the equivalent ibis datatype."""
         from ibis.formats.pandas import PandasType
 
         return PandasType.to_ibis(pandas_type, nullable=nullable)
 
     @classmethod
-    def from_pyarrow(cls, arrow_type, nullable=True) -> Self:
+    def from_pyarrow(cls, arrow_type: pa.DataType, nullable: bool = True) -> Self:
         """Return the equivalent ibis datatype."""
         from ibis.formats.pyarrow import PyArrowType
 
         return PyArrowType.to_ibis(arrow_type, nullable=nullable)
 
     @classmethod
-    def from_polars(cls, polars_type, nullable=True) -> Self:
+    def from_polars(cls, polars_type: pl.DataType, nullable: bool = True) -> Self:
         """Return the equivalent ibis datatype."""
         from ibis.formats.polars import PolarsType
 
         return PolarsType.to_ibis(polars_type, nullable=nullable)
 
-    def to_numpy(self):
+    def to_numpy(self) -> np.dtype:
         """Return the equivalent numpy datatype."""
         from ibis.formats.numpy import NumpyType
 
         return NumpyType.from_ibis(self)
 
-    def to_pandas(self):
+    def to_pandas(self) -> np.dtype | ExtensionDtype:
         """Return the equivalent pandas datatype."""
         from ibis.formats.pandas import PandasType
 
         return PandasType.from_ibis(self)
 
-    def to_pyarrow(self):
+    def to_pyarrow(self) -> pa.DataType:
         """Return the equivalent pyarrow datatype."""
         from ibis.formats.pyarrow import PyArrowType
 
         return PyArrowType.from_ibis(self)
 
-    def to_polars(self):
+    def to_polars(self) -> pl.DataType:
         """Return the equivalent polars datatype."""
         from ibis.formats.polars import PolarsType
 
@@ -294,6 +385,10 @@ class DataType(Concrete, Coercible):
     def is_enum(self) -> bool:
         """Return True if an instance of an Enum type."""
         return isinstance(self, Enum)
+
+    def is_fixed_length_array(self) -> bool:
+        """Return True if an instance of an Array type and has a known length."""
+        return isinstance(self, Array) and self.length is not None
 
     def is_float16(self) -> bool:
         """Return True if an instance of a Float16 type."""
@@ -453,11 +548,27 @@ class DataType(Concrete, Coercible):
 
 
 @public
-class Unknown(DataType, Singleton):
+class Unknown(DataType):
     """An unknown type."""
+
+    raw_type: Any = None
+    """The raw type from the underlying type system, such as pa.DataType | sge.DataType if available.
+
+    The idea is that `type_mapper.from_ibis(type_mapper.to_ibis(original_type))`
+    should roundtrip back to the original type.
+    For example, when reading a user defined datatype from postgres,
+    eg "MySchema"."MyEnum", the `raw_type` will be
+    a `sqlglot.expressions.DataType` object holding that.
+    Ibis won't know how to interact with the expression, but
+    we can still pass it around, and cast.
+    """
 
     scalar = "UnknownScalar"
     column = "UnknownColumn"
+
+    @property
+    def _pretty_piece(self) -> str:
+        return f"({self.raw_type!r})" if self.raw_type is not None else ""
 
 
 @public
@@ -525,6 +636,12 @@ class Integer(Primitive, Numeric):
 class String(Variadic, Singleton):
     """A type representing a string.
 
+    ::: {.callout-note}
+    ## The `length` attribute has **no** effect on the end-user API.
+
+    `length` is supported so that fixed-length strings' metadata is preserved.
+    :::
+
     Notes
     -----
     Because of differences in the way different backends handle strings, we
@@ -532,8 +649,16 @@ class String(Variadic, Singleton):
 
     """
 
+    length: Optional[int] = None
+
     scalar = "StringScalar"
     column = "StringColumn"
+
+    @property
+    def _pretty_piece(self) -> str:
+        if (length := self.length) is not None:
+            return f"({length:d})"
+        return ""
 
 
 @public
@@ -577,33 +702,24 @@ class Time(Temporal, Primitive):
 
 @public
 class Timestamp(Temporal, Parametric):
-    """Timestamp values."""
+    """Timestamp values, with a timezone and a scale."""
 
     timezone: Optional[str] = None
     """The timezone of values of this type."""
 
     # Literal[*range(10)] is only supported from 3.11
     scale: Optional[Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]] = None
-    """The scale of the timestamp if known."""
+    """The number of digits after the decimal point. eg 3 for milliseconds, 6 for microseconds."""
 
     scalar = "TimestampScalar"
     column = "TimestampColumn"
 
     @classmethod
-    def from_unit(cls, unit, timezone=None, nullable=True):
+    def from_unit(cls, unit, timezone=None, nullable=True) -> Self:
         """Return a timestamp type with the given unit and timezone."""
-        unit = TimestampUnit(unit)
-        if unit == TimestampUnit.SECOND:
-            scale = 0
-        elif unit == TimestampUnit.MILLISECOND:
-            scale = 3
-        elif unit == TimestampUnit.MICROSECOND:
-            scale = 6
-        elif unit == TimestampUnit.NANOSECOND:
-            scale = 9
-        else:
-            raise ValueError(f"Invalid unit {unit}")
-        return cls(scale=scale, timezone=timezone, nullable=nullable)
+        return cls(
+            scale=TimestampUnit.to_scale(unit), timezone=timezone, nullable=nullable
+        )
 
     @property
     def unit(self) -> str:
@@ -617,6 +733,9 @@ class Timestamp(Temporal, Parametric):
         elif 7 <= self.scale <= 9:
             return TimestampUnit.NANOSECOND
         else:
+            # TODO: remove raise path as it's never triggered
+            # TimestampUnit, which is a (child of) Enum
+            # so it'll raise in the Enum class constructor instead
             raise ValueError(f"Invalid scale {self.scale}")
 
     @property
@@ -636,7 +755,7 @@ class SignedInteger(Integer):
     """Signed integer values."""
 
     @property
-    def bounds(self):
+    def bounds(self) -> Bounds:
         exp = self.nbytes * 8 - 1
         upper = (1 << exp) - 1
         return Bounds(lower=~upper, upper=upper)
@@ -647,7 +766,7 @@ class UnsignedInteger(Integer):
     """Unsigned integer values."""
 
     @property
-    def bounds(self):
+    def bounds(self) -> Bounds:
         exp = self.nbytes * 8
         upper = (1 << exp) - 1
         return Bounds(lower=0, upper=upper)
@@ -765,8 +884,7 @@ class Decimal(Numeric, Parametric):
         if precision is not None:
             if not isinstance(precision, numbers.Integral):
                 raise TypeError(
-                    "Decimal type precision must be an integer; "
-                    f"got {type(precision)}"
+                    f"Decimal type precision must be an integer; got {type(precision)}"
                 )
             if precision < 0:
                 raise ValueError("Decimal type precision cannot be negative")
@@ -810,7 +928,7 @@ class Interval(Parametric):
     column = "IntervalColumn"
 
     @property
-    def resolution(self):
+    def resolution(self) -> str:
         """The interval unit's name."""
         return self.unit.singular
 
@@ -823,7 +941,7 @@ class Interval(Parametric):
 class Struct(Parametric, MapSet):
     """Structured values."""
 
-    fields: FrozenDict[str, DataType]
+    fields: FrozenOrderedDict[str, DataType]
 
     scalar = "StructScalar"
     column = "StructColumn"
@@ -831,7 +949,7 @@ class Struct(Parametric, MapSet):
     @classmethod
     def from_tuples(
         cls, pairs: Iterable[tuple[str, str | DataType]], nullable: bool = True
-    ) -> Struct:
+    ) -> Self:
         """Construct a `Struct` type from pairs.
 
         Parameters
@@ -869,7 +987,8 @@ class Struct(Parametric, MapSet):
         return self.fields[key]
 
     def __repr__(self) -> str:
-        return f"'{self.name}({list(self.items())}, nullable={self.nullable})"
+        name = self.__class__.__name__
+        return f"{name}({list(self.items())}, nullable={self.nullable})"
 
     @property
     def _pretty_piece(self) -> str:
@@ -885,13 +1004,19 @@ class Array(Variadic, Parametric, Generic[T]):
     """Array values."""
 
     value_type: T
+    """Element type of the array."""
+    length: Optional[Annotated[int, Between(lower=0)]] = None
+    """The length of the array if known."""
 
     scalar = "ArrayScalar"
     column = "ArrayColumn"
 
     @property
     def _pretty_piece(self) -> str:
-        return f"<{self.value_type}>"
+        value_type = self.value_type
+        if (length := self.length) is not None:
+            return f"<{value_type}, {length:d}>"
+        return f"<{value_type}>"
 
 
 K = TypeVar("K", bound=DataType, covariant=True)
@@ -903,7 +1028,9 @@ class Map(Variadic, Parametric, Generic[K, V]):
     """Associative array values."""
 
     key_type: K
+    """Map key type."""
     value_type: V
+    """Map value type."""
 
     scalar = "MapScalar"
     column = "MapColumn"
@@ -920,12 +1047,19 @@ class JSON(Variadic):
     scalar = "JSONScalar"
     column = "JSONColumn"
 
+    binary: bool = False
+    """True if JSON is stored as binary, e.g., JSONB in PostgreSQL."""
+
+    @property
+    def _pretty_piece(self) -> str:
+        return "b" * self.binary
+
 
 @public
 class GeoSpatial(DataType):
     """Geospatial values."""
 
-    geotype: Optional[Literal["geography", "geometry"]] = None
+    geotype: Literal["geography", "geometry"] = "geometry"
     """The specific geospatial type."""
 
     srid: Optional[int] = None
@@ -1050,7 +1184,8 @@ multilinestring = MultiLineString()
 multipoint = MultiPoint()
 multipolygon = MultiPolygon()
 # json
-json = JSON()
+json = JSON(binary=False)
+jsonb = JSON(binary=True)
 # special string based data type
 uuid = UUID()
 macaddr = MACADDR()
@@ -1091,6 +1226,7 @@ public(
     multipoint=multipoint,
     multipolygon=multipolygon,
     json=json,
+    jsonb=jsonb,
     uuid=uuid,
     macaddr=macaddr,
     inet=inet,

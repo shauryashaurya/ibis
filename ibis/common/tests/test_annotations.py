@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import pickle
 from typing import Annotated, Union
 
 import pytest
@@ -79,16 +80,8 @@ def test_annotations_are_not_hashable():
         hash(a)
 
 
-def test_argument_repr():
-    argument = Argument(is_int, typehint=int, default=None)
-    assert repr(argument) == (
-        "Argument(pattern=InstanceOf(type=<class 'int'>), default=None, "
-        "typehint=<class 'int'>, kind=<_ParameterKind.POSITIONAL_OR_KEYWORD: 1>)"
-    )
-
-
 def test_default_argument():
-    annotation = Argument(pattern=lambda x, context: int(x), default=3)
+    annotation = Argument(pattern=lambda x, *_, **__: int(x), default=3)
     assert annotation.pattern.match(1, {}) == 1
 
 
@@ -129,7 +122,7 @@ def test_attribute_default_value():
 
     assert field.get_default("b", Foo) == 20
 
-    field2 = Attribute(pattern=lambda x, this: str(x), default=lambda self: self.a)
+    field2 = Attribute(pattern=lambda x, *_, **__: str(x), default=lambda self: self.a)
     assert field2.has_default()
     assert field != field2
     assert field2.get_default("b", Foo) == "10"
@@ -140,31 +133,31 @@ def test_parameter():
         return int(x) + this["other"]
 
     annot = argument(fn)
-    p = Parameter("test", annotation=annot)
+    p = Parameter.from_argument("test", annotation=annot)
 
     assert p.annotation is annot
     assert p.default is inspect.Parameter.empty
     assert p.annotation.pattern.match("2", {"other": 1}) == 3
 
     ofn = optional(fn)
-    op = Parameter("test", annotation=ofn)
+    op = Parameter.from_argument("test", annotation=ofn)
     assert op.annotation.pattern == Option(fn, default=None)
     assert op.default is None
     assert op.annotation.pattern.match(None, {"other": 1}) is None
 
     with pytest.raises(TypeError, match="annotation must be an instance of Argument"):
-        Parameter("wrong", annotation=Attribute(lambda x, context: x))
+        Parameter.from_argument("wrong", annotation=Attribute(lambda x, *_, **__: x))
 
 
 def test_signature():
-    def to_int(x, this):
+    def to_int(x, *_, **__):
         return int(x)
 
     def add_other(x, this):
         return int(x) + this["other"]
 
-    other = Parameter("other", annotation=Argument(to_int))
-    this = Parameter("this", annotation=Argument(add_other))
+    other = Parameter.from_argument("other", annotation=Argument(to_int))
+    this = Parameter.from_argument("this", annotation=Argument(add_other))
 
     sig = Signature(parameters=[other, this])
     assert sig.validate(None, args=(1, 2), kwargs={}) == {"other": 1, "this": 3}
@@ -219,7 +212,7 @@ def test_signature_from_callable_with_varargs():
     assert kwargs == {}
 
 
-def test_signature_from_callable_with_positional_only_arguments(snapshot):
+def test_signature_from_callable_with_positional_only_arguments():
     def test(a: int, b: int, /, c: int = 1): ...
 
     sig = Signature.from_callable(test)
@@ -227,9 +220,11 @@ def test_signature_from_callable_with_positional_only_arguments(snapshot):
     assert sig.validate(test, args=(2, 3, 4), kwargs={}) == {"a": 2, "b": 3, "c": 4}
     assert sig.validate(test, args=(2, 3), kwargs=dict(c=4)) == {"a": 2, "b": 3, "c": 4}
 
-    with pytest.raises(ValidationError) as excinfo:
+    with pytest.raises(
+        ValidationError,
+        match=r"test\(1, b=2\).+positional[- ]only.+(?:keyword)?(?: argument)?",
+    ):
         sig.validate(test, args=(1,), kwargs=dict(b=2))
-    snapshot.assert_match(str(excinfo.value), "parameter_is_positional_only.txt")
 
     args, kwargs = sig.unbind(sig.validate(test, args=(2, 3), kwargs={}))
     assert args == (2, 3, 1)
@@ -254,7 +249,7 @@ def test_signature_from_callable_with_keyword_only_arguments(snapshot):
     }
 
     with pytest.raises(
-        ValidationError, match="missing a required (?:keyword-only )?argument: 'c'"
+        ValidationError, match=r"missing a required (?:keyword-only )?argument: 'c'"
     ) as excinfo:
         sig.validate(test, args=(2, 3), kwargs={})
 
@@ -268,14 +263,14 @@ def test_signature_from_callable_with_keyword_only_arguments(snapshot):
 
 
 def test_signature_unbind():
-    def to_int(x, this):
+    def to_int(x, *_, **__):
         return int(x)
 
     def add_other(x, this):
         return int(x) + this["other"]
 
-    other = Parameter("other", annotation=Argument(to_int))
-    this = Parameter("this", annotation=Argument(add_other))
+    other = Parameter.from_argument("other", annotation=Argument(to_int))
+    this = Parameter.from_argument("this", annotation=Argument(add_other))
 
     sig = Signature(parameters=[other, this])
     params = sig.validate(None, args=(1,), kwargs=dict(this=2))
@@ -285,14 +280,16 @@ def test_signature_unbind():
     assert kwargs == {}
 
 
-a = Parameter("a", annotation=Argument(CoercedTo(float)))
-b = Parameter("b", annotation=Argument(CoercedTo(float)))
-c = Parameter("c", annotation=Argument(CoercedTo(float), default=0))
-d = Parameter(
+a = Parameter.from_argument("a", annotation=Argument(CoercedTo(float)))
+b = Parameter.from_argument("b", annotation=Argument(CoercedTo(float)))
+c = Parameter.from_argument("c", annotation=Argument(CoercedTo(float), default=0))
+d = Parameter.from_argument(
     "d",
     annotation=Argument(TupleOf(CoercedTo(float)), default=()),
 )
-e = Parameter("e", annotation=Argument(Option(CoercedTo(float)), default=None))
+e = Parameter.from_argument(
+    "e", annotation=Argument(Option(CoercedTo(float)), default=None)
+)
 sig = Signature(parameters=[a, b, c, d, e])
 
 
@@ -355,7 +352,7 @@ def test_annotated_function_with_return_type_annotation():
         return a + b + c
 
     @annotated
-    def test_wrong(a: int, b: int, c: int = 1) -> int:
+    def test_wrong(a: int, b: int, c: int = 1) -> int:  # noqa: ARG001
         return "invalid result"
 
     assert test_ok(2, 3) == 6
@@ -395,7 +392,7 @@ def test_annotated_function_with_list_overrides_and_return_override():
 
 
 @pattern
-def short_str(x, this):
+def short_str(x, *_, **__):
     if len(x) > 3:
         return x
     else:
@@ -403,7 +400,7 @@ def short_str(x, this):
 
 
 @pattern
-def endswith_d(x, this):
+def endswith_d(x, *_, **__):
     if x.endswith("d"):
         return x
     else:
@@ -479,3 +476,14 @@ def test_multiple_validation_failures():
         test(1.0, 2.0, 3.0, 4, c=5.0, d=6)
 
     assert len(excinfo.value.errors) == 2
+
+
+def test_pickle():
+    a = Parameter.from_argument("a", annotation=Argument(int))
+    assert pickle.loads(pickle.dumps(a)) == a
+
+
+def test_cloudpickle():
+    cloudpickle = pytest.importorskip("cloudpickle")
+    a = Parameter.from_argument("a", annotation=Argument(int))
+    assert cloudpickle.loads(cloudpickle.dumps(a)) == a

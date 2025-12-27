@@ -1,39 +1,67 @@
-{ stdenv
-, lib
-, esbuild
-, deno
-, fetchurl
-, dart-sass
-, makeWrapper
-, rWrapper
-, rPackages
-, autoPatchelfHook
+{
+  stdenv,
+  lib,
+  esbuild,
+  fetchurl,
+  dart-sass,
+  makeWrapper,
+  rWrapper,
+  rPackages,
+  autoPatchelfHook,
+  libgcc,
+  which,
 }:
 
-stdenv.mkDerivation rec {
-  pname = "quarto";
-  version = "1.5.13";
-  src = fetchurl {
-    url = "https://github.com/quarto-dev/quarto-cli/releases/download/v${version}/quarto-${version}-linux-amd64.tar.gz";
-    sha256 = "sha256-X+VgTY649Vo37u8byNzLD+KPVK3MRdySAPN0ZhdBw0g=";
+let
+  platforms = rec {
+    x86_64-linux = "linux-amd64";
+    aarch64-linux = "linux-arm64";
+    aarch64-darwin = "macos";
   };
 
-  nativeBuildInputs = [ autoPatchelfHook makeWrapper ];
+  inherit (stdenv.hostPlatform) system;
+  versionInfo = builtins.fromJSON (builtins.readFile ./version-info.json);
+in
+stdenv.mkDerivation rec {
+  pname = "quarto";
+  inherit (versionInfo) version;
+  src = fetchurl {
+    url = "https://github.com/quarto-dev/quarto-cli/releases/download/v${version}/quarto-${version}-${platforms.${system}}.tar.gz";
+    sha256 = versionInfo.hashes.${system};
+  };
 
-  preFixup = ''
-    wrapProgram $out/bin/quarto \
-      --prefix QUARTO_ESBUILD : ${esbuild}/bin/esbuild \
-      --prefix QUARTO_DENO : ${deno}/bin/deno \
-      --prefix QUARTO_R : ${rWrapper.override { packages = with rPackages; [ dplyr reticulate rmarkdown tidyr ]; }}/bin/R \
-      --prefix QUARTO_DART_SASS : ${dart-sass}/bin/dart-sass
-  '';
+  preUnpack = lib.optionalString stdenv.isDarwin "mkdir ${sourceRoot}";
+  sourceRoot = lib.optionalString stdenv.isDarwin "quarto-${version}";
+  unpackCmd = lib.optionalString stdenv.isDarwin "tar xzf $curSrc --directory=$sourceRoot";
+
+  nativeBuildInputs = lib.optionals stdenv.isLinux [ autoPatchelfHook ] ++ [
+    makeWrapper
+    libgcc
+  ];
+
+  preFixup =
+    let
+      rEnv = rWrapper.override {
+        packages = with rPackages; [
+          dplyr
+          reticulate
+          rmarkdown
+          tidyr
+        ];
+      };
+    in
+    ''
+      wrapProgram $out/bin/quarto \
+        --prefix QUARTO_ESBUILD : ${lib.getExe esbuild} \
+        --prefix QUARTO_R : ${lib.getExe' rEnv "R"} \
+        --prefix QUARTO_DART_SASS : ${lib.getExe dart-sass} \
+        --prefix PATH : ${lib.makeBinPath [ which ]}
+    '';
 
   installPhase = ''
     runHook preInstall
 
     mkdir -p $out/bin $out/share
-
-    rm -r bin/tools/*/deno*
 
     mv bin/* $out/bin
     mv share/* $out/share
@@ -50,8 +78,10 @@ stdenv.mkDerivation rec {
     homepage = "https://quarto.org/";
     changelog = "https://github.com/quarto-dev/quarto-cli/releases/tag/v${version}";
     license = licenses.gpl2Plus;
-    maintainers = with maintainers; [ mrtarantoga ];
-    platforms = [ "x86_64-linux" ];
-    sourceProvenance = with sourceTypes; [ binaryNativeCode binaryBytecode ];
+    platforms = builtins.attrNames platforms;
+    sourceProvenance = with sourceTypes; [
+      binaryNativeCode
+      binaryBytecode
+    ];
   };
 }

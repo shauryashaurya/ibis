@@ -26,7 +26,7 @@ from ibis.common.bases import (  # noqa: F401
     Immutable,
     Singleton,
 )
-from ibis.common.collections import FrozenDict  # noqa: TCH001
+from ibis.common.collections import FrozenDict  # noqa: TC001
 from ibis.common.patterns import Pattern
 from ibis.common.typing import evaluate_annotations
 
@@ -160,6 +160,8 @@ class Annotable(Abstract, metaclass=AnnotableMeta):
             if getattr(self, name, None) != getattr(other, name, None):
                 return False
         return True
+
+    __hash__ = None
 
     @property
     def __args__(self) -> tuple[Any, ...]:

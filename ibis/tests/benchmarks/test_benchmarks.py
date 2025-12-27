@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+import contextlib
 import copy
+import datetime
 import functools
 import inspect
 import itertools
+import math
+import operator
 import os
+import random
 import string
 
-import numpy as np
-import pandas as pd
 import pytest
-from packaging.version import parse as vparse
+from pytest import param
 
 import ibis
+import ibis.common.exceptions as exc
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+import ibis.expr.schema as sch
 import ibis.expr.types as ir
+import ibis.selectors as s
 from ibis.backends import _get_backend_names
 
-pytestmark = [pytest.mark.benchmark, pytest.mark.timeout(30)]
+pytestmark = [pytest.mark.benchmark]
 
 
 def make_t():
@@ -46,7 +52,7 @@ def t():
 
 
 def make_base(t):
-    return t[
+    return t.filter(
         (
             (t.year > 2016)
             | ((t.year == 2016) & (t.month > 6))
@@ -73,7 +79,7 @@ def make_base(t):
                 & (t.minute <= 5)
             )
         )
-    ]
+    )
 
 
 @pytest.fixture(scope="module")
@@ -90,9 +96,7 @@ def make_large_expr(base):
         valid_seconds=ibis.literal(300),
     )
 
-    aggs = []
-    for meas in ["meas1", "meas2"]:
-        aggs.append(src_table[meas].sum().cast("float").name(meas))
+    aggs = [src_table[f"meas{i}"].sum().cast("float").name(f"meas{i}") for i in (1, 2)]
     src_table = src_table.aggregate(
         aggs, by=["_timestamp", "dim1", "dim2", "valid_seconds"]
     )
@@ -153,9 +157,9 @@ def test_builtins(benchmark, expr_fn, builtin, t, base, large_expr):
     benchmark(builtin, expr)
 
 
-_backends = _get_backend_names(exclude=("pandas",))
+_backends = _get_backend_names()
 
-_XFAIL_COMPILE_BACKENDS = ("dask", "polars")
+_XFAIL_COMPILE_BACKENDS = ("polars",)
 
 
 @pytest.mark.benchmark(group="compilation")
@@ -193,8 +197,17 @@ def test_compile(benchmark, module, expr_fn, t, base, large_expr):
             pytest.skip(str(e))
 
 
-@pytest.fixture(scope="module")
-def pt():
+@pytest.fixture
+def con():
+    pytest.importorskip("duckdb")
+    return ibis.duckdb.connect()
+
+
+@pytest.fixture
+def pt(con):
+    np = pytest.importorskip("numpy")
+    pd = pytest.importorskip("pandas")
+
     n = 60_000
     data = pd.DataFrame(
         {
@@ -213,7 +226,6 @@ def pt():
         }
     )
 
-    con = ibis.duckdb.connect()
     return con.create_table("df", data)
 
 
@@ -285,13 +297,6 @@ def high_card_window(t):
     return ibis.window(group_by=t.key)
 
 
-broken_pandas_grouped_rolling = pytest.mark.xfail(
-    condition=vparse("1.4") <= vparse(pd.__version__) < vparse("1.4.2"),
-    raises=ValueError,
-    reason="https://github.com/pandas-dev/pandas/pull/44068",
-)
-
-
 @pytest.mark.benchmark(group="execution")
 @pytest.mark.parametrize(
     "expression_fn",
@@ -304,16 +309,8 @@ broken_pandas_grouped_rolling = pytest.mark.xfail(
         pytest.param(simple_sort_projection, id="simple_sort_projection"),
         pytest.param(multikey_sort, id="multikey_sort"),
         pytest.param(multikey_sort_projection, id="multikey_sort_projection"),
-        pytest.param(
-            low_card_grouped_rolling,
-            id="low_card_grouped_rolling",
-            marks=[broken_pandas_grouped_rolling],
-        ),
-        pytest.param(
-            high_card_grouped_rolling,
-            id="high_card_grouped_rolling",
-            marks=[broken_pandas_grouped_rolling],
-        ),
+        pytest.param(low_card_grouped_rolling, id="low_card_grouped_rolling"),
+        pytest.param(high_card_grouped_rolling, id="high_card_grouped_rolling"),
     ],
 )
 def test_execute(benchmark, expression_fn, pt):
@@ -394,9 +391,9 @@ def tpc_h02(part, supplier, partsupp, nation, region):
         .join(region, nation.n_regionkey == region.r_regionkey)
     )
 
-    subexpr = subexpr[
+    subexpr = subexpr.filter(
         (subexpr.r_name == REGION) & (expr.p_partkey == subexpr.ps_partkey)
-    ]
+    )
 
     filters = [
         expr.p_size == SIZE,
@@ -529,7 +526,7 @@ def test_eq_datatypes(benchmark, dtypes):
 def multiple_joins(table, num_joins):
     for _ in range(num_joins):
         table = table.mutate(dummy=ibis.literal(""))
-        table = table.left_join(table.view(), ["dummy"])[[table]]
+        table = table.left_join(table.view(), ["dummy"]).select(table)
 
 
 @pytest.mark.parametrize("num_joins", [1, 10])
@@ -620,7 +617,7 @@ def test_compile_with_drops(
         .join(products, "sku")
         .drop("customerid", "qty", "total", "items")
         .drop("dims_cm", "cost")
-        .mutate(o_date=lambda t: t.shipped.date())
+        .mutate(o_date=lambda t: t.shipped)
         .filter(lambda t: t.ordered == t.shipped)
     )
 
@@ -700,8 +697,6 @@ def ddb(tmp_path_factory):
 
     N = 20_000_000
 
-    con = duckdb.connect()
-
     path = str(tmp_path_factory.mktemp("duckdb") / "data.ddb")
     sql = (
         lambda var, table, n=N: f"""
@@ -715,9 +710,9 @@ def ddb(tmp_path_factory):
         """
     )
 
-    with duckdb.connect(path) as con:
-        con.execute(sql("x", table="t1"))
-        con.execute(sql("y", table="t2"))
+    with duckdb.connect(path) as cur:
+        cur.execute(sql("x", table="t1"))
+        cur.execute(sql("y", table="t2"))
     return path
 
 
@@ -725,6 +720,7 @@ def test_duckdb_to_pyarrow(benchmark, sql, ddb) -> None:
     # yes, we're benchmarking duckdb here, not ibis
     #
     # we do this to get a baseline for comparison
+    pytest.importorskip("pyarrow")
     duckdb = pytest.importorskip("duckdb")
     con = duckdb.connect(ddb, read_only=True)
 
@@ -732,6 +728,7 @@ def test_duckdb_to_pyarrow(benchmark, sql, ddb) -> None:
 
 
 def test_ibis_duckdb_to_pyarrow(benchmark, sql, ddb) -> None:
+    pytest.importorskip("pyarrow")
     pytest.importorskip("duckdb")
 
     con = ibis.duckdb.connect(ddb, read_only=True)
@@ -815,6 +812,8 @@ def test_big_join_compile(benchmark, src, diff):
 
 @pytest.mark.timeout(5)
 def test_big_expression_compile(benchmark):
+    pytest.importorskip("duckdb")
+
     from ibis.tests.benchmarks.benchfuncs import clean_names
 
     t = ibis.table(
@@ -832,3 +831,229 @@ def test_big_expression_compile(benchmark):
     t2 = clean_names(t)
 
     assert benchmark(ibis.to_sql, t2, dialect="duckdb")
+
+
+@pytest.fixture(scope="module")
+def many_cols():
+    return ibis.table({f"x{i:d}": "int" for i in range(10000)}, name="t")
+
+
+@pytest.mark.parametrize(
+    "getter",
+    [lambda t: t["x0"], lambda t: t[0], lambda t: t.x0],
+    ids=["str", "int", "attr"],
+)
+def test_column_access(benchmark, many_cols, getter):
+    benchmark(getter, many_cols)
+
+
+@pytest.fixture(scope="module", params=[1000, 10000])
+def many_tables(request):
+    num_cols = 10
+    return [
+        ibis.table({f"c{i}": "int" for i in range(num_cols)})
+        for _ in range(request.param)
+    ]
+
+
+def test_large_union_construct(benchmark, many_tables):
+    assert benchmark(lambda args: ibis.union(*args), many_tables) is not None
+
+
+@pytest.mark.timeout(180)
+def test_large_union_compile(benchmark, many_tables):
+    pytest.importorskip("duckdb")
+
+    expr = ibis.union(*many_tables)
+    assert benchmark(ibis.to_sql, expr, dialect="duckdb") is not None
+
+
+@pytest.mark.parametrize("cols", [128, 256])
+@pytest.mark.parametrize("op", ["construct", "compile"])
+def test_large_add(benchmark, cols, op):
+    t = ibis.table(name="t", schema={f"x{i}": "int" for i in range(cols)})
+
+    def construct():
+        return functools.reduce(operator.add, (t[c] for c in t.columns))
+
+    def compile(expr):
+        return ibis.to_sql(expr, dialect="duckdb")
+
+    if op == "construct":
+        benchmark(construct)
+    else:
+        benchmark(compile, construct())
+
+
+@pytest.fixture(scope="session")
+def lots_of_tables(tmp_path_factory):
+    duckdb = pytest.importorskip("duckdb")
+    db = str(tmp_path_factory.mktemp("data") / "lots_of_tables.ddb")
+    n = 100_000
+    d = int(math.log10(n))
+    sql = ";".join(f"CREATE TABLE t{i:0>{d}} (x TINYINT)" for i in range(n))
+    with duckdb.connect(db) as con:
+        con.execute(sql)
+    return ibis.duckdb.connect(db)
+
+
+@pytest.mark.timeout(120)
+def test_memtable_register(lots_of_tables, benchmark):
+    t = ibis.memtable({"x": [1, 2, 3]})
+    result = benchmark(lots_of_tables.execute, t)
+    assert len(result) == 3
+
+
+@pytest.fixture(params=[10, 100, 1_000, 10_000], scope="module")
+def wide_table(request):
+    num_cols = request.param
+    return ibis.table(name="t", schema={f"a{i}": "int" for i in range(num_cols)})
+
+
+@pytest.fixture(
+    params=[param(0.01, id="1"), param(0.5, id="50"), param(0.99, id="99")],
+    scope="module",
+)
+def cols_to_drop(wide_table, request):
+    perc_cols_to_drop = request.param
+    total_cols = len(wide_table.columns)
+    ncols = math.floor(perc_cols_to_drop * total_cols)
+    cols_to_drop = random.sample(range(total_cols), ncols)
+    return [f"a{i}" for i in cols_to_drop]
+
+
+def test_wide_drop_construct(benchmark, wide_table, cols_to_drop):
+    benchmark(wide_table.drop, *cols_to_drop)
+
+
+def test_wide_drop_compile(benchmark, wide_table, cols_to_drop):
+    pytest.importorskip("duckdb")
+
+    benchmark(
+        lambda expr: ibis.to_sql(expr, dialect="duckdb"), wide_table.drop(*cols_to_drop)
+    )
+
+
+def test_bind_on_wide_table(benchmark, wide_table):
+    # use a chain of select expressions on a wide table to test performance of Table.bind (internally used by select)
+    def select_chain(wide_table):
+        expr = wide_table.select(wide_table.columns[:-1])
+        expr2 = expr.select(expr.columns[:-1])
+        expr2.select(expr2.columns[:-1])
+
+    benchmark(select_chain, wide_table)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "snake_case",
+        "ALL_CAPS",
+        lambda x: f"t_{x}",
+        "t_{name}",
+        lambda x: x,
+        "{name}",
+        {"b0": "a0"},
+    ],
+    ids=[
+        "snake_case",
+        "ALL_CAPS",
+        "function",
+        "format_string",
+        "no_op_function",
+        "no_op_string",
+        "mapping",
+    ],
+)
+@pytest.mark.parametrize("cols", [1_000, 10_000])
+def test_wide_rename(benchmark, method, cols):
+    t = ibis.table(name="t", schema={f"a{i}": "int" for i in range(cols)})
+    benchmark(t.rename, method)
+
+
+@pytest.mark.parametrize(
+    ("input", "column", "relative"),
+    [("before", "a{}", "a0"), ("after", "a0", "a{}")],
+    ids=["before", "after"],
+)
+@pytest.mark.parametrize("cols", [10, 100, 1_000, 10_000])
+def test_wide_relocate(benchmark, input, column, relative, cols):
+    last = cols - 1
+    t = ibis.table(name="t", schema={f"a{i}": "int" for i in range(cols)})
+    benchmark(t.relocate, column.format(last), **{input: relative.format(last)})
+
+
+def test_duckdb_timestamp_conversion(benchmark, con):
+    start = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+    stop = datetime.datetime(2000, 2, 1, tzinfo=datetime.timezone.utc)
+    expr = ibis.range(start, stop, ibis.interval(seconds=1)).unnest()
+
+    series = benchmark(con.execute, expr)
+    assert series.size == (stop - start).total_seconds()
+
+
+@pytest.mark.parametrize("cols", [1_000, 10_000])
+def test_selectors(benchmark, cols):
+    t = ibis.table(name="t", schema={f"col{i}": "int" for i in range(cols)})
+    n = cols - cols // 10
+    sel = s.across(s.cols(*[f"col{i}" for i in range(n)]), lambda c: c.cast("str"))
+    benchmark(sel.expand, t)
+
+
+@pytest.mark.parametrize("ncols", [10_000, 100_000, 1_000_000])
+def test_dot_columns(benchmark, ncols):
+    t = ibis.table(name="t", schema={f"col{i}": "int" for i in range(ncols)})
+    result = benchmark(lambda t: t.columns, t)
+    assert len(result) == ncols
+
+
+def test_dedup_schema_failure_mode(benchmark):
+    def dedup_schema(pairs):
+        with contextlib.suppress(exc.IntegrityError):
+            sch.Schema.from_tuples(pairs)
+
+    benchmark(
+        dedup_schema,
+        [("a", "int"), ("b", "string"), ("c", "array<int>"), ("d", "float")] * 2_500,
+    )
+
+
+def test_dedup_schema(benchmark):
+    benchmark(
+        sch.Schema.from_tuples,
+        zip(
+            map("col{}".format, range(10_000)),
+            itertools.cycle(("int", "string", "array<int>", "float")),
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def pgtable(data_dir):
+    pd = pytest.importorskip("pandas")
+    pytest.importorskip("psycopg")
+
+    from ibis.backends.postgres.tests.conftest import (
+        IBIS_TEST_POSTGRES_DB,
+        PG_HOST,
+        PG_PASS,
+        PG_PORT,
+        PG_USER,
+    )
+
+    con = ibis.postgres.connect(
+        user=PG_USER,
+        password=PG_PASS,
+        host=PG_HOST,
+        port=PG_PORT,
+        database=IBIS_TEST_POSTGRES_DB,
+    )
+    name = ibis.util.gen_name("functional_alltypes_bench")
+    yield con.create_table(
+        name, obj=pd.read_csv(data_dir / "csv" / "functional_alltypes.csv"), temp=True
+    )
+    con.disconnect()
+
+
+def test_postgres_record_batches(pgtable, benchmark):
+    benchmark(pgtable.to_pyarrow)

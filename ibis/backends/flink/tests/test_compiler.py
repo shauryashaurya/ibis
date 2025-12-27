@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from operator import methodcaller
-
 import pytest
 from pytest import param
 
 import ibis
-from ibis.common.deferred import _
 
 
 def test_sum(simple_table, assert_sql):
@@ -27,7 +24,7 @@ def test_count_star(simple_table, assert_sql):
     ],
 )
 def test_timestamp_from_unix(simple_table, unit, assert_sql):
-    expr = simple_table.d.to_timestamp(unit=unit)
+    expr = simple_table.d.as_timestamp(unit)
     assert_sql(expr)
 
 
@@ -42,9 +39,9 @@ def test_complex_projections(simple_table, assert_sql):
 
 
 def test_filter(simple_table, assert_sql):
-    expr = simple_table[
+    expr = simple_table.filter(
         ((simple_table.c > 0) | (simple_table.c < 0)) & simple_table.g.isin(["A", "B"])
-    ]
+    )
     assert_sql(expr)
 
 
@@ -105,46 +102,7 @@ def test_having(simple_table, assert_sql):
     assert_sql(expr)
 
 
-@pytest.mark.parametrize(
-    "method",
-    [
-        methodcaller("tumble", window_size=ibis.interval(minutes=15)),
-        methodcaller(
-            "hop",
-            window_size=ibis.interval(minutes=15),
-            window_slide=ibis.interval(minutes=1),
-        ),
-        methodcaller(
-            "cumulate",
-            window_size=ibis.interval(minutes=1),
-            window_step=ibis.interval(seconds=10),
-        ),
-    ],
-    ids=["tumble", "hop", "cumulate"],
-)
-def test_windowing_tvf(simple_table, method, assert_sql):
-    expr = method(simple_table.window_by(time_col=simple_table.i))
-    assert_sql(expr)
-
-
-def test_window_aggregation(simple_table, assert_sql):
-    expr = (
-        simple_table.window_by(time_col=simple_table.i)
-        .tumble(window_size=ibis.interval(minutes=15))
-        .group_by(["window_start", "window_end", "g"])
-        .aggregate(mean=_.d.mean())
-    )
-    assert_sql(expr)
-
-
-def test_window_topn(simple_table, assert_sql):
-    expr = simple_table.window_by(time_col="i").tumble(
-        window_size=ibis.interval(seconds=600),
-    )["a", "b", "c", "d", "g", "window_start", "window_end"]
-    expr = expr.mutate(
-        rownum=ibis.row_number().over(
-            group_by=["window_start", "window_end"], order_by=ibis.desc("g")
-        )
-    )
-    expr = expr[expr.rownum <= 3]
-    assert_sql(expr)
+def test_timestamp_cast_to_seconds_respects_unit():
+    expr = ibis.now()
+    compiled = ibis.to_sql(expr.cast("timestamp('s')"), dialect="flink")
+    assert "yyyy-MM-dd HH:mm:ss.SSS" not in compiled

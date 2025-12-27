@@ -3,7 +3,8 @@ from __future__ import annotations
 import hypothesis as h
 import hypothesis.strategies as st
 import pytest
-import sqlglot.expressions as sge
+import sqlglot as sg
+from packaging.version import parse as vparse
 from pytest import param
 
 import ibis
@@ -124,7 +125,7 @@ def test_array_discovery_clickhouse(con):
         ),
         param(
             "Array(FixedString(32))",
-            dt.Array(dt.String(nullable=False), nullable=False),
+            dt.Array(dt.String(length=32, nullable=False), nullable=False),
             id="array_fixed_string",
         ),
         param(
@@ -192,6 +193,11 @@ def test_array_discovery_clickhouse(con):
                 ),
                 nullable=False,
             ),
+            marks=pytest.mark.xfail(
+                vparse(sg.__version__) == vparse("24.0.0"),
+                reason="struct parsing for clickhouse broken in sqlglot 24",
+                raises=sg.ParseError,
+            ),
             id="named_tuple",
         ),
         param(
@@ -203,6 +209,11 @@ def test_array_discovery_clickhouse(con):
                 ),
                 nullable=False,
             ),
+            marks=pytest.mark.xfail(
+                vparse("24.0.0") <= vparse(sg.__version__) <= vparse("24.0.1"),
+                reason="struct parsing for clickhouse broken in sqlglot 24",
+                raises=sg.ParseError,
+            ),
             id="unnamed_tuple",
         ),
         param(
@@ -213,6 +224,11 @@ def test_array_discovery_clickhouse(con):
                     f1=dt.Array(dt.float64, nullable=False),
                 ),
                 nullable=False,
+            ),
+            marks=pytest.mark.xfail(
+                vparse("24.0.0") <= vparse(sg.__version__) <= vparse("24.0.1"),
+                reason="struct parsing for clickhouse broken in sqlglot 24",
+                raises=sg.ParseError,
             ),
             id="partially_named",
         ),
@@ -227,6 +243,7 @@ def test_array_discovery_clickhouse(con):
             ),
             id="nested",
         ),
+        param("Date32", dt.Date(nullable=False), id="date32"),
         param("DateTime", dt.Timestamp(scale=0, nullable=False), id="datetime"),
         param(
             "DateTime('Europe/Budapest')",
@@ -279,7 +296,7 @@ roundtrippable_types = st.deferred(
         | its.date_dtype()
         | its.time_dtype()
         | its.timestamp_dtype(scale=st.integers(0, 9))
-        | its.array_dtypes(roundtrippable_types, nullable=false)
+        | its.array_dtypes(roundtrippable_types, nullable=false, length=st.none())
         | its.map_dtypes(map_key_types, roundtrippable_types, nullable=false)
     )
 )
@@ -293,16 +310,5 @@ def test_type_roundtrip(ibis_type):
 
 
 def test_arrays_nullable():
-    # if dtype.nullable and not (dtype.is_map() or dtype.is_array()):
     sge_type = ClickHouseType.from_ibis(dt.Array("float"))
-    typecode = sge.DataType.Type
-
-    assert sge_type == sge.DataType(
-        this=typecode.ARRAY,
-        expressions=[
-            sge.DataType(
-                this=typecode.NULLABLE, expressions=[sge.DataType(this=typecode.DOUBLE)]
-            )
-        ],
-        nested=True,
-    )
+    assert sge_type.sql("clickhouse") == "Array(Nullable(Float64))"

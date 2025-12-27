@@ -5,10 +5,11 @@ import math
 from copy import deepcopy
 
 import sqlglot.expressions as sge
+import sqlglot.generator as sgn
 from sqlglot import transforms
 from sqlglot.dialects import (
     TSQL,
-    ClickHouse,
+    Databricks,
     Hive,
     MySQL,
     Oracle,
@@ -18,15 +19,31 @@ from sqlglot.dialects import (
     SQLite,
     Trino,
 )
+from sqlglot.dialects import ClickHouse as _ClickHouse
 from sqlglot.dialects.dialect import rename_func
 from sqlglot.helper import find_new_name, seq_get
 
-ClickHouse.Generator.TRANSFORMS |= {
-    sge.ArraySize: rename_func("length"),
-    sge.ArraySort: rename_func("arraySort"),
-    sge.LogicalAnd: rename_func("min"),
-    sge.LogicalOr: rename_func("max"),
-}
+
+class ClickHouse(_ClickHouse):
+    class Generator(_ClickHouse.Generator):
+        _ClickHouse.Generator.TRANSFORMS |= {
+            sge.ArraySize: rename_func("length"),
+            sge.ArraySort: rename_func("arraySort"),
+            sge.LogicalAnd: rename_func("min"),
+            sge.LogicalOr: rename_func("max"),
+        }
+
+        def except_op(self, expression: sge.Except) -> str:
+            return f"EXCEPT{' DISTINCT' if expression.args.get('distinct') else ' ALL'}"
+
+        def intersect_op(self, expression: sge.Intersect) -> str:
+            return (
+                f"INTERSECT{' DISTINCT' if expression.args.get('distinct') else ' ALL'}"
+            )
+
+
+with contextlib.suppress(AttributeError):
+    ClickHouse.Generator.TRANSFORMS[sge.Median] = rename_func("median")
 
 
 class DataFusion(Postgres):
@@ -42,6 +59,10 @@ class DataFusion(Postgres):
             sge.ArrayContains: rename_func("array_has"),
             sge.ArraySize: rename_func("array_length"),
         }
+
+
+with contextlib.suppress(AttributeError):
+    DataFusion.Generator.TRANSFORMS[sge.Median] = rename_func("median")
 
 
 class Druid(Postgres):
@@ -64,9 +85,20 @@ def _interval(self, e, quote_arg=True):
     return f"INTERVAL {arg} {e.args['unit']}"
 
 
+def _group_concat(self, e):
+    this = self.sql(e, "this")
+    separator = self.sql(e, "separator") or "','"
+    return f"GROUP_CONCAT({this} SEPARATOR {separator})"
+
+
 class Exasol(Postgres):
     class Generator(Postgres.Generator):
-        TRANSFORMS = Postgres.Generator.TRANSFORMS.copy() | {sge.Interval: _interval}
+        TRANSFORMS = Postgres.Generator.TRANSFORMS.copy() | {
+            sge.Interval: _interval,
+            sge.GroupConcat: _group_concat,
+            sge.ApproxDistinct: rename_func("approximate_count_distinct"),
+            sge.Round: rename_func("round"),
+        }
         TYPE_MAPPING = Postgres.Generator.TYPE_MAPPING.copy() | {
             sge.DataType.Type.TIMESTAMPTZ: "TIMESTAMP WITH LOCAL TIME ZONE",
         }
@@ -183,13 +215,18 @@ def _explode_to_unnest():
 
 class Flink(Hive):
     UNESCAPED_SEQUENCES = {"\\\\d": "\\d"}
+    REGEXP_EXTRACT_DEFAULT_GROUP = 0
 
     class Generator(Hive.Generator):
+        WITH_PROPERTIES_PREFIX = "WITH"
+
         UNNEST_WITH_ORDINALITY = False
 
         TYPE_MAPPING = Hive.Generator.TYPE_MAPPING.copy() | {
             sge.DataType.Type.TIME: "TIME",
             sge.DataType.Type.STRUCT: "ROW",
+            sge.DataType.Type.BINARY: "VARBINARY",
+            sge.DataType.Type.VARBINARY: "VARBINARY",
         }
 
         TRANSFORMS = Hive.Generator.TRANSFORMS.copy() | {
@@ -201,6 +238,8 @@ class Flink(Hive):
             sge.VariancePop: rename_func("var_pop"),
             sge.ArrayConcat: rename_func("array_concat"),
             sge.ArraySize: rename_func("cardinality"),
+            sge.ArrayAgg: rename_func("array_agg"),
+            sge.ArraySort: rename_func("array_sort"),
             sge.Length: rename_func("char_length"),
             sge.TryCast: lambda self,
             e: f"TRY_CAST({e.this.sql(self.dialect)} AS {e.to.sql(self.dialect)})",
@@ -209,6 +248,22 @@ class Flink(Hive):
             sge.DayOfMonth: rename_func("dayofmonth"),
             sge.Interval: _interval_with_precision,
         }
+
+        def columndef_sql(self, expression: sge.ColumnDef, sep: str = " ") -> str:
+            # override this method to avoid inserting spurious colons
+            # (and continue using spaces) between field names and types inside
+            # of a struct
+            return sgn.Generator.columndef_sql(self, expression, sep=" ")
+
+        # Flink is like Hive except where it might actually be convenient
+        #
+        # UNNEST works like the SQL standard, and not like Hive, so we have to
+        # override sqlglot here and convince it that flink is not like Hive
+        # when it comes to unnesting
+        TRANSFORMS.pop(sge.Unnest, None)
+
+        def unnest_sql(self, expression: sge.Unnest) -> str:
+            return sgn.Generator.unnest_sql(self, expression)
 
         def struct_sql(self, expression: sge.Struct) -> str:
             from sqlglot.optimizer.annotate_types import annotate_types
@@ -272,8 +327,22 @@ class Flink(Hive):
         STRING_ESCAPES = ["'"]
 
 
+def tablesample_percent_to_int(self, expr):
+    """Impala's TABLESAMPLE only supports integer percentages."""
+    expr = expr.copy()
+    expr.args["percent"] = sge.convert(round(float(expr.args["percent"].this)))
+    return self.tablesample_sql(expr)
+
+
 class Impala(Hive):
+    NULL_ORDERING = "nulls_are_large"
+    REGEXP_EXTRACT_DEFAULT_GROUP = 0
+    TABLESAMPLE_SIZE_IS_PERCENT = True
+    ALIAS_POST_TABLESAMPLE = False
+
     class Generator(Hive.Generator):
+        TABLESAMPLE_WITH_METHOD = True
+
         TRANSFORMS = Hive.Generator.TRANSFORMS.copy() | {
             sge.ApproxDistinct: rename_func("ndv"),
             sge.IsNan: rename_func("is_nan"),
@@ -281,6 +350,8 @@ class Impala(Hive):
             sge.DayOfWeek: rename_func("dayofweek"),
             sge.Interval: lambda self, e: _interval(self, e, quote_arg=False),
             sge.CurrentDate: rename_func("current_date"),
+            sge.TableSample: tablesample_percent_to_int,
+            sge.CurrentTimestamp: lambda *_: "NOW()",
         }
 
 
@@ -294,8 +365,8 @@ class MSSQL(TSQL):
             sge.Variance: rename_func("var"),
             sge.VariancePop: rename_func("varp"),
             sge.Ceil: rename_func("ceiling"),
-            sge.Trim: lambda self, e: f"TRIM({e.this.sql(self.dialect)})",
             sge.DateFromParts: rename_func("datefromparts"),
+            sge.Ln: rename_func("log"),
         }
 
 
@@ -310,6 +381,7 @@ MySQL.Generator.TRANSFORMS |= {
     sge.RegexpLike: (
         lambda _, e: f"({e.this.sql('mysql')} RLIKE {e.expression.sql('mysql')})"
     ),
+    sge.Length: rename_func("char_length"),
 }
 
 
@@ -336,6 +408,8 @@ def _create_sql(self, expression: sge.Create) -> str:
     return self.create_sql(expression)
 
 
+# hack around https://github.com/tobymao/sqlglot/issues/3684
+Oracle.NULL_ORDERING = "nulls_are_large"
 Oracle.Generator.TRANSFORMS |= {
     sge.LogicalOr: rename_func("max"),
     sge.LogicalAnd: rename_func("min"),
@@ -344,7 +418,15 @@ Oracle.Generator.TRANSFORMS |= {
     sge.Stddev: rename_func("stddev_pop"),
     sge.ApproxDistinct: rename_func("approx_count_distinct"),
     sge.Create: _create_sql,
-    sge.Select: transforms.preprocess([transforms.eliminate_semi_and_anti_joins]),
+    sge.Select: transforms.preprocess(
+        [
+            transforms.eliminate_semi_and_anti_joins,
+            transforms.eliminate_distinct_on,
+            transforms.eliminate_qualify,
+        ]
+    ),
+    sge.GroupConcat: rename_func("listagg"),
+    sge.StrPosition: rename_func("instr"),
 }
 
 # TODO: can delete this after bumping sqlglot version > 20.9.0
@@ -363,7 +445,6 @@ class Polars(Postgres):
 
 
 Postgres.Generator.TRANSFORMS |= {
-    sge.Map: rename_func("hstore"),
     sge.Split: rename_func("string_to_array"),
     sge.RegexpSplit: rename_func("regexp_split_to_array"),
     sge.DateFromParts: rename_func("make_date"),
@@ -392,7 +473,7 @@ class RisingWave(Postgres):
         TABLE_HINTS = False
         QUERY_HINTS = False
         NVL2_SUPPORTED = False
-        PARAMETER_TOKEN = "$"
+        PARAMETER_TOKEN = "$"  # noqa: S105
         TABLESAMPLE_SIZE_IS_ROWS = False
         TABLESAMPLE_SEED_KEYWORD = "REPEATABLE"
         SUPPORTS_SELECT_INTO = True
@@ -403,6 +484,27 @@ class RisingWave(Postgres):
             sge.DataType.Type.TIMESTAMPTZ: "TIMESTAMPTZ"
         }
 
+        def datatype_sql(self, expression: sge.DataType) -> str:
+            # for some reason risingwave chose to make their delimiters for
+            # structs angle brackets (<>) and their delimiters for maps
+            # parentheses
+            #
+            # this code works around the consequences of that decision
+            if expression.is_type(sge.DataType.Type.MAP):
+                curr = self.STRUCT_DELIMITER
+                self.STRUCT_DELIMITER = ("(", ")")
+                result = super().datatype_sql(expression)
+                self.STRUCT_DELIMITER = curr
+                return result
+            elif expression.is_type(sge.DataType.Type.STRUCT):
+                curr = self.STRUCT_DELIMITER
+                self.STRUCT_DELIMITER = ("<", ">")
+                result = super().datatype_sql(expression)
+                self.STRUCT_DELIMITER = curr
+                return result
+            else:
+                return super().datatype_sql(expression)
+
 
 Snowflake.Generator.TRANSFORMS |= {
     sge.ApproxDistinct: rename_func("approx_count_distinct"),
@@ -411,19 +513,19 @@ Snowflake.Generator.TRANSFORMS |= {
 
 SQLite.Generator.TYPE_MAPPING |= {sge.DataType.Type.BOOLEAN: "BOOLEAN"}
 
-
-# TODO(cpcloud): remove this hack once
-# https://github.com/tobymao/sqlglot/issues/2735 is resolved
-def make_cross_joins_explicit(node):
-    if not (node.kind or node.side):
-        node.args["kind"] = "CROSS"
-    return node
-
-
 Trino.Generator.TRANSFORMS |= {
     sge.BitwiseLeftShift: rename_func("bitwise_left_shift"),
     sge.BitwiseRightShift: rename_func("bitwise_right_shift"),
     sge.FirstValue: rename_func("first_value"),
-    sge.Join: transforms.preprocess([make_cross_joins_explicit]),
     sge.LastValue: rename_func("last_value"),
+}
+
+Databricks.Generator.TRANSFORMS |= {
+    # required because of https://github.com/tobymao/sqlglot/pull/4142
+    sge.Create: transforms.preprocess(
+        [
+            transforms.remove_unique_constraints,
+            transforms.move_partitioned_by_to_schema_columns,
+        ]
+    )
 }

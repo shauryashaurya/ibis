@@ -166,13 +166,13 @@ def test_regexp(con, expr, expected):
 @pytest.mark.parametrize(
     ("expr", "expected"),
     [
-        param(ibis.NA.fillna(5), 5, id="filled"),
-        param(L(5).fillna(10), 5, id="not_filled"),
+        param(ibis.null().fill_null(5), 5, id="filled"),
+        param(L(5).fill_null(10), 5, id="not_filled"),
         param(L(5).nullif(5), None, id="nullif_null"),
         param(L(10).nullif(5), 10, id="nullif_not_null"),
     ],
 )
-def test_fillna_nullif(con, expr, expected):
+def test_fill_null_nullif(con, expr, expected):
     assert con.execute(expr) == expected
 
 
@@ -180,8 +180,8 @@ def test_fillna_nullif(con, expr, expected):
     ("expr", "expected"),
     [
         param(ibis.coalesce(5, None, 4), 5, id="first"),
-        param(ibis.coalesce(ibis.NA, 4, ibis.NA), 4, id="second"),
-        param(ibis.coalesce(ibis.NA, ibis.NA, 3.14), 3.14, id="third"),
+        param(ibis.coalesce(ibis.null(), 4, ibis.null()), 4, id="second"),
+        param(ibis.coalesce(ibis.null(), ibis.null(), 3.14), 3.14, id="third"),
     ],
 )
 def test_coalesce(con, expr, expected):
@@ -189,34 +189,30 @@ def test_coalesce(con, expr, expected):
 
 
 @pytest.mark.parametrize(
-    ("expr", "expected"),
+    "expr",
     [
-        param(ibis.coalesce(ibis.NA, ibis.NA), None, id="all_null"),
-        param(
-            ibis.coalesce(
-                ibis.NA.cast("int8"),
-                ibis.NA.cast("int8"),
-                ibis.NA.cast("int8"),
-            ),
-            None,
-            id="all_nulls_with_all_cast",
+        ibis.coalesce(ibis.null(), ibis.null()),
+        ibis.coalesce(
+            ibis.null().cast("int8"),
+            ibis.null().cast("int8"),
+            ibis.null().cast("int8"),
         ),
     ],
+    ids=["all_null", "all_nulls_with_all_cast"],
 )
-def test_coalesce_all_na(con, expr, expected):
+def test_coalesce_all_na(con, expr):
     assert con.execute(expr) is None
 
 
 def test_coalesce_all_na_double(con):
-    expr = ibis.coalesce(ibis.NA, ibis.NA, ibis.NA.cast("double"))
+    expr = ibis.coalesce(ibis.null(), ibis.null(), ibis.null().cast("double"))
     assert np.isnan(con.execute(expr))
 
 
 def test_numeric_builtins_work(alltypes, df):
-    expr = alltypes.double_col.fillna(0)
+    expr = alltypes.double_col.fill_null(0)
     result = expr.execute()
-    expected = df.double_col.fillna(0)
-    expected.name = "Coalesce()"
+    expected = df.double_col.fillna(0).rename(expr.get_name())
     tm.assert_series_equal(result, expected)
 
 
@@ -302,7 +298,7 @@ def test_category_label(alltypes, df):
     bins = [0, 10, 25, 50, 100]
     labels = ["a", "b", "c", "d"]
     bucket = d.bucket(bins)
-    expr = bucket.label(labels)
+    expr = bucket.cases(*enumerate(labels), else_=None)
     result = expr.execute()
 
     with warnings.catch_warnings():
@@ -330,43 +326,43 @@ def test_union_cte(alltypes, distinct, assert_sql):
     ("func", "pandas_func"),
     [
         param(
-            lambda t, cond: t.bool_col.count(),
-            lambda df, cond: df.bool_col.count(),
+            lambda t, _: t.bool_col.count(),
+            lambda df, _: df.bool_col.count(),
             id="count",
         ),
         param(
-            lambda t, cond: t.double_col.mean(),
-            lambda df, cond: df.double_col.mean(),
+            lambda t, _: t.double_col.mean(),
+            lambda df, _: df.double_col.mean(),
             id="mean",
         ),
         param(
-            lambda t, cond: t.double_col.min(),
-            lambda df, cond: df.double_col.min(),
+            lambda t, _: t.double_col.min(),
+            lambda df, _: df.double_col.min(),
             id="min",
         ),
         param(
-            lambda t, cond: t.double_col.max(),
-            lambda df, cond: df.double_col.max(),
+            lambda t, _: t.double_col.max(),
+            lambda df, _: df.double_col.max(),
             id="max",
         ),
         param(
-            lambda t, cond: t.double_col.var(),
-            lambda df, cond: df.double_col.var(),
+            lambda t, _: t.double_col.var(),
+            lambda df, _: df.double_col.var(),
             id="var",
         ),
         param(
-            lambda t, cond: t.double_col.std(),
-            lambda df, cond: df.double_col.std(),
+            lambda t, _: t.double_col.std(),
+            lambda df, _: df.double_col.std(),
             id="std",
         ),
         param(
-            lambda t, cond: t.double_col.var(how="sample"),
-            lambda df, cond: df.double_col.var(ddof=1),
+            lambda t, _: t.double_col.var(how="sample"),
+            lambda df, _: df.double_col.var(ddof=1),
             id="samp_var",
         ),
         param(
-            lambda t, cond: t.double_col.std(how="pop"),
-            lambda df, cond: df.double_col.std(ddof=0),
+            lambda t, _: t.double_col.std(how="pop"),
+            lambda df, _: df.double_col.std(ddof=0),
             id="pop_std",
         ),
         param(
@@ -449,7 +445,7 @@ def test_not_exists(alltypes, df):
     t = alltypes
     t2 = t.view()
 
-    expr = t[~((t.string_col == t2.string_col).any())]
+    expr = t.filter(~((t.string_col == t2.string_col).any()))
     result = expr.execute()
 
     left, right = df, t2.execute()
@@ -461,7 +457,9 @@ def test_not_exists(alltypes, df):
 def test_subquery(alltypes, df):
     t = alltypes
 
-    expr = t.mutate(d=t.double_col.fillna(0)).limit(1000).group_by("string_col").size()
+    expr = (
+        t.mutate(d=t.double_col.fill_null(0)).limit(1000).group_by("string_col").size()
+    )
     result = expr.execute().sort_values("string_col").reset_index(drop=True)
     expected = (
         df.assign(d=df.double_col.fillna(0))
@@ -543,7 +541,7 @@ def test_cumulative_simple_window(alltypes, func, df):
     col = t.double_col - f().over(ibis.cumulative_window())
     expr = t.select(col.name("double_col"))
     result = expr.execute().double_col
-    expected = df.double_col - getattr(df.double_col, "cum%s" % func)()
+    expected = df.double_col - getattr(df.double_col, f"cum{func}")()
     tm.assert_series_equal(result, expected)
 
 
@@ -558,7 +556,7 @@ def test_cumulative_ordered_window(alltypes, func, df):
     f = getattr(t.double_col, func)
     expr = t.select((t.double_col - f().over(window)).name("double_col"))
     result = expr.execute().double_col
-    expected = df.double_col - getattr(df.double_col, "cum%s" % func)()
+    expected = df.double_col - getattr(df.double_col, f"cum{func}")()
     tm.assert_series_equal(result, expected)
 
 
@@ -593,7 +591,7 @@ def test_first_last_value(alltypes, df, func, expected_index):
 def test_null_column(alltypes):
     t = alltypes
     nrows = t.count().execute()
-    expr = t.mutate(na_column=ibis.NA).na_column
+    expr = t.mutate(na_column=ibis.null()).na_column
     result = expr.execute()
     tm.assert_series_equal(result, pd.Series([None] * nrows, name="na_column"))
 
@@ -614,18 +612,14 @@ def test_window_with_arithmetic(alltypes, df):
 
 def test_anonymous_aggregate(alltypes, df):
     t = alltypes
-    expr = t[t.double_col > t.double_col.mean()]
+    expr = t.filter(t.double_col > t.double_col.mean())
     result = expr.execute()
     expected = df[df.double_col > df.double_col.mean()].reset_index(drop=True)
     tm.assert_frame_equal(result, expected)
 
 
-@pytest.fixture
-def array_types(con):
-    return con.table("array_types")
-
-
-def test_array_length(array_types):
+def test_array_length(con):
+    array_types = con.table("array_types")
     expr = array_types.select(
         array_types.x.length().name("x_length"),
         array_types.y.length().name("y_length"),
@@ -672,13 +666,11 @@ def test_identical_to(con, df):
     tm.assert_series_equal(result, expected)
 
 
-@pytest.mark.parametrize("opname", ["invert", "neg"])
-def test_not_and_negate_bool(con, opname, df):
-    op = getattr(operator, opname)
+def test_invert_bool(con, df):
     t = con.table("functional_alltypes").limit(10)
-    expr = t.select(op(t.bool_col).name("bool_col"))
+    expr = t.select((~t.bool_col).name("bool_col"))
     result = expr.execute().bool_col
-    expected = op(df.head(10).bool_col)
+    expected = ~df.head(10).bool_col
     tm.assert_series_equal(result, expected)
 
 
@@ -700,14 +692,6 @@ def test_negate_non_boolean(con, field, df):
     expr = t.select((-t[field]).name(field))
     result = expr.execute()[field]
     expected = -df.head(10)[field]
-    tm.assert_series_equal(result, expected)
-
-
-def test_negate_boolean(con, df):
-    t = con.table("functional_alltypes").limit(10)
-    expr = t.select((-t.bool_col).name("bool_col"))
-    result = expr.execute().bool_col
-    expected = -df.head(10).bool_col
     tm.assert_series_equal(result, expected)
 
 

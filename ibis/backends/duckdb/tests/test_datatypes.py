@@ -20,6 +20,7 @@ from ibis.backends.sql.datatypes import DuckDBType
             ("DATE", dt.date),
             ("DOUBLE", dt.float64),
             ("DECIMAL(10, 3)", dt.Decimal(10, 3)),
+            ("ENUM('a', 'b')", dt.string),
             ("INTEGER", dt.int32),
             ("INTERVAL", dt.Interval("us")),
             ("FLOAT", dt.float32),
@@ -36,6 +37,7 @@ from ibis.backends.sql.datatypes import DuckDBType
             ("UUID", dt.uuid),
             ("VARCHAR", dt.string),
             ("INTEGER[]", dt.Array(dt.int32)),
+            ("INTEGER[3]", dt.Array(dt.int32, length=3)),
             ("MAP(VARCHAR, BIGINT)", dt.Map(dt.string, dt.int64)),
             (
                 "STRUCT(a INTEGER, b VARCHAR, c MAP(VARCHAR, DOUBLE[])[])",
@@ -114,3 +116,15 @@ def test_cast_to_floating_point_type(con, snapshot, typ):
 
     sql = str(ibis.to_sql(expr, dialect="duckdb"))
     snapshot.assert_match(sql, "out.sql")
+
+
+def test_null_scalar(con, monkeypatch):
+    monkeypatch.setattr(ibis.options, "default_backend", con)
+    monkeypatch.setattr(ibis.options, "interactive", True)
+
+    result = repr(ibis.literal(None, type="int"))
+    expected = """\
+┌──────┐
+│ NULL │
+└──────┘"""
+    assert result == expected

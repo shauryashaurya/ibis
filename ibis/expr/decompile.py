@@ -24,7 +24,6 @@ _method_overrides = {
     ops.ExtractMicrosecond: "microsecond",
     ops.ExtractMillisecond: "millisecond",
     ops.ExtractMinute: "minute",
-    ops.ExtractMinute: "minute",
     ops.ExtractMonth: "month",
     ops.ExtractQuarter: "quarter",
     ops.ExtractSecond: "second",
@@ -38,7 +37,7 @@ _method_overrides = {
     ops.StringContains: "contains",
     ops.StringSQLILike: "ilike",
     ops.StringSQLLike: "like",
-    ops.TimestampNow: "now",
+    ops.Uppercase: "upper",
 }
 
 
@@ -82,6 +81,11 @@ class CallStatement:
 def translate(op, *args, **kwargs):
     """Translate an ibis operation into a Python expression."""
     raise NotImplementedError(op)
+
+
+@translate.register(ops.TimestampNow)
+def now(_):
+    return "ibis.now()"
 
 
 @translate.register(ops.Value)
@@ -187,6 +191,11 @@ def distinct(op, parent):
     return f"{parent}.distinct()"
 
 
+@translate.register(ops.DropColumns)
+def drop(op, parent, columns_to_drop):
+    return f"{parent}.drop({_inline(map(repr, columns_to_drop))})"
+
+
 @translate.register(ops.SelfReference)
 def self_reference(op, parent, identifier):
     return f"{parent}.view()"
@@ -225,7 +234,7 @@ def union(op, left, right, distinct):
 @translate.register(ops.Limit)
 def limit(op, parent, n, offset):
     if offset:
-        return f"{parent}.limit({n}, {offset})"
+        return f"{parent}.limit({n}, offset={offset})"
     else:
         return f"{parent}.limit({n})"
 
@@ -238,11 +247,12 @@ def table_column(op, rel, name):
 
 
 @translate.register(ops.SortKey)
-def sort_key(op, expr, ascending):
-    if ascending:
-        return f"{expr}.asc()"
-    else:
-        return f"{expr}.desc()"
+def sort_key(op, expr, ascending, nulls_first):
+    method = "asc" if ascending else "desc"
+    call = f"{expr}.{method}"
+    if nulls_first:
+        return f"{call}(nulls_first={nulls_first})"
+    return f"{call}()"
 
 
 @translate.register(ops.Reduction)
@@ -298,16 +308,12 @@ def ifelse(op, bool_expr, true_expr, false_null_expr):
 
 @translate.register(ops.SimpleCase)
 @translate.register(ops.SearchedCase)
-def switch_case(op, cases, results, default, base=None):
-    out = f"{base}.case()" if base else "ibis.case()"
-
-    for case, result in zip(cases, results):
-        out = f"{out}.when({case}, {result})"
-
-    if default is not None:
-        out = f"{out}.else_({default})"
-
-    return f"{out}.end()"
+def switch_cases(op, cases, results, default, base=None):
+    namespace = f"{base}" if base else "ibis"
+    case_strs = [f"({case}, {result})" for case, result in zip(cases, results)]
+    cases_str = ", ".join(case_strs)
+    else_str = f", else_={default}" if default is not None else ""
+    return f"{namespace}.cases({cases_str}{else_str})"
 
 
 _infix_ops = {
@@ -336,7 +342,7 @@ def binary(op, left, right):
     operator = _infix_ops[type(op)]
     left = _maybe_add_parens(op.left, left)
     right = _maybe_add_parens(op.right, right)
-    return f"{left} {operator} {right}"
+    return _maybe_add_parens(op, f"{left} {operator} {right}")
 
 
 @translate.register(ops.InValues)

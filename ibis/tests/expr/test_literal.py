@@ -8,6 +8,7 @@ import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
+from ibis import _
 from ibis.common.collections import frozendict
 from ibis.expr.operations import Literal
 from ibis.tests.util import assert_pickle_roundtrip
@@ -118,14 +119,13 @@ def test_struct_literal(value):
 @pytest.mark.parametrize(
     "value",
     [
-        dict(field1="value1", field3=3.14),  # wrong field name
-        dict(field1="value1"),  # missing field
+        pytest.param(dict(field1="value1", field3=3.14), id="wrong_field"),
+        pytest.param(dict(field1="value1"), id="missing_field"),
     ],
 )
 def test_struct_literal_non_castable(value):
-    typestr = "struct<field1: string, field2: float64>"
     with pytest.raises(TypeError, match="Unable to normalize"):
-        ibis.struct(value, type=typestr)
+        ibis.struct(value, type="struct<field1: string, field2: float64>")
 
 
 def test_struct_cast_to_empty_struct():
@@ -133,18 +133,11 @@ def test_struct_cast_to_empty_struct():
     assert value.type().castable(dt.Struct({}))
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        dict(key1="value1", key2="value2"),
-    ],
-)
-def test_map_literal(value):
-    typestr = "map<string, int8>"
+def test_map_literal():
     a = ibis.map(["a", "b"], [1, 2])
     assert a.op().keys.value == ("a", "b")
     assert a.op().values.value == (1, 2)
-    assert a.type() == dt.dtype(typestr)
+    assert a.type() == dt.dtype("map<string, int8>")
 
 
 @pytest.mark.parametrize(
@@ -174,3 +167,11 @@ def test_timestamp_literal_without_tz():
 def test_integer_as_decimal():
     lit = ibis.literal(12, type="decimal")
     assert lit.op().value == decimal.Decimal(12)
+
+
+def test_deferred(table):
+    expr = _.g.get_name()
+    dtype = _.g.type()
+    deferred = ibis.literal(expr, type=dtype)
+    result = deferred.resolve(table)
+    assert result.op().value == "g"

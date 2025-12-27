@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import warnings
 from functools import partial
 from importlib.util import find_spec as _find_spec
 from typing import TYPE_CHECKING
@@ -10,7 +9,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import pandas.api.types as pdt
-import pyarrow as pa
 
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
@@ -22,15 +20,11 @@ from ibis.formats.numpy import NumpyType
 from ibis.formats.pyarrow import PyArrowData, PyArrowSchema, PyArrowType
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     import polars as pl
-
-_has_arrow_dtype = hasattr(pd, "ArrowDtype")
-
-if not _has_arrow_dtype:
-    warnings.warn(
-        f"The `ArrowDtype` class is not available in pandas {pd.__version__}. "
-        "Install pandas >= 1.5.0 for interop with pandas and arrow dtype support"
-    )
+    import pyarrow as pa
+    from pandas.api.extensions import ExtensionDtype
 
 geospatial_supported = _find_spec("geopandas") is not None
 
@@ -47,7 +41,7 @@ class PandasType(NumpyType):
                 return dt.String(nullable=nullable)
             return cls.to_ibis(typ.categories.dtype, nullable=nullable)
         elif pdt.is_extension_array_dtype(typ):
-            if _has_arrow_dtype and isinstance(typ, pd.ArrowDtype):
+            if isinstance(typ, pd.ArrowDtype):
                 return PyArrowType.to_ibis(typ.pyarrow_dtype, nullable=nullable)
             else:
                 name = typ.__class__.__name__.replace("Dtype", "")
@@ -57,7 +51,7 @@ class PandasType(NumpyType):
             return super().to_ibis(typ, nullable=nullable)
 
     @classmethod
-    def from_ibis(cls, dtype):
+    def from_ibis(cls, dtype) -> np.dtype | pd.Ex:
         if dtype.is_timestamp() and dtype.timezone:
             return pdt.DatetimeTZDtype("ns", dtype.timezone)
         elif dtype.is_date():
@@ -70,7 +64,9 @@ class PandasType(NumpyType):
 
 class PandasSchema(SchemaMapper):
     @classmethod
-    def to_ibis(cls, pandas_schema):
+    def to_ibis(
+        cls, pandas_schema: pd.Series | Iterable[tuple[str, np.dtype | ExtensionDtype]]
+    ) -> sch.Schema:
         if isinstance(pandas_schema, pd.Series):
             pandas_schema = pandas_schema.to_list()
 
@@ -79,7 +75,9 @@ class PandasSchema(SchemaMapper):
         return sch.Schema(fields)
 
     @classmethod
-    def from_ibis(cls, schema):
+    def from_ibis(
+        cls, schema: sch.Schema
+    ) -> list[tuple[str, np.dtype | ExtensionDtype]]:
         names = schema.names
         types = [PandasType.from_ibis(t) for t in schema.types]
         return list(zip(names, types))
@@ -100,7 +98,7 @@ class PandasData(DataMapper):
         for column_name in df.dtypes.keys():
             if not isinstance(column_name, str):
                 raise TypeError(
-                    "Column names must be strings to use the pandas backend"
+                    "Column names must be strings to ingest a pandas DataFrame"
                 )
 
             pandas_column = df[column_name]
@@ -118,19 +116,13 @@ class PandasData(DataMapper):
 
     @classmethod
     def convert_table(cls, df, schema):
-        if len(schema) != len(df.columns):
-            raise ValueError(
-                "schema column count does not match input data column count"
-            )
+        if schema.names != tuple(df.columns):
+            raise ValueError("schema names don't match input data columns")
 
-        columns = []
-        for (_, series), dtype in zip(df.items(), schema.types):
-            columns.append(cls.convert_column(series, dtype))
-        df = cls.concat(columns, axis=1)
-
-        # return data with the schema's columns which may be different than the
-        # input columns
-        df.columns = schema.names
+        columns = {
+            name: cls.convert_column(df[name], dtype) for name, dtype in schema.items()
+        }
+        df = pd.DataFrame(columns)
 
         if geospatial_supported:
             from geopandas import GeoDataFrame
@@ -163,8 +155,19 @@ class PandasData(DataMapper):
 
     @classmethod
     def convert_scalar(cls, obj, dtype):
-        df = PandasData.convert_table(obj, sch.Schema({obj.columns[0]: dtype}))
-        return df.iat[0, 0]
+        df = PandasData.convert_table(obj, sch.Schema({str(obj.columns[0]): dtype}))
+        value = df.iat[0, 0]
+
+        if dtype.is_array():
+            try:
+                return value.tolist()
+            except AttributeError:
+                return value
+
+        try:
+            return value.item()
+        except AttributeError:
+            return value
 
     @classmethod
     def convert_GeoSpatial(cls, s, dtype, pandas_type):
@@ -200,8 +203,10 @@ class PandasData(DataMapper):
 
     @classmethod
     def convert_Timestamp(cls, s, dtype, pandas_type):
-        if isinstance(dtype, pd.DatetimeTZDtype):
-            return s.dt.tz_convert(dtype.timezone)
+        if isinstance(pandas_type, pd.DatetimeTZDtype) and isinstance(
+            s.dtype, pd.DatetimeTZDtype
+        ):
+            return s if s.dtype == pandas_type else s.dt.tz_convert(dtype.timezone)
         elif pdt.is_datetime64_dtype(s.dtype):
             return s.dt.tz_localize(dtype.timezone)
         else:
@@ -224,17 +229,20 @@ class PandasData(DataMapper):
     def convert_Date(cls, s, dtype, pandas_type):
         if isinstance(s.dtype, pd.DatetimeTZDtype):
             s = s.dt.tz_convert("UTC").dt.tz_localize(None)
+
         try:
-            return s.astype(pandas_type).dt.date
+            return s.astype(pandas_type)
         except (ValueError, TypeError, pd._libs.tslibs.OutOfBoundsDatetime):
 
             def try_date(v):
-                if isinstance(v, datetime.datetime):
-                    return v.date()
+                if isinstance(v, datetime.date):
+                    return pd.Timestamp(v)
                 elif isinstance(v, str):
                     if v.endswith("Z"):
-                        return datetime.datetime.fromisoformat(v[:-1]).date()
-                    return datetime.date.fromisoformat(v)
+                        datetime_obj = datetime.datetime.fromisoformat(v[:-1])
+                    else:
+                        datetime_obj = datetime.datetime.fromisoformat(v)
+                    return pd.Timestamp(datetime_obj)
                 else:
                     return v
 
@@ -348,10 +356,14 @@ class PandasData(DataMapper):
                 # TODO: can we do better than implicit truncation to microseconds?
                 import dateutil
 
-                value = datetime.datetime.fromtimestamp(value / 1e9, dateutil.tz.UTC)
+                value = pd.Timestamp.fromtimestamp(value / 1e9, dateutil.tz.UTC)
 
             if (tz := dtype.timezone) is not None:
-                return value.astimezone(normalize_timezone(tz))
+                value = pd.Timestamp(value)
+                normed_tz = normalize_timezone(tz)
+                if value.tzinfo is None:
+                    return value.tz_localize(normed_tz)
+                return value.tz_convert(normed_tz)
 
             return value.replace(tzinfo=None)
 
@@ -396,6 +408,8 @@ class PandasData(DataMapper):
                 return value
             elif isinstance(value, UUID):
                 return value
+            elif isinstance(value, bytes):
+                return UUID(bytes=value)
             return UUID(value)
 
         return convert
@@ -406,8 +420,20 @@ class PandasDataFrameProxy(TableProxy[pd.DataFrame]):
         return self.obj
 
     def to_pyarrow(self, schema: sch.Schema) -> pa.Table:
+        from decimal import Decimal
+
+        import pyarrow as pa
+        import pyarrow_hotfix  # noqa: F401
+
         pyarrow_schema = PyArrowSchema.from_ibis(schema)
-        return pa.Table.from_pandas(self.obj, schema=pyarrow_schema)
+
+        obj = self.obj
+        if decimal_cols := [
+            name for name, dtype in schema.items() if dtype.is_decimal()
+        ]:
+            obj = obj.assign(**{col: obj[col].map(Decimal) for col in decimal_cols})
+
+        return pa.Table.from_pandas(obj, schema=pyarrow_schema)
 
     def to_polars(self, schema: sch.Schema) -> pl.DataFrame:
         import polars as pl

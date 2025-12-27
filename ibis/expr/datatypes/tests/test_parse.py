@@ -6,12 +6,14 @@ import hypothesis as h
 import hypothesis.strategies as st
 import parsy
 import pytest
+from pytest import param
 
 import ibis.expr.datatypes as dt
 import ibis.tests.strategies as its
 from ibis.common.annotations import ValidationError
 
 
+@pytest.mark.parametrize("nullable", [True, False])
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -42,8 +44,8 @@ from ibis.common.annotations import ValidationError
         ("multipolygon", dt.multipolygon),
     ],
 )
-def test_primitive_from_string(spec, expected):
-    assert dt.dtype(spec) == expected
+def test_primitive_from_string(nullable, spec, expected):
+    assert dt.dtype(spec, nullable=nullable) == expected(nullable=nullable)
 
 
 @pytest.mark.parametrize(
@@ -77,9 +79,12 @@ def test_parse_decimal_failure(case):
         dt.dtype(case)
 
 
-@pytest.mark.parametrize("spec", ["varchar", "varchar(10)", "char", "char(10)"])
-def test_parse_char_varchar(spec):
-    assert dt.dtype(spec) == dt.string
+@pytest.mark.parametrize(
+    ("spec", "length"),
+    [("varchar", None), ("varchar(10)", 10), ("char", None), ("char(10)", 10)],
+)
+def test_parse_char_varchar(spec, length):
+    assert dt.dtype(spec) == dt.String(length=length)
 
 
 @pytest.mark.parametrize(
@@ -157,6 +162,34 @@ def test_struct_with_string_types():
             ("d", dt.int8),
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("type_string", "expected_dtype"),
+    [
+        ("struct<a: int32,>", {"a": dt.int32}),
+        ("struct<a: int32, b: string  , >", {"a": dt.int32, "b": dt.string}),
+    ],
+    ids=["single_field", "multiple_fields"],
+)
+def test_struct_trailing_comma(type_string, expected_dtype):
+    result = dt.dtype(type_string)
+    assert result == dt.Struct(expected_dtype)
+
+
+@pytest.mark.parametrize(
+    "invalid_type_string",
+    [
+        param("struct<,>", id="missing_key"),
+        param("struct<a,>", id="missing_colon"),
+        param("struct<b: ,>", id="missing_value"),
+        param("struct<c:in,>", id="invalid_type"),
+        param("struct<a:int,b:int64,,>", id="double_comma"),
+    ],
+)
+def test_struct_trailing_comma_invalid(invalid_type_string):
+    with pytest.raises(parsy.ParseError):
+        dt.dtype(invalid_type_string)
 
 
 def test_array_with_string_value_types():
@@ -266,7 +299,6 @@ def test_parse_null():
 
 
 # corresponds to its.all_dtypes() but without:
-# - geospacial types, the string representation is different from what the parser expects
 # - struct types, the generated struct field names contain special characters
 
 field_names = st.text(
@@ -286,6 +318,7 @@ roundtrippable_dtypes = st.deferred(
         | its.struct_dtypes(names=field_names)
         | its.array_dtypes(roundtrippable_dtypes)
         | its.map_dtypes(roundtrippable_dtypes, roundtrippable_dtypes)
+        | its.geospatial_dtypes()
     )
 )
 
@@ -293,3 +326,7 @@ roundtrippable_dtypes = st.deferred(
 @h.given(roundtrippable_dtypes)
 def test_parse_dtype_roundtrip(dtype):
     assert dt.dtype(str(dtype)) == dtype
+
+
+def test_parse_empty_struct():
+    assert dt.dtype("struct<>") == dt.Struct({})

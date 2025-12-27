@@ -7,32 +7,21 @@ import operator
 import os
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import parse_qs, urlparse
 
 import impala.dbapi as impyla
+import impala.hiveserver2 as hs2
 import sqlglot as sg
 import sqlglot.expressions as sge
 from impala.error import Error as ImpylaError
 
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as com
 import ibis.config
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
+from ibis.backends import HasCurrentDatabase, NoExampleLoader
 from ibis.backends.impala import ddl, udf
-from ibis.backends.impala.client import ImpalaTable
-from ibis.backends.impala.compiler import ImpalaCompiler
-from ibis.backends.impala.ddl import (
-    CTAS,
-    CreateDatabase,
-    CreateTableWithSchema,
-    CreateView,
-    DropDatabase,
-    DropTable,
-    DropView,
-    RenameTable,
-    TruncateTable,
-)
 from ibis.backends.impala.udf import (
     aggregate_function,
     scalar_function,
@@ -44,8 +33,10 @@ from ibis.backends.sql import SQLBackend
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
+    from urllib.parse import ParseResult
 
     import pandas as pd
+    import polars as pl
     import pyarrow as pa
 
     import ibis.expr.operations as ops
@@ -60,54 +51,45 @@ __all__ = (
 )
 
 
-class Backend(SQLBackend):
+class Backend(SQLBackend, HasCurrentDatabase, NoExampleLoader):
     name = "impala"
-    compiler = ImpalaCompiler()
+    compiler = sc.impala.compiler
 
-    supports_in_memory_tables = True
+    def _from_url(self, url: ParseResult, **kwarg_overrides: Any) -> Backend:
+        def _get_env(attr: str) -> str | None:
+            return os.environ.get(f"{self.name.upper()}_{attr.upper()}")
 
-    def _from_url(self, url: str, **kwargs: Any) -> Backend:
-        """Connect to a backend using a URL `url`.
+        kwargs = {}
+        if (username := _get_env("username")) is not None:
+            kwargs["user"] = username
+        if url.username:
+            kwargs["user"] = url.username
 
-        Parameters
-        ----------
-        url
-            URL with which to connect to a backend.
-        kwargs
-            Additional keyword arguments passed to the `connect` method.
+        if (password := _get_env("password")) is not None:
+            kwargs["password"] = password
+        if url.password:
+            kwargs["password"] = url.password
 
-        Returns
-        -------
-        BaseBackend
-            A backend instance
+        if (host := _get_env("hostname")) is not None:
+            kwargs["host"] = host
+        if (host := _get_env("host")) is not None:
+            kwargs["host"] = host
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if host := kwarg_overrides.get("hostname"):
+            kwargs["host"] = host
 
-        """
-        url = urlparse(url)
+        if (port := _get_env("port")) is not None:
+            kwargs["port"] = port
+        if url.port:
+            kwargs["port"] = url.port
 
-        for name in ("username", "hostname", "port", "password"):
-            if value := (
-                getattr(url, name, None)
-                or os.environ.get(f"{self.name.upper()}_{name.upper()}")
-            ):
-                kwargs[name] = value
-
-        with contextlib.suppress(KeyError):
-            kwargs["host"] = kwargs.pop("hostname")
-
-        (database,) = url.path[1:].split("/", 1)
-        if database:
+        if (database := _get_env("path")) is not None:
+            kwargs["database"] = database
+        if database := url.path[1:].split("/", 1)[0]:
             kwargs["database"] = database
 
-        query_params = parse_qs(url.query)
-
-        for name, value in query_params.items():
-            if len(value) > 1:
-                kwargs[name] = value
-            elif len(value) == 1:
-                kwargs[name] = value[0]
-            else:
-                raise com.IbisError(f"Invalid URL parameter: {name}")
-
+        kwargs.update(kwarg_overrides)
         self._convert_kwargs(kwargs)
         return self.connect(**kwargs)
 
@@ -142,7 +124,7 @@ class Backend(SQLBackend):
         ca_cert
             Local path to 3rd party CA certificate or copy of server
             certificate for self-signed certificates. If SSL is enabled, but
-            this argument is ``None``, then certificate validation is skipped.
+            this argument is `None`, then certificate validation is skipped.
         user
             LDAP user to authenticate
         password
@@ -194,6 +176,25 @@ class Backend(SQLBackend):
             cur.ping()
 
         self.con = con
+        self._post_connect()
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: hs2.HiveServer2Connection, /) -> Backend:
+        """Create an Impala `Backend` from an existing HS2 connection.
+
+        Parameters
+        ----------
+        con
+            An existing connection to HiveServer2 (HS2).
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        new_backend._post_connect()
+        return new_backend
+
+    def _post_connect(self) -> None:
         self.options = {}
 
     @cached_property
@@ -202,28 +203,14 @@ class Backend(SQLBackend):
             (result,) = cursor.fetchone()
         return result
 
-    def list_databases(self, like=None):
+    def list_databases(self, *, like: str | None = None) -> list[str]:
         with self._safe_raw_sql("SHOW DATABASES") as cur:
             databases = fetchall(cur)
         return self._filter_with_like(databases.name.tolist(), like)
 
-    def list_tables(self, like=None, database=None):
-        """Return the list of table names in the current database.
-
-        Parameters
-        ----------
-        like
-            A pattern in Python's regex format.
-        database
-            The database from which to list tables.
-            If not provided, the current database is used.
-
-        Returns
-        -------
-        list[str]
-            The list of the table names that match the pattern `like`.
-        """
-
+    def list_tables(
+        self, *, like: str | None = None, database: str | None = None
+    ) -> list[str]:
         statement = "SHOW TABLES"
         if database is not None:
             statement += f" IN {database}"
@@ -257,7 +244,7 @@ class Backend(SQLBackend):
     def _fetch_from_cursor(self, cursor, schema):
         from ibis.formats.pandas import PandasData
 
-        results = fetchall(cursor)
+        results = fetchall(cursor, schema.names)
         return PandasData.convert_table(results, schema)
 
     @contextlib.contextmanager
@@ -288,34 +275,28 @@ class Backend(SQLBackend):
             [(db,)] = cur.fetchall()
         return db
 
-    def create_database(self, name, path=None, force=False):
-        """Create a new Impala database.
+    def table(
+        self, name, /, *, database: str | tuple[str, str] | None = None
+    ) -> ir.Table:
+        try:
+            return super().table(name, database=database)
+        except hs2.HiveServer2Error as e:
+            if "AnalysisException: Could not resolve path:" in str(e):
+                raise com.TableNotFound(name) from e
 
-        Parameters
-        ----------
-        name
-            Database name
-        path
-            Path where to store the database data; otherwise uses the Impala default
-        force
-            Forcibly create the database
-
-        """
-        statement = CreateDatabase(name, path=path, can_exist=force)
+    def create_database(
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
+    ) -> None:
+        statement = ddl.CreateDatabase(name, path=catalog, can_exist=force)
         self._safe_exec_sql(statement)
 
-    def drop_database(self, name, force=False):
-        """Drop an Impala database.
-
-        Parameters
-        ----------
-        name
-            Database name
-        force
-            If False and there are any tables in this database, raises an
-            IntegrityError
-
-        """
+    def drop_database(
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
+    ) -> None:
+        if catalog is not None:
+            raise NotImplementedError(
+                "Ibis has not yet implemented `catalog` parameter of drop_database() for Impala"
+            )
         if not force or name in self.list_databases():
             tables = self.list_tables(database=name)
             udfs = self.list_udfs(database=name)
@@ -346,10 +327,9 @@ class Backend(SQLBackend):
                 )
         elif tables or udfs or udas:
             raise com.IntegrityError(
-                f"Database {name} must be empty before "
-                "being dropped, or set force=True"
+                f"Database {name} must be empty before being dropped, or set force=True"
             )
-        statement = DropDatabase(name, must_exist=not force)
+        statement = ddl.DropDatabase(name, must_exist=not force)
         self._safe_exec_sql(statement)
 
     def get_schema(
@@ -376,14 +356,18 @@ class Backend(SQLBackend):
             Ibis schema
 
         """
-        query = sge.Describe(
-            this=sg.table(
-                table_name, db=database, catalog=catalog, quoted=self.compiler.quoted
-            )
+        table = sg.table(
+            table_name, db=database, catalog=catalog, quoted=self.compiler.quoted
         )
 
+        with contextlib.closing(self.con.cursor()) as cur:
+            if not cur.table_exists(table_name, database_name=database or catalog):
+                raise com.TableNotFound(table.sql(self.dialect))
+
+        query = sge.Describe(this=table)
         with self._safe_raw_sql(query) as cur:
             meta = fetchall(cur)
+
         return sch.Schema.from_tuples(
             zip(meta["name"], meta["type"].map(self.compiler.type_mapper.from_string))
         )
@@ -426,40 +410,46 @@ class Backend(SQLBackend):
     def create_view(
         self,
         name: str,
+        /,
         obj: ir.Table,
         *,
         database: str | None = None,
         overwrite: bool = False,
     ) -> ir.Table:
         select = self.compile(obj)
-        statement = CreateView(name, select, database=database, can_exist=overwrite)
+        statement = ddl.CreateView(name, select, database=database, can_exist=overwrite)
         self._safe_exec_sql(statement)
         return self.table(name, database=database)
 
-    def drop_view(self, name, database=None, force=False):
-        stmt = DropView(name, database=database, must_exist=not force)
+    def drop_view(
+        self, name, /, *, database: str | None = None, force: bool = False
+    ) -> None:
+        stmt = ddl.DropView(name, database=database, must_exist=not force)
         self._safe_exec_sql(stmt)
-
-    def table(self, name: str, database: str | None = None, **kwargs: Any) -> ir.Table:
-        expr = super().table(name, database=database, **kwargs)
-        return ImpalaTable(expr.op())
 
     def create_table(
         self,
         name: str,
-        obj: ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema=None,
-        database=None,
+        schema: sch.SchemaLike | None = None,
+        database: str | None = None,
         temp: bool | None = None,
         overwrite: bool = False,
         external: bool = False,
         format="parquet",
         location=None,
         partition=None,
+        tbl_properties: Mapping[str, Any] | None = None,
         like_parquet=None,
     ) -> ir.Table:
-        """Create a new table in Impala using an Ibis table expression.
+        """Create a new table using an Ibis table expression or in-memory data.
 
         Parameters
         ----------
@@ -487,14 +477,17 @@ class Backend(SQLBackend):
         partition
             Must pass a schema to use this. Cannot partition from an
             expression.
+        tbl_properties
+            Table properties to set on table creation.
         like_parquet
             Can specify instead of a schema
-
         """
         if obj is None and schema is None:
             raise com.IbisError("The schema or obj parameter is required")
+        if schema is not None:
+            schema = ibis.schema(schema)
 
-        if temp is not None:
+        if temp:
             raise NotImplementedError(
                 "Impala backend does not yet support temporary tables"
             )
@@ -513,7 +506,7 @@ class Backend(SQLBackend):
                 self.drop_table(name, force=True)
 
             self._safe_exec_sql(
-                CTAS(
+                ddl.CTAS(
                     name,
                     select,
                     database=database or self.current_database,
@@ -521,27 +514,29 @@ class Backend(SQLBackend):
                     external=True if location is not None else external,
                     partition=partition,
                     path=location,
+                    tbl_properties=tbl_properties,
                 )
             )
         else:  # schema is not None
             if overwrite:
                 self.drop_table(name, force=True)
             self._safe_exec_sql(
-                CreateTableWithSchema(
+                ddl.CreateTableWithSchema(
                     name,
-                    schema if schema is not None else obj.schema(),
+                    schema or obj.schema(),
                     database=database or self.current_database,
                     format=format,
                     external=external,
                     path=location,
                     partition=partition,
+                    tbl_properties=tbl_properties,
                 )
             )
         return self.table(name, database=database or self.current_database)
 
     def avro_file(
         self, directory, avro_schema, name=None, database=None, external=True
-    ):
+    ) -> ir.Table:
         """Create a table to read a collection of Avro data.
 
         Parameters
@@ -559,9 +554,8 @@ class Backend(SQLBackend):
 
         Returns
         -------
-        ImpalaTable
-            Impala table expression
-
+        Table
+            Table expression
         """
         name, database = self._get_concrete_table_path(name, database)
 
@@ -582,7 +576,7 @@ class Backend(SQLBackend):
         escapechar=None,
         lineterminator=None,
         external=True,
-    ):
+    ) -> ir.Table:
         """Interpret delimited text files as an Ibis table expression.
 
         See the `parquet_file` method for more details on what happens under
@@ -611,9 +605,8 @@ class Backend(SQLBackend):
 
         Returns
         -------
-        ImpalaTable
-            Impala table expression
-
+        Table
+            Table expression
         """
         name, database = self._get_concrete_table_path(name, database)
 
@@ -640,7 +633,7 @@ class Backend(SQLBackend):
         external: bool = True,
         like_file: str | Path | None = None,
         like_table: str | None = None,
-    ):
+    ) -> ir.Table:
         """Create an Ibis table from the passed directory of Parquet files.
 
         The table can be optionally named, otherwise a unique name will be
@@ -671,9 +664,8 @@ class Backend(SQLBackend):
 
         Returns
         -------
-        ImpalaTable
-            Impala table expression
-
+        Table
+            Table expression
         """
         name, database = self._get_concrete_table_path(name, database)
 
@@ -716,42 +708,100 @@ class Backend(SQLBackend):
 
     def insert(
         self,
-        table_name,
+        name,
+        /,
         obj=None,
+        *,
         database=None,
         overwrite=False,
         partition=None,
-        values=None,
         validate=True,
-    ):
-        """Insert data into an existing table.
+    ) -> None:
+        """Insert into an Impala table.
 
-        See
-        [`ImpalaTable.insert`](../backends/impala.qmd#ibis.backends.impala.client.ImpalaTable.insert)
-        for parameters.
+        Parameters
+        ----------
+        name
+            The table name
+        obj
+            Table expression or DataFrame
+        database
+            The table database
+        overwrite
+            If True, will replace existing contents of table
+        partition
+            For partitioned tables, indicate the partition that's being
+            inserted into, either with an ordered list of partition keys or a
+            dict of partition field name to value. For example for the
+            partition (year=2007, month=7), this can be either (2007, 7) or
+            {'year': 2007, 'month': 7}.
+        validate
+            If True, do more rigorous validation that schema of table being
+            inserted is compatible with the existing table
 
         Examples
         --------
-        >>> table = "my_table"
-        >>> con.insert(table, table_expr)  # quartodoc: +SKIP # doctest: +SKIP
+        Append to an existing table
+
+        >>> con.insert(table_name, table_expr)  # quartodoc: +SKIP # doctest: +SKIP
 
         Completely overwrite contents
-        >>> con.insert(table, table_expr, overwrite=True)  # quartodoc: +SKIP # doctest: +SKIP
+
+        >>> con.insert(table_name, table_expr, overwrite=True)  # quartodoc: +SKIP # doctest: +SKIP
 
         """
         if isinstance(obj, ir.Table):
             self._run_pre_execute_hooks(obj)
-        table = self.table(table_name, database=database)
-        return table.insert(
-            obj=obj,
-            overwrite=overwrite,
+
+        table = self.table(name, database=database)
+
+        if not isinstance(obj, ir.Table):
+            obj = ibis.memtable(obj)
+
+        if not set(table.columns).difference(obj.columns):
+            # project out using column order of parent table
+            # if column names match
+            obj = obj.select(table.columns)
+
+        self._run_pre_execute_hooks(obj)
+
+        if validate:
+            existing_schema = table.schema()
+            insert_schema = obj.schema()
+            if not insert_schema.equals(existing_schema):
+                if set(insert_schema.names) != set(existing_schema.names):
+                    raise com.IbisInputError("Schemas have different names")
+
+                for insert_name in insert_schema:
+                    lt = insert_schema[insert_name]
+                    rt = existing_schema[insert_name]
+                    if not lt.castable(rt):
+                        raise com.IbisInputError(f"Cannot safely cast {lt!r} to {rt!r}")
+
+        if partition is not None:
+            partition_schema = self.get_partition_schema(name, database=database)
+            partition_schema_names = frozenset(partition_schema.names)
+            obj = obj.select(
+                [
+                    column
+                    for column in obj.columns
+                    if column not in partition_schema_names
+                ]
+            )
+        else:
+            partition_schema = None
+
+        statement = ddl.InsertSelect(
+            self._fully_qualified_name(name, database),
+            self.compile(obj),
             partition=partition,
-            values=values,
-            validate=validate,
+            partition_schema=partition_schema,
+            overwrite=overwrite,
         )
+        self._safe_exec_sql(statement.compile())
 
     def drop_table(
-        self, name: str, *, database: str | None = None, force: bool = False
+        self, name: str, /, *, database: str | None = None, force: bool = False
     ) -> None:
         """Drop an Impala table.
 
@@ -769,12 +819,11 @@ class Backend(SQLBackend):
         >>> table = "my_table"
         >>> db = "operations"
         >>> con.drop_table(table, database=db, force=True)  # quartodoc: +SKIP # doctest: +SKIP
-
         """
-        statement = DropTable(name, database=database, must_exist=not force)
+        statement = ddl.DropTable(name, database=database, must_exist=not force)
         self._safe_exec_sql(statement)
 
-    def truncate_table(self, name: str, database: str | None = None) -> None:
+    def truncate_table(self, name: str, /, *, database: str | None = None) -> None:
         """Delete all rows from an existing table.
 
         Parameters
@@ -783,9 +832,8 @@ class Backend(SQLBackend):
             Table name
         database
             Database name
-
         """
-        statement = TruncateTable(name, database=database)
+        statement = ddl.TruncateTable(name, database=database)
         self._safe_exec_sql(statement)
 
     def rename_table(self, old_name: str, new_name: str) -> None:
@@ -799,10 +847,12 @@ class Backend(SQLBackend):
             The new name of the table.
 
         """
-        statement = RenameTable(old_name, new_name)
+        statement = ddl.RenameTable(old_name, new_name)
         self._safe_exec_sql(statement)
 
-    def drop_table_or_view(self, name, *, database=None, force=False):
+    def drop_table_or_view(
+        self, name, /, *, database: str | None = None, force: bool = False
+    ):
         """Drop view or table."""
         try:
             self.drop_table(name, database=database)
@@ -1119,6 +1169,141 @@ class Backend(SQLBackend):
         stmt = self._table_command("SHOW PARTITIONS", name, database=database)
         return self._exec_statement(stmt)
 
+    def get_partition_schema(
+        self,
+        table_name: str,
+        database: str | None = None,
+    ) -> sch.Schema:
+        """Return the schema for the partition columns.
+
+        Parameters
+        ----------
+        table_name
+            Table name
+        database
+            Database name
+
+        Returns
+        -------
+        Schema
+            Ibis schema for the partition columns
+        """
+        schema = self.get_schema(table_name, database=database)
+        result = self.list_partitions(table_name, database)
+
+        partition_fields = []
+        for col in result.columns:
+            if col not in schema:
+                break
+            partition_fields.append((col, schema[col]))
+
+        return sch.Schema(dict(partition_fields))
+
+    def add_partition(
+        self,
+        table_name: str,
+        spec: dict[str, Any] | list,
+        *,
+        database: str | None = None,
+        location: str | None = None,
+    ) -> None:
+        """Add a new table partition.
+
+        Partition parameters can be set in a single DDL statement or you can
+        use `alter_partition` to set them after the fact.
+
+        Parameters
+        ----------
+        table_name
+            The table name.
+        spec
+            The partition keys for the partition being added.
+        database
+            The database name. If not provided, the current database is used.
+        location
+            Location of the partition
+        """
+        part_schema = self.get_partition_schema(table_name, database)
+        stmt = ddl.AddPartition(
+            self._fully_qualified_name(table_name, database),
+            spec,
+            part_schema,
+            location=location,
+        )
+        self._safe_exec_sql(stmt)
+
+    def drop_partition(
+        self,
+        table_name: str,
+        spec: dict[str, Any] | list,
+        *,
+        database: str | None = None,
+    ) -> None:
+        """Drop an existing table partition.
+
+        Parameters
+        ----------
+        table_name
+            The table name.
+        spec
+            The partition keys for the partition being dropped.
+        database
+            The database name. If not provided, the current database is used.
+        """
+        part_schema = self.get_partition_schema(table_name, database)
+        stmt = ddl.DropPartition(
+            self._fully_qualified_name(table_name, database),
+            spec,
+            part_schema,
+        )
+        self._safe_exec_sql(stmt)
+
+    def alter_partition(
+        self,
+        table_name: str,
+        spec: dict[str, Any] | list,
+        *,
+        database: str | None = None,
+        location: str | None = None,
+        format: str | None = None,
+        tbl_properties: dict | None = None,
+        serde_properties: dict | None = None,
+    ) -> None:
+        """Change settings and parameters of an existing partition.
+
+        Parameters
+        ----------
+        table_name
+            The table name
+        spec
+            The partition keys for the partition being modified
+        database
+            The database name. If not provided, the current database is used.
+        location
+            Location of the partition
+        format
+            Table format
+        tbl_properties
+            Table properties
+        serde_properties
+            Serialization/deserialization properties
+        """
+        part_schema = self.get_partition_schema(table_name, database)
+
+        alterations = [
+            ("location", location),
+            ("format", format),
+            ("tbl_properties", tbl_properties),
+            ("serde_properties", serde_properties),
+        ]
+
+        qname = self._fully_qualified_name(table_name, database)
+
+        for field, values in alterations:
+            if values is not None:
+                stmt = ddl.AlterPartition(qname, spec, part_schema, **{field, values})
+                self._safe_exec_sql(stmt)
+
     def table_stats(self, name, database=None):
         """Return results of `SHOW TABLE STATS` for the table `name`."""
         stmt = self._table_command("SHOW TABLE STATS", name, database=database)
@@ -1140,6 +1325,8 @@ class Backend(SQLBackend):
     def to_pyarrow(
         self,
         expr: ir.Expr,
+        /,
+        *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
         **kwargs: Any,
@@ -1162,6 +1349,7 @@ class Backend(SQLBackend):
     def to_pyarrow_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -1202,48 +1390,34 @@ class Backend(SQLBackend):
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         schema = op.schema
-        if null_columns := [col for col, dtype in schema.items() if dtype.is_null()]:
+        if null_columns := schema.null_fields:
             raise com.IbisTypeError(
                 "Impala cannot yet reliably handle `null` typed columns; "
                 f"got null typed columns: {null_columns}"
             )
 
-        # only register if we haven't already done so
-        if (name := op.name) not in self.list_tables():
-            type_mapper = self.compiler.type_mapper
-            quoted = self.compiler.quoted
-            column_defs = [
-                sg.exp.ColumnDef(
-                    this=sg.to_identifier(colname, quoted=quoted),
-                    kind=type_mapper.from_ibis(typ),
-                    # we don't support `NOT NULL` constraints in trino because
-                    # because each trino connector differs in whether it
-                    # supports nullability constraints, and whether the
-                    # connector supports it isn't visible to ibis via a
-                    # metadata query
-                )
-                for colname, typ in schema.items()
-            ]
+        name = op.name
+        quoted = self.compiler.quoted
 
-            create_stmt = sg.exp.Create(
-                kind="TABLE",
-                this=sg.exp.Schema(
-                    this=sg.to_identifier(name, quoted=quoted), expressions=column_defs
-                ),
-            ).sql(self.name, pretty=True)
+        create_stmt = sg.exp.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
+            ),
+        ).sql(self.name, pretty=True)
 
-            data = op.data.to_frame().itertuples(index=False)
-            specs = ", ".join("?" * len(schema))
-            table = sg.table(name, quoted=quoted).sql(self.name)
-            insert_stmt = f"INSERT INTO {table} VALUES ({specs})"
-            with self._safe_raw_sql(create_stmt) as cur:
-                for row in data:
-                    cur.execute(insert_stmt, row)
+        data = op.data.to_frame().itertuples(index=False)
+        insert_stmt = self._build_insert_template(name, schema=schema)
+        with self._safe_raw_sql(create_stmt) as cur:
+            for row in data:
+                cur.execute(insert_stmt, row)
 
 
-def fetchall(cur):
+def fetchall(cur, names=None):
     batches = cur.fetchcolumnar()
-    names = list(map(operator.itemgetter(0), cur.description))
+    if names is None:
+        names = list(map(operator.itemgetter(0), cur.description))
     df = _column_batches_to_dataframe(names, batches)
     return df
 

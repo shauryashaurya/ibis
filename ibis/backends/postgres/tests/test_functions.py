@@ -14,10 +14,10 @@ from pytest import param
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-from ibis import config
 from ibis import literal as L
+from ibis.util import gen_name
 
-pytest.importorskip("psycopg2")
+pytest.importorskip("psycopg")
 
 
 @pytest.mark.parametrize(
@@ -150,7 +150,7 @@ def test_strftime(con, pattern):
     [
         param(L("foo_bar"), "text", id="text"),
         param(L(5), "integer", id="integer"),
-        param(ibis.NA, "null", id="null"),
+        param(ibis.null(), "null", id="null"),
         # TODO(phillipc): should this really be double?
         param(L(1.2345), "numeric", id="numeric"),
         param(
@@ -335,13 +335,13 @@ def test_regexp_extract(con, expr, expected):
 @pytest.mark.parametrize(
     ("expr", "expected"),
     [
-        param(ibis.NA.fillna(5), 5, id="filled"),
-        param(L(5).fillna(10), 5, id="not_filled"),
+        param(ibis.null().fill_null(5), 5, id="filled"),
+        param(L(5).fill_null(10), 5, id="not_filled"),
         param(L(5).nullif(5), None, id="nullif_null"),
         param(L(10).nullif(5), 10, id="nullif_not_null"),
     ],
 )
-def test_fillna_nullif(con, expr, expected):
+def test_fill_null_nullif(con, expr, expected):
     assert con.execute(expr) == expected
 
 
@@ -349,8 +349,8 @@ def test_fillna_nullif(con, expr, expected):
     ("expr", "expected"),
     [
         param(ibis.coalesce(5, None, 4), 5, id="first"),
-        param(ibis.coalesce(ibis.NA, 4, ibis.NA), 4, id="second"),
-        param(ibis.coalesce(ibis.NA, ibis.NA, 3.14), 3.14, id="third"),
+        param(ibis.coalesce(ibis.null(), 4, ibis.null()), 4, id="second"),
+        param(ibis.coalesce(ibis.null(), ibis.null(), 3.14), 3.14, id="third"),
     ],
 )
 def test_coalesce(con, expr, expected):
@@ -358,34 +358,26 @@ def test_coalesce(con, expr, expected):
 
 
 @pytest.mark.parametrize(
-    ("expr", "expected"),
+    "expr",
     [
-        param(ibis.coalesce(ibis.NA, ibis.NA), None, id="all_null"),
-        param(
-            ibis.coalesce(
-                ibis.NA.cast("int8"),
-                ibis.NA.cast("int8"),
-                ibis.NA.cast("int8"),
-            ),
-            None,
-            id="all_nulls_with_all_cast",
-        ),
+        ibis.coalesce(*([ibis.null()] * 2)),
+        ibis.coalesce(*([ibis.null().cast("int8")] * 3)),
     ],
+    ids=["all", "all_with_cast"],
 )
-def test_coalesce_all_na(con, expr, expected):
+def test_coalesce_all_na(con, expr):
     assert con.execute(expr) is None
 
 
 def test_coalesce_all_na_double(con):
-    expr = ibis.coalesce(ibis.NA, ibis.NA, ibis.NA.cast("double"))
+    expr = ibis.coalesce(ibis.null(), ibis.null(), ibis.null().cast("double"))
     assert np.isnan(con.execute(expr))
 
 
 def test_numeric_builtins_work(alltypes, df):
-    expr = alltypes.double_col.fillna(0)
+    expr = alltypes.double_col.fill_null(0)
     result = expr.execute()
-    expected = df.double_col.fillna(0)
-    expected.name = "Coalesce()"
+    expected = df.double_col.fillna(0).rename(expr.get_name())
     tm.assert_series_equal(result, expected)
 
 
@@ -471,7 +463,7 @@ def test_category_label(alltypes, df):
     bins = [0, 10, 25, 50, 100]
     labels = ["a", "b", "c", "d"]
     bucket = d.bucket(bins)
-    expr = bucket.label(labels)
+    expr = bucket.cases(*enumerate(labels), else_=None)
     result = expr.execute()
 
     with warnings.catch_warnings():
@@ -499,68 +491,68 @@ def test_union_cte(alltypes, distinct, assert_sql):
     ("func", "pandas_func"),
     [
         param(
-            lambda t, cond: t.bool_col.count(),
-            lambda df, cond: df.bool_col.count(),
+            lambda t, _: t.bool_col.count(),
+            lambda df, _: df.bool_col.count(),
             id="count",
         ),
         param(
-            lambda t, cond: t.bool_col.any(),
-            lambda df, cond: df.bool_col.any(),
+            lambda t, _: t.bool_col.any(),
+            lambda df, _: df.bool_col.any(),
             id="any",
         ),
         param(
-            lambda t, cond: t.bool_col.all(),
-            lambda df, cond: df.bool_col.all(),
+            lambda t, _: t.bool_col.all(),
+            lambda df, _: df.bool_col.all(),
             id="all",
         ),
         param(
-            lambda t, cond: t.bool_col.notany(),
-            lambda df, cond: ~df.bool_col.any(),
+            lambda t, _: t.bool_col.notany(),
+            lambda df, _: ~df.bool_col.any(),
             id="notany",
         ),
         param(
-            lambda t, cond: t.bool_col.notall(),
-            lambda df, cond: ~df.bool_col.all(),
+            lambda t, _: t.bool_col.notall(),
+            lambda df, _: ~df.bool_col.all(),
             id="notall",
         ),
         param(
-            lambda t, cond: t.double_col.sum(),
-            lambda df, cond: df.double_col.sum(),
+            lambda t, _: t.double_col.sum(),
+            lambda df, _: df.double_col.sum(),
             id="sum",
         ),
         param(
-            lambda t, cond: t.double_col.mean(),
-            lambda df, cond: df.double_col.mean(),
+            lambda t, _: t.double_col.mean(),
+            lambda df, _: df.double_col.mean(),
             id="mean",
         ),
         param(
-            lambda t, cond: t.double_col.min(),
-            lambda df, cond: df.double_col.min(),
+            lambda t, _: t.double_col.min(),
+            lambda df, _: df.double_col.min(),
             id="min",
         ),
         param(
-            lambda t, cond: t.double_col.max(),
-            lambda df, cond: df.double_col.max(),
+            lambda t, _: t.double_col.max(),
+            lambda df, _: df.double_col.max(),
             id="max",
         ),
         param(
-            lambda t, cond: t.double_col.var(),
-            lambda df, cond: df.double_col.var(),
+            lambda t, _: t.double_col.var(),
+            lambda df, _: df.double_col.var(),
             id="var",
         ),
         param(
-            lambda t, cond: t.double_col.std(),
-            lambda df, cond: df.double_col.std(),
+            lambda t, _: t.double_col.std(),
+            lambda df, _: df.double_col.std(),
             id="std",
         ),
         param(
-            lambda t, cond: t.double_col.var(how="sample"),
-            lambda df, cond: df.double_col.var(ddof=1),
+            lambda t, _: t.double_col.var(how="sample"),
+            lambda df, _: df.double_col.var(ddof=1),
             id="samp_var",
         ),
         param(
-            lambda t, cond: t.double_col.std(how="pop"),
-            lambda df, cond: df.double_col.std(ddof=0),
+            lambda t, _: t.double_col.std(how="pop"),
+            lambda df, _: df.double_col.std(ddof=0),
             id="pop_std",
         ),
         param(
@@ -648,7 +640,7 @@ def test_not_exists(alltypes, df):
     t = alltypes
     t2 = t.view()
 
-    expr = t[~((t.string_col == t2.string_col).any())]
+    expr = t.filter(~((t.string_col == t2.string_col).any()))
     result = expr.execute()
 
     left, right = df, t2.execute()
@@ -657,11 +649,12 @@ def test_not_exists(alltypes, df):
     tm.assert_frame_equal(result, expected, check_index_type=False, check_dtype=False)
 
 
-def test_interactive_repr_shows_error(alltypes):
+def test_interactive_repr_shows_error(alltypes, monkeypatch):
     expr = alltypes.int_col.convert_base(10, 2)
 
-    with config.option_context("interactive", True):
-        result = repr(expr)
+    monkeypatch.setattr(ibis.options, "interactive", True)
+
+    result = repr(expr)
 
     assert "OperationNotDefinedError" in result
     assert "BaseConvert" in result
@@ -670,7 +663,9 @@ def test_interactive_repr_shows_error(alltypes):
 def test_subquery(alltypes, df):
     t = alltypes
 
-    expr = t.mutate(d=t.double_col.fillna(0)).limit(1000).group_by("string_col").size()
+    expr = (
+        t.mutate(d=t.double_col.fill_null(0)).limit(1000).group_by("string_col").size()
+    )
     result = expr.execute().sort_values("string_col").reset_index(drop=True)
     expected = (
         df.assign(d=df.double_col.fillna(0))
@@ -743,7 +738,7 @@ def test_cumulative_simple_window(alltypes, func, df):
     col = t.double_col - f().over(ibis.cumulative_window())
     expr = t.select(col.name("double_col"))
     result = expr.execute().double_col
-    expected = df.double_col - getattr(df.double_col, "cum%s" % func)()
+    expected = df.double_col - getattr(df.double_col, f"cum{func}")()
     tm.assert_series_equal(result, expected)
 
 
@@ -756,7 +751,7 @@ def test_cumulative_partitioned_window(alltypes, func, df):
     expr = t.select((t.double_col - f().over(window)).name("double_col"))
     result = expr.execute().double_col
     expected = df.groupby(df.string_col).double_col.transform(
-        lambda c: c - getattr(c, "cum%s" % func)()
+        lambda c: c - getattr(c, f"cum{func}")()
     )
     tm.assert_series_equal(result, expected)
 
@@ -769,7 +764,7 @@ def test_cumulative_ordered_window(alltypes, func, df):
     f = getattr(t.double_col, func)
     expr = t.select((t.double_col - f().over(window)).name("double_col"))
     result = expr.execute().double_col
-    expected = df.double_col - getattr(df.double_col, "cum%s" % func)()
+    expected = df.double_col - getattr(df.double_col, f"cum{func}")()
     tm.assert_series_equal(result, expected)
 
 
@@ -813,14 +808,14 @@ def test_first_last_value(alltypes, df, func, expected_index):
 def test_null_column(alltypes):
     t = alltypes
     nrows = t.count().execute()
-    expr = t.mutate(na_column=ibis.NA).na_column
+    expr = t.mutate(na_column=ibis.null()).na_column
     result = expr.execute()
     tm.assert_series_equal(result, pd.Series([None] * nrows, name="na_column"))
 
 
 def test_null_column_union(alltypes, df):
     t = alltypes
-    s = alltypes[["double_col"]].mutate(string_col=ibis.NA.cast("string"))
+    s = alltypes[["double_col"]].mutate(string_col=ibis.null().cast("string"))
     expr = t[["double_col", "string_col"]].union(s)
     result = expr.execute()
     nrows = t.count().execute()
@@ -854,7 +849,7 @@ def test_window_with_arithmetic(alltypes, df):
 
 def test_anonymous_aggregate(alltypes, df):
     t = alltypes
-    expr = t[t.double_col > t.double_col.mean()]
+    expr = t.filter(t.double_col > t.double_col.mean())
     result = expr.execute()
     expected = df[df.double_col > df.double_col.mean()].reset_index(drop=True)
     tm.assert_frame_equal(result, expected)
@@ -907,7 +902,7 @@ def test_array_collect(array_types):
 
 @pytest.mark.parametrize("index", [0, 1, 3, 4, 11, -1, -3, -4, -11])
 def test_array_index(array_types, index):
-    expr = array_types[array_types.y[index].name("indexed")]
+    expr = array_types.select(array_types.y[index].name("indexed"))
     result = expr.execute()
     expected = pd.DataFrame(
         {
@@ -956,31 +951,6 @@ def test_array_concat(array_types, catop):
 def test_array_concat_mixed_types(array_types):
     with pytest.raises(TypeError):
         array_types.y + array_types.x.cast("array<double>")
-
-
-@pytest.fixture
-def t(con, temp_table):
-    with con.begin() as c:
-        c.execute(f"CREATE TABLE {temp_table} (id SERIAL PRIMARY KEY, name TEXT)")
-    return con.table(temp_table)
-
-
-@pytest.fixture
-def s(con, t, temp_table2):
-    temp_table = t.op().name
-    assert temp_table != temp_table2
-
-    with con.begin() as c:
-        c.execute(
-            f"""
-            CREATE TABLE {temp_table2} (
-              id SERIAL PRIMARY KEY,
-              left_t_id INTEGER REFERENCES {temp_table},
-              cost DOUBLE PRECISION
-            )
-            """
-        )
-    return con.table(temp_table2)
 
 
 @pytest.fixture
@@ -1035,13 +1005,11 @@ def test_analytic_functions(alltypes, assert_sql):
     assert_sql(expr)
 
 
-@pytest.mark.parametrize("opname", ["invert", "neg"])
-def test_not_and_negate_bool(con, opname, df):
-    op = getattr(operator, opname)
+def test_invert_bool(con, df):
     t = con.table("functional_alltypes").limit(10)
-    expr = t.select(op(t.bool_col).name("bool_col"))
+    expr = t.select((~t.bool_col).name("bool_col"))
     result = expr.execute().bool_col
-    expected = op(df.head(10).bool_col)
+    expected = ~df.head(10).bool_col
     tm.assert_series_equal(result, expected)
 
 
@@ -1063,14 +1031,6 @@ def test_negate_non_boolean(con, field, df):
     expr = t.select((-t[field]).name(field))
     result = expr.execute()[field]
     expected = -df.head(10)[field]
-    tm.assert_series_equal(result, expected)
-
-
-def test_negate_boolean(con, df):
-    t = con.table("functional_alltypes").limit(10)
-    expr = t.select((-t.bool_col).name("bool_col"))
-    result = expr.execute().bool_col
-    expected = -df.head(10).bool_col
     tm.assert_series_equal(result, expected)
 
 
@@ -1236,7 +1196,7 @@ def test_string_to_binary_cast(con):
     )
     with con.begin() as c:
         c.execute(sql_string)
-        raw_data = [row[0][0] for row in c.fetchall()]
+        raw_data = [row[0] for row in c.fetchall()]
     expected = pd.Series(raw_data, name=name)
     tm.assert_series_equal(result, expected)
 
@@ -1253,7 +1213,7 @@ def test_string_to_binary_round_trip(con):
     )
     with con.begin() as c:
         c.execute(sql_string)
-        rows = [row[0] for (row,) in c.fetchall()]
+        rows = [row[0] for row in c.fetchall()]
     expected = pd.Series(rows, name=name)
     tm.assert_series_equal(result, expected)
 
@@ -1271,3 +1231,18 @@ def test_array_discovery(con):
         )
     )
     assert t.schema() == expected
+
+
+@pytest.mark.parametrize("tz", [None, "UTC", "America/New_York"])
+def test_insert_null_timestamp(con, tz):
+    name = gen_name("test_insert_nat")
+    ts = pd.Timestamp(datetime(2025, 1, 3, 12, 37, 38, 234236), tz=tz)
+    df = pd.DataFrame({"ts": [ts, None]})
+
+    # check that timezones match the input
+    t = con.create_table(name, obj=df, temp=True)
+    assert t.ts.type().timezone == tz
+
+    # check that the NaT went into the database as NULL
+    res = t.ts.count().execute()
+    assert res == 1

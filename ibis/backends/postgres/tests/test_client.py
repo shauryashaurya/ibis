@@ -13,23 +13,29 @@
 # limitations under the License.
 from __future__ import annotations
 
+import math
 import os
-import random
+import string
+from urllib.parse import quote_plus
 
+import hypothesis as h
+import hypothesis.strategies as st
 import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import pytest
 import sqlglot as sg
+import sqlglot.expressions as sge
 from pytest import param
 
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-from ibis.backends.tests.errors import PsycoPg2OperationalError
+from ibis.backends.tests.errors import PsycoPgOperationalError
+from ibis.util import gen_name
 
-pytest.importorskip("psycopg2")
+psycopg = pytest.importorskip("psycopg")
 
 POSTGRES_TEST_DB = os.environ.get("IBIS_TEST_POSTGRES_DATABASE", "ibis_testing")
 IBIS_POSTGRES_HOST = os.environ.get("IBIS_TEST_POSTGRES_HOST", "localhost")
@@ -53,6 +59,17 @@ def test_literal_execute(con):
     expr = ibis.literal("1234")
     result = con.execute(expr)
     assert result == "1234"
+
+
+def test_raw_sql(con):
+    with con.raw_sql("SELECT 1 AS foo") as cur:
+        assert cur.fetchall() == [(1,)]
+    con.con.commit()
+    with (
+        pytest.raises(psycopg.errors.UndefinedTable),
+        con.raw_sql("SELECT foo FROM bar"),
+    ):
+        pass
 
 
 def test_simple_aggregate_execute(alltypes):
@@ -133,7 +150,7 @@ def test_create_and_drop_table(con, temp_table, params):
 
     con.drop_table(temp_table, **params)
 
-    with pytest.raises(com.IbisError):
+    with pytest.raises(com.TableNotFound, match=temp_table):
         con.table(temp_table, **params)
 
 
@@ -144,7 +161,8 @@ def test_create_and_drop_table(con, temp_table, params):
         for (pg_type, ibis_type) in [
             ("boolean", dt.boolean),
             ("bytea", dt.binary),
-            ("char", dt.string),
+            ("char", dt.String(length=1)),
+            ("char(42)", dt.String(length=42)),
             ("bigint", dt.int64),
             ("smallint", dt.int16),
             ("integer", dt.int32),
@@ -158,8 +176,10 @@ def test_create_and_drop_table(con, temp_table, params):
             ("macaddr", dt.macaddr),
             ("macaddr8", dt.macaddr),
             ("inet", dt.inet),
-            ("character", dt.string),
+            ("character", dt.String(length=1)),
             ("character varying", dt.string),
+            ("character varying(73)", dt.String(length=73)),
+            ("varchar(37)", dt.String(length=37)),
             ("date", dt.date),
             ("time", dt.time),
             ("time without time zone", dt.time),
@@ -169,7 +189,7 @@ def test_create_and_drop_table(con, temp_table, params):
             ("numeric", dt.decimal),
             ("numeric(3, 2)", dt.Decimal(3, 2)),
             ("uuid", dt.uuid),
-            ("jsonb", dt.json),
+            ("jsonb", dt.jsonb),
             ("geometry", dt.geometry),
             ("geography", dt.geography),
         ]
@@ -251,16 +271,20 @@ def test_kwargs_passthrough_in_connect():
     con = ibis.connect(
         "postgresql://postgres:postgres@localhost:5432/ibis_testing?sslmode=allow"
     )
-    assert con.current_catalog == "ibis_testing"
+    try:
+        assert con.current_catalog == "ibis_testing"
+    finally:
+        con.disconnect()
 
 
 def test_port():
     # check that we parse and use the port (and then of course fail cuz it's bogus)
-    with pytest.raises(PsycoPg2OperationalError):
+    with pytest.raises(PsycoPgOperationalError):
         ibis.connect("postgresql://postgres:postgres@localhost:1337/ibis_testing")
 
 
-def test_pgvector_type_load(con):
+@h.given(st.integers(min_value=4, max_value=1000))
+def test_pgvector_type_load(con, vector_size):
     """
     CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
     INSERT INTO items (embedding) VALUES ('[1,2,3]'), ('[4,5,6]');
@@ -270,19 +294,20 @@ def test_pgvector_type_load(con):
     assert t.schema() == ibis.schema(
         {
             "id": dt.int64(nullable=False),
-            "embedding": dt.unknown,
+            "embedding": dt.Unknown(
+                raw_type=sge.DataType(this=sge.DataType.Type.VECTOR)
+            ),
         }
     )
 
     result = ["[1,2,3]", "[4,5,6]"]
     assert t.to_pyarrow().column("embedding").to_pylist() == result
 
-    query = f"""
-    DROP TABLE IF EXISTS itemsvrandom;
-    CREATE TABLE itemsvrandom (id bigserial PRIMARY KEY, embedding vector({random.randint(4, 1000)}));
-    """
+    query = f"""\
+DROP TABLE IF EXISTS itemsvrandom;
+CREATE TABLE itemsvrandom (id bigserial PRIMARY KEY, embedding vector({vector_size}))"""
 
-    with con.raw_sql(query):
+    with con._safe_raw_sql(query):
         pass
 
     t = con.table("itemsvrandom")
@@ -290,7 +315,9 @@ def test_pgvector_type_load(con):
     assert t.schema() == ibis.schema(
         {
             "id": dt.int64(nullable=False),
-            "embedding": dt.unknown,
+            "embedding": dt.Unknown(
+                raw_type=sge.DataType(this=sge.DataType.Type.VECTOR)
+            ),
         }
     )
 
@@ -300,13 +327,13 @@ def test_pgvector_type_load(con):
 def test_name_dtype(con):
     expected_schema = ibis.schema(
         {
-            "f_table_catalog": dt.String(nullable=True),
+            "f_table_catalog": dt.String(length=256, nullable=True),
             "f_table_schema": dt.String(nullable=True),
             "f_table_name": dt.String(nullable=True),
             "f_geometry_column": dt.String(nullable=True),
             "coord_dimension": dt.Int32(nullable=True),
             "srid": dt.Int32(nullable=True),
-            "type": dt.String(nullable=True),
+            "type": dt.String(length=30, nullable=True),
         }
     )
 
@@ -376,3 +403,115 @@ def test_infoschema_dtypes(con):
         con.table("triggers", database="information_schema").select("created").schema()
         == triggers_created_schema
     )
+
+
+def test_password_with_bracket():
+    password = f"{IBIS_POSTGRES_PASS}[]"
+    quoted_pass = quote_plus(password)
+    url = f"postgres://{IBIS_POSTGRES_USER}:{quoted_pass}@{IBIS_POSTGRES_HOST}:{IBIS_POSTGRES_PORT}/{POSTGRES_TEST_DB}"
+    with pytest.raises(
+        PsycoPgOperationalError,
+        match=f'password authentication failed for user "{IBIS_POSTGRES_USER}"',
+    ):
+        ibis.connect(url)
+
+
+def test_create_geospatial_table_with_srid(con):
+    name = gen_name("geospatial")
+    column_names = string.ascii_lowercase
+    column_types = [
+        "Point",
+        "LineString",
+        "Polygon",
+        "MultiLineString",
+        "MultiPoint",
+        "MultiPolygon",
+    ]
+    schema_string = ", ".join(
+        f"{column} geometry({dtype}, 4326)"
+        for column, dtype in zip(column_names, column_types)
+    )
+    with con._safe_raw_sql(f"CREATE TEMP TABLE {name} ({schema_string})"):
+        pass
+
+    schema = con.get_schema(name)
+    assert schema == ibis.schema(
+        {
+            column: getattr(dt, dtype)(srid=4326)
+            for column, dtype in zip(column_names, column_types)
+        }
+    )
+
+
+@pytest.fixture
+def enum_table(con):
+    name = gen_name("enum_table")
+    with con._safe_raw_sql("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')") as cur:
+        cur.execute(f"CREATE TEMP TABLE {name} (mood mood)")
+        cur.execute(f"INSERT INTO {name} (mood) VALUES ('happy'), ('ok')")
+        yield name
+        cur.execute(f"DROP TABLE {name}")
+        cur.execute("DROP TYPE mood")
+
+
+def test_enum_table(con, enum_table):
+    t = con.table(enum_table)
+    assert t.mood.type().is_string()
+    e = t.filter(t.mood == "ok")
+    result = e.execute()
+    assert len(result) == 1
+
+
+def test_parsing_oid_dtype(con):
+    # Load a table that uses the OID type and check that we map it to Int64
+    t = con.table("pg_class", database="pg_catalog")
+    assert t.oid.type() == ibis.dtype("int64")
+
+
+@pytest.fixture
+def tmp_db(con):
+    name = gen_name("tmp_db")
+    con.create_database(name)
+    yield name
+    con.drop_database(name, cascade=True)
+
+
+def test_create_table_overwrite(con, tmp_db):
+    name = gen_name("overwrite_test")
+    t = con.create_table(name, schema={"id": "int32"}, database=tmp_db, overwrite=True)
+    assert t.schema() == ibis.schema({"id": dt.int32})
+
+
+@pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "no-overwrite"])
+@pytest.mark.parametrize(
+    ("insert_overwrite", "expected_count"),
+    [(True, 2), (False, 7)],
+    ids=["insert-overwrite", "no-insert-overwrite"],
+)
+def test_insert_overwrite(con, tmp_db, overwrite, insert_overwrite, expected_count):
+    table = gen_name("insert_overwrite")
+    schema = tmp_db
+
+    t = ibis.memtable({"key": [1, 2, 3, 4, 5]})
+
+    con.create_table(table, obj=t, database=schema, overwrite=overwrite)
+
+    t = t.filter(lambda table: table["key"] > 3)
+
+    con.insert(table, obj=t, overwrite=insert_overwrite, database=schema)
+    assert table in con.list_tables(database=schema)
+    assert con.table(table, database=schema).count().execute() == expected_count
+
+
+def test_nans_nulls(con):
+    pa = pytest.importorskip("pyarrow")
+    table_name = gen_name("test_table")
+    data = pa.table({"value": [1.0, float("nan"), None], "key": [1, 2, 3]})
+    table = con.create_table(table_name, obj=data, temp=True)
+    result = table.order_by("key").to_pyarrow()
+    assert result.num_rows == 3
+
+    value = result["value"]
+    assert value[0].as_py() == 1.0
+    assert math.isnan(value[1].as_py())
+    assert value[2].as_py() is None

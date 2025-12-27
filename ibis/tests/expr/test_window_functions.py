@@ -19,7 +19,7 @@ def test_mutate_with_analytic_functions(alltypes):
         f.rank(),
         f.dense_rank(),
         f.percent_rank(),
-        f.ntile(buckets=7),
+        f.ntile(7),
         f.first(),
         f.last(),
         f.first().over(ibis.window(preceding=10)),
@@ -38,7 +38,7 @@ def test_mutate_with_analytic_functions(alltypes):
         f.max(),
     ]
 
-    exprs = [expr.name("e%d" % i) for i, expr in enumerate(exprs)]
+    exprs = [expr.name(f"e{i:d}") for i, expr in enumerate(exprs)]
     proj = g.mutate(exprs)
 
     values = list(proj.op().values.values())

@@ -3,21 +3,15 @@ from __future__ import annotations
 import contextlib
 import functools
 import glob
-import inspect
 import itertools
 import json
 import os
-import platform
-import shutil
-import sys
-import tempfile
-import textwrap
 import warnings
 from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlparse
-from urllib.request import urlretrieve
+from urllib.parse import unquote_plus
+from urllib.request import urlcleanup, urlretrieve
 
 import pyarrow as pa
 import pyarrow_hotfix  # noqa: F401
@@ -25,22 +19,43 @@ import sqlglot as sg
 import sqlglot.expressions as sge
 
 import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
-from ibis.backends import CanCreateCatalog, CanCreateDatabase, CanCreateSchema
-from ibis.backends.snowflake.compiler import SnowflakeCompiler
+from ibis.backends import (
+    CanCreateCatalog,
+    CanCreateDatabase,
+    DirectExampleLoader,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    SupportsTempTables,
+)
 from ibis.backends.snowflake.converter import SnowflakePandasData
 from ibis.backends.sql import SQLBackend
-from ibis.backends.sql.datatypes import SnowflakeType
+from ibis.backends.sql.compilers.base import STAR
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Generator, Iterable, Iterator, Mapping
+    from urllib.parse import ParseResult
 
     import pandas as pd
+    import polars as pl
+    import snowflake.connector
+    import snowflake.snowpark
+
+
+@contextlib.contextmanager
+def download_file(url: str) -> Generator[str]:
+    assert url.startswith("https://"), str(url)
+    tmpfile, _ = urlretrieve(url)  # noqa: S310
+    try:
+        yield tmpfile
+    finally:
+        urlcleanup()
 
 
 _SNOWFLAKE_MAP_UDFS = {
@@ -71,16 +86,88 @@ return longest.map((_, i) => {
         "returns": "ARRAY",
         "source": """return Array(count).fill(value).flat();""",
     },
+    "ibis_udfs.public.array_sum": {
+        "inputs": {"array": "ARRAY"},
+        "returns": "DOUBLE",
+        "source": """\
+let total = 0.0;
+let allNull = true;
+
+for (val of array) {
+  if (val !== null) {
+    total += val;
+    allNull = false;
+  }
+}
+
+return !allNull ? total : null;""",
+    },
+    "ibis_udfs.public.array_avg": {
+        "inputs": {"array": "ARRAY"},
+        "returns": "DOUBLE",
+        "source": """\
+let count = 0;
+let total = 0.0;
+
+for (val of array) {
+  if (val !== null) {
+    total += val;
+    ++count;
+  }
+}
+
+return count !== 0 ? total / count : null;""",
+    },
+    "ibis_udfs.public.array_any": {
+        "inputs": {"array": "ARRAY"},
+        "returns": "BOOLEAN",
+        "source": """\
+let count = 0;
+
+for (val of array) {
+  if (val === true) {
+    return true;
+  } else if (val === false) {
+    ++count;
+  }
+}
+
+return count !== 0 ? false : null;""",
+    },
+    "ibis_udfs.public.array_all": {
+        "inputs": {"array": "ARRAY"},
+        "returns": "BOOLEAN",
+        "source": """\
+let count = 0;
+
+for (val of array) {
+  if (val === false) {
+    return false;
+  } else if (val === true) {
+    ++count;
+  }
+}
+
+return count !== 0 ? true : null;""",
+    },
 }
 
 
-class Backend(SQLBackend, CanCreateCatalog, CanCreateDatabase, CanCreateSchema):
+class Backend(
+    SupportsTempTables,
+    SQLBackend,
+    CanCreateCatalog,
+    CanCreateDatabase,
+    HasCurrentDatabase,
+    HasCurrentCatalog,
+    DirectExampleLoader,
+):
     name = "snowflake"
-    compiler = SnowflakeCompiler()
+    compiler = sc.snowflake.compiler
     supports_python_udfs = True
+    supports_temporary_tables = True
 
-    _latest_udf_python_version = (3, 10)
-    _top_level_methods = ("from_snowpark",)
+    _top_level_methods = ("from_connection", "from_snowpark")
 
     def __init__(self, *args, _from_snowpark: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -90,65 +177,23 @@ class Backend(SQLBackend, CanCreateCatalog, CanCreateDatabase, CanCreateSchema):
         with contextlib.suppress(KeyError):
             kwargs["account"] = kwargs.pop("host")
 
-    def _from_url(self, url: str, **kwargs):
-        """Connect to a backend using a URL `url`.
-
-        Parameters
-        ----------
-        url
-            URL with which to connect to a backend.
-        kwargs
-            Additional keyword arguments
-
-        Returns
-        -------
-        BaseBackend
-            A backend instance
-
-        """
-
-        url = urlparse(url)
-        if url.path:
-            database, schema = url.path[1:].split("/", 1)
-            query_params = parse_qs(url.query)
-            (warehouse,) = query_params.pop("warehouse", (None,))
-            connect_args = {
-                "user": url.username,
-                "password": url.password or "",
-                "account": url.hostname,
-                "warehouse": warehouse,
-                "database": database or "",
-                "schema": schema or "",
-            }
-        else:
-            connect_args = {}
-            query_params = {}
-
-        for name, value in query_params.items():
-            if len(value) > 1:
-                connect_args[name] = value
-            elif len(value) == 1:
-                connect_args[name] = value[0]
-            else:
-                raise com.IbisError(f"Invalid URL parameter: {name}")
-
-        session_parameters = kwargs.setdefault("session_parameters", {})
-
-        session_parameters["MULTI_STATEMENT_COUNT"] = 0
-        session_parameters["JSON_INDENT"] = 0
-        session_parameters["PYTHON_CONNECTOR_QUERY_RESULT_FORMAT"] = "arrow_force"
-
-        kwargs.update(connect_args)
+    def _from_url(self, url: ParseResult, **kwarg_overrides):
+        kwargs = {}
+        database, *schema = url.path[1:].split("/", 1)
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["password"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["account"] = url.hostname
+        if database:
+            kwargs["database"] = database
+        if url.port:
+            kwargs["port"] = url.port
+        if schema:
+            kwargs["schema"] = schema[0]
+        kwargs.update(kwarg_overrides)
         self._convert_kwargs(kwargs)
-
-        if "database" in kwargs and not kwargs["database"]:
-            del kwargs["database"]
-
-        if "schema" in kwargs and not kwargs["schema"]:
-            del kwargs["schema"]
-
-        if "password" in kwargs and kwargs["password"] is None:
-            kwargs["password"] = ""
         return self.connect(**kwargs)
 
     @property
@@ -206,7 +251,7 @@ $$ {defn["source"]} $$"""
             `ibis.snowflake.connect(...)` can succeed, while subsequent API
             calls fail if the authentication fails for any reason.
         create_object_udfs
-            Enable object UDF extensions defined by ibis on the first
+            Enable object UDF extensions defined by Ibis on the first
             connection to the database.
         kwargs
             Additional arguments passed to the DBAPI connection call.
@@ -251,16 +296,18 @@ $$ {defn["source"]} $$"""
             )
 
         if create_object_udfs:
-            database = con.database
-            schema = con.schema
             dialect = self.name
             create_stmt = sge.Create(
                 kind="DATABASE", this="ibis_udfs", exists=True
             ).sql(dialect)
-            use_stmt = sge.Use(
-                kind="SCHEMA",
-                this=sg.table(schema, db=database, quoted=self.compiler.quoted),
-            ).sql(dialect)
+            if "/" in con.database:
+                (catalog, db) = con.database.split("/")
+                use_stmt = sge.Use(
+                    kind="SCHEMA",
+                    this=sg.table(db, catalog=catalog, quoted=self.compiler.quoted),
+                ).sql(dialect)
+            else:
+                use_stmt = ""
 
             stmts = [
                 create_stmt,
@@ -279,9 +326,11 @@ $$ {defn["source"]} $$"""
                         f"Unable to create Ibis UDFs, some functionality will not work: {e}"
                     )
 
-    @util.experimental
     @classmethod
-    def from_snowpark(cls, session, *, create_object_udfs: bool = True) -> Backend:
+    @util.deprecated(as_of="10.0", instead="use from_connection instead")
+    def from_snowpark(
+        cls, session: snowflake.snowpark.Session, *, create_object_udfs: bool = True
+    ) -> Backend:
         """Create an Ibis Snowflake backend from a Snowpark session.
 
         Parameters
@@ -289,7 +338,7 @@ $$ {defn["source"]} $$"""
         session
             A Snowpark session instance.
         create_object_udfs
-            Enable object UDF extensions defined by ibis on the first
+            Enable object UDF extensions defined by Ibis on the first
             connection to the database.
 
         Returns
@@ -329,6 +378,68 @@ $$ {defn["source"]} $$"""
             )
         return backend
 
+    @util.experimental
+    @classmethod
+    def from_connection(
+        cls,
+        con: snowflake.connector.SnowflakeConnection | snowflake.snowpark.Session,
+        /,
+        *,
+        create_object_udfs: bool = True,
+    ) -> Backend:
+        """Create an Ibis Snowflake backend from an existing connection.
+
+        Parameters
+        ----------
+        con
+            A Snowflake Connector for Python connection or a Snowpark
+            session instance.
+        create_object_udfs
+            Enable object UDF extensions defined by Ibis on the first
+            connection to the database.
+
+        Returns
+        -------
+        Backend
+            An Ibis Snowflake backend instance.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> import snowflake.snowpark as sp  # doctest: +SKIP
+        >>> session = sp.Session.builder.configs(...).create()  # doctest: +SKIP
+        >>> con = ibis.snowflake.from_connection(session)  # doctest: +SKIP
+        >>> batting = con.tables.BATTING  # doctest: +SKIP
+        >>> batting[["playerID", "RBI"]].head()  # doctest: +SKIP
+        ┏━━━━━━━━━━━┳━━━━━━━┓
+        ┃ playerID  ┃ RBI   ┃
+        ┡━━━━━━━━━━━╇━━━━━━━┩
+        │ string    │ int64 │
+        ├───────────┼───────┤
+        │ abercda01 │     0 │
+        │ addybo01  │    13 │
+        │ allisar01 │    19 │
+        │ allisdo01 │    27 │
+        │ ansonca01 │    16 │
+        └───────────┴───────┘
+        """
+        import snowflake.connector
+
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = (
+            con
+            if isinstance(con, snowflake.connector.SnowflakeConnection)
+            else con._conn._conn
+        )
+        with contextlib.suppress(snowflake.connector.errors.ProgrammingError):
+            # stored procs on snowflake don't allow session mutation it seems
+            new_backend._setup_session(
+                session_parameters={}, create_object_udfs=create_object_udfs
+            )
+        return new_backend
+
     def reconnect(self) -> None:
         if self._from_snowpark:
             raise com.IbisError(
@@ -336,110 +447,10 @@ $$ {defn["source"]} $$"""
             )
         super().reconnect()
 
-    def _get_udf_source(self, udf_node: ops.ScalarUDF):
-        name = type(udf_node).__name__
-        signature = ", ".join(
-            f"{name} {self.compiler.type_mapper.to_string(arg.dtype)}"
-            for name, arg in zip(udf_node.argnames, udf_node.args)
-        )
-        return_type = SnowflakeType.to_string(udf_node.dtype)
-        lines, _ = inspect.getsourcelines(udf_node.__func__)
-        source = textwrap.dedent(
-            "".join(
-                itertools.dropwhile(
-                    lambda line: not line.lstrip().startswith("def "), lines
-                )
-            )
-        ).strip()
-
-        config = udf_node.__config__
-
-        preamble_lines = [*self._UDF_PREAMBLE_LINES]
-
-        if imports := config.get("imports"):
-            preamble_lines.append(f"IMPORTS = ({', '.join(map(repr, imports))})")
-
-        packages = "({})".format(
-            ", ".join(map(repr, ("pandas", *config.get("packages", ()))))
-        )
-        preamble_lines.append(f"PACKAGES = {packages}")
-
-        return dict(
-            source=source,
-            name=name,
-            func_name=udf_node.__func_name__,
-            preamble="\n".join(preamble_lines).format(
-                name=name,
-                signature=signature,
-                return_type=return_type,
-                comment=f"Generated by ibis {ibis.__version__} using Python {platform.python_version()}",
-                version=".".join(
-                    map(str, min(sys.version_info[:2], self._latest_udf_python_version))
-                ),
-            ),
-        )
-
-    _UDF_PREAMBLE_LINES = (
-        "CREATE OR REPLACE TEMPORARY FUNCTION {name}({signature})",
-        "RETURNS {return_type}",
-        "LANGUAGE PYTHON",
-        "IMMUTABLE",
-        "RUNTIME_VERSION = '{version}'",
-        "COMMENT = '{comment}'",
-    )
-
-    def _define_udf_translation_rules(self, expr):
-        """No-op, these are defined in the compiler."""
-
-    def _register_udfs(self, expr: ir.Expr) -> None:
-        udf_sources = []
-        for udf_node in expr.op().find(ops.ScalarUDF):
-            compile_func = getattr(
-                self, f"_compile_{udf_node.__input_type__.name.lower()}_udf"
-            )
-            if sql := compile_func(udf_node):
-                udf_sources.append(sql)
-        if udf_sources:
-            # define every udf in one execution to avoid the overhead of db
-            # round trips per udf
-            with self._safe_raw_sql(";\n".join(udf_sources)):
-                pass
-
-    def _compile_python_udf(self, udf_node: ops.ScalarUDF) -> str:
-        return """\
-{preamble}
-HANDLER = '{func_name}'
-AS $$
-from __future__ import annotations
-
-from typing import *
-
-{source}
-$$""".format(**self._get_udf_source(udf_node))
-
-    def _compile_pandas_udf(self, udf_node: ops.ScalarUDF) -> str:
-        template = """\
-{preamble}
-HANDLER = 'wrapper'
-AS $$
-from __future__ import annotations
-
-from typing import *
-
-import _snowflake
-import pandas as pd
-
-{source}
-
-@_snowflake.vectorized(input=pd.DataFrame)
-def wrapper(df):
-    return {func_name}(*(col for _, col in df.items()))
-$$"""
-        return template.format(**self._get_udf_source(udf_node))
-
     def to_pyarrow(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -469,13 +480,14 @@ $$"""
     def to_pandas_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
-        **kwargs: Any,
+        chunk_size: int = 1_000_000,
     ) -> Iterator[pd.DataFrame | pd.Series | Any]:
         self._run_pre_execute_hooks(expr)
-        sql = self.compile(expr, limit=limit, params=params, **kwargs)
+        sql = self.compile(expr, limit=limit, params=params)
         target_schema = expr.as_table().schema()
         converter = functools.partial(
             SnowflakePandasData.convert_table, schema=target_schema
@@ -489,6 +501,7 @@ $$"""
     def to_pyarrow_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -524,11 +537,37 @@ $$"""
         catalog: str | None = None,
         database: str | None = None,
     ) -> Iterable[tuple[str, dt.DataType]]:
+        import snowflake.connector
+
+        # this will always show temp tables with the same name as a non-temp
+        # table first
+        #
+        # snowflake puts temp tables in the same catalog and database as
+        # non-temp tables and differentiates between them using a different
+        # mechanism than other database that often put temp tables in a hidden
+        # or intentionally-difficult-to-access catalog/database
         table = sg.table(
             table_name, db=database, catalog=catalog, quoted=self.compiler.quoted
         )
-        with self._safe_raw_sql(sge.Describe(kind="TABLE", this=table)) as cur:
-            result = cur.fetchall()
+        query = sge.Describe(kind="TABLE", this=table)
+
+        try:
+            with self._safe_raw_sql(query) as cur:
+                result = cur.fetchall()
+        except snowflake.connector.errors.ProgrammingError as e:
+            # apparently sqlstate codes are "standard", in the same way that
+            # SQL is standard, because sqlstate codes are part of the SQL
+            # standard
+            #
+            # Nowhere does this exist in Snowflake's documentation but this
+            # exists in MariaDB's docs and matches the SQLSTATE error code
+            #
+            # https://mariadb.com/kb/en/sqlstate/
+            # https://mariadb.com/kb/en/mariadb-error-code-reference/
+            # and the least helpful version: https://docs.snowflake.com/en/developer-guide/snowflake-scripting/exceptions#handling-an-exception
+            if e.sqlstate == "42S02":
+                raise com.TableNotFound(table.sql(self.dialect)) from e
+            raise
 
         type_mapper = self.compiler.type_mapper
         return sch.Schema(
@@ -554,13 +593,13 @@ $$"""
             }
         )
 
-    def list_catalogs(self, like: str | None = None) -> list[str]:
+    def list_catalogs(self, *, like: str | None = None) -> list[str]:
         with self._safe_raw_sql("SHOW DATABASES") as con:
             catalogs = list(map(itemgetter(1), con))
         return self._filter_with_like(catalogs, like)
 
     def list_databases(
-        self, like: str | None = None, catalog: str | None = None
+        self, *, like: str | None = None, catalog: str | None = None
     ) -> list[str]:
         query = "SHOW SCHEMAS"
 
@@ -576,43 +615,14 @@ $$"""
         return self._filter_with_like(schemata, like)
 
     def list_tables(
-        self,
-        like: str | None = None,
-        database: tuple[str, str] | str | None = None,
-        schema: str | None = None,
+        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
     ) -> list[str]:
-        """List the tables in the database.
-
-        Parameters
-        ----------
-        like
-            A pattern to use for listing tables.
-        database
-            Table location. If not passed, uses the current catalog and database.
-
-            To specify a table in a separate Snowflake catalog, you can pass in the
-            catalog and database as a string `"catalog.database"`, or as a tuple of
-            strings `("catalog", "database")`.
-
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
-        schema
-            [deprecated] The schema inside `database` to perform the list against.
-        """
-        table_loc = self._warn_and_create_table_loc(database, schema)
+        table_loc = self._to_sqlglot_table(database)
 
         tables_query = "SHOW TABLES"
         views_query = "SHOW VIEWS"
 
-        if table_loc is not None:
+        if table_loc.catalog or table_loc.db:
             tables_query += f" IN {table_loc}"
             views_query += f" IN {table_loc}"
 
@@ -626,24 +636,17 @@ $$"""
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         import pyarrow.parquet as pq
 
-        raw_name = op.name
+        name = op.name
+        data = op.data.to_pyarrow(schema=op.schema)
 
-        with self.con.cursor() as con:
-            if not con.execute(f"SHOW TABLES LIKE '{raw_name}'").fetchone():
-                tmpdir = tempfile.TemporaryDirectory()
-                try:
-                    path = os.path.join(tmpdir.name, f"{raw_name}.parquet")
-                    # optimize for bandwidth so use zstd which typically compresses
-                    # better than the other options without much loss in speed
-                    pq.write_table(
-                        op.data.to_pyarrow(schema=op.schema), path, compression="zstd"
-                    )
-                    self.read_parquet(path, table_name=raw_name)
-                finally:
-                    with contextlib.suppress(Exception):
-                        shutil.rmtree(tmpdir.name)
+        with util.mktempd() as tmpdir:
+            path = Path(tmpdir, f"{name}.parquet")
+            # optimize for bandwidth so use zstd which typically compresses
+            # better than the other options without much loss in speed
+            pq.write_table(data, path, compression="zstd")
+            self.read_parquet(path, table_name=name)
 
-    def create_catalog(self, name: str, force: bool = False) -> None:
+    def create_catalog(self, name: str, /, *, force: bool = False) -> None:
         current_catalog = self.current_catalog
         current_database = self.current_database
         quoted = self.compiler.quoted
@@ -661,7 +664,7 @@ $$"""
             # so we switch back to the original database and schema
             cur.execute(use_stmt)
 
-    def drop_catalog(self, name: str, force: bool = False) -> None:
+    def drop_catalog(self, name: str, /, *, force: bool = False) -> None:
         current_catalog = self.current_catalog
         if name == current_catalog:
             raise com.UnsupportedOperationError(
@@ -676,7 +679,7 @@ $$"""
             pass
 
     def create_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         current_catalog = self.current_catalog
         current_database = self.current_database
@@ -716,7 +719,7 @@ $$"""
             return cur
 
     def drop_database(
-        self, name: str, catalog: str | None = None, force: bool = False
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
         if self.current_database == name and (
             catalog is None or self.current_catalog == catalog
@@ -736,9 +739,15 @@ $$"""
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | pa.Table | ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema: sch.Schema | None = None,
+        schema: sch.SchemaLike | None = None,
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
@@ -770,6 +779,8 @@ $$"""
         """
         if obj is None and schema is None:
             raise ValueError("Either `obj` or `schema` must be specified")
+        if schema is not None:
+            schema = ibis.schema(schema)
 
         quoted = self.compiler.quoted
 
@@ -782,21 +793,11 @@ $$"""
             db = db.name
             target = sg.table(name, db=db, catalog=catalog, quoted=quoted)
 
-        column_defs = [
-            sge.ColumnDef(
-                this=sg.to_identifier(name, quoted=quoted),
-                kind=self.compiler.type_mapper.from_ibis(typ),
-                constraints=(
-                    None
-                    if typ.nullable
-                    else [sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())]
-                ),
+        if schema:
+            target = sge.Schema(
+                this=target,
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
             )
-            for name, typ in (schema or {}).items()
-        ]
-
-        if column_defs:
-            target = sge.Schema(this=target, expressions=column_defs)
 
         properties = []
 
@@ -814,7 +815,7 @@ $$"""
 
             self._run_pre_execute_hooks(table)
 
-            query = self._to_sqlglot(table)
+            query = self.compiler.to_sqlglot(table)
         else:
             query = None
 
@@ -832,7 +833,7 @@ $$"""
         return self.table(name, database=(catalog, db))
 
     def read_csv(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Register a CSV file as a table in the Snowflake backend.
 
@@ -850,7 +851,6 @@ $$"""
         -------
         Table
             The table that was read from the CSV file
-
         """
         stage = ibis.util.gen_name("stage")
         file_format = ibis.util.gen_name("format")
@@ -858,7 +858,8 @@ $$"""
         # https://docs.snowflake.com/en/sql-reference/sql/put#optional-parameters
         threads = min((os.cpu_count() or 2) // 2, 99)
         table = table_name or ibis.util.gen_name("read_csv_snowflake")
-        quoted = self.compiler.quoted
+        compiler = self.compiler
+        quoted = compiler.quoted
         qtable = sg.to_identifier(table, quoted=quoted)
 
         parse_header = header = kwargs.pop("parse_header", True)
@@ -887,47 +888,64 @@ $$"""
         with self._safe_raw_sql(";\n".join(stmts)) as cur:
             # copy the local file to the stage
             if str(path).startswith("https://"):
-                with tempfile.NamedTemporaryFile() as tmp:
-                    tmpname = tmp.name
-                    urlretrieve(path, filename=tmpname)
-                    tmp.flush()
+                with download_file(str(path)) as tmpname:
                     cur.execute(
-                        f"PUT 'file://{tmpname}' @{stage} PARALLEL = {threads:d}"
+                        f"PUT 'file://{Path(tmpname).absolute().as_posix()}' @{stage} PARALLEL = {threads:d}"
                     )
             else:
                 cur.execute(
-                    f"PUT 'file://{Path(path).absolute()}' @{stage} PARALLEL = {threads:d}"
+                    f"PUT 'file://{Path(path).absolute().as_posix()}' @{stage} PARALLEL = {threads:d}"
                 )
 
             # handle setting up the schema in python because snowflake is
             # broken for csv globs: it cannot parse the result of the following
-            # query in  USING TEMPLATE
-            (info,) = cur.execute(
-                f"""
-                SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
-                WITHIN GROUP (ORDER BY ORDER_ID ASC)
-                FROM TABLE(
-                    INFER_SCHEMA(
-                        LOCATION => '@{stage}',
-                        FILE_FORMAT => '{file_format}'
+            # query in USING TEMPLATE
+            query = sg.select(
+                sge.WithinGroup(
+                    this=sge.ArrayAgg(this=sge.StarMap(this=STAR)),
+                    expression=sge.Order(
+                        expressions=[sge.Ordered(this=sg.column("ORDER_ID"))]
+                    ),
+                )
+            ).from_(
+                compiler.f.anon.TABLE(
+                    compiler.f.anon.INFER_SCHEMA(
+                        sge.Kwarg(
+                            this=compiler.v.LOCATION,
+                            expression=sge.convert(f"@{stage}"),
+                        ),
+                        sge.Kwarg(
+                            this=compiler.v.FILE_FORMAT,
+                            expression=sge.convert(file_format),
+                        ),
                     )
                 )
-                """
-            ).fetchone()
-            columns = ", ".join(
-                "{} {}{}".format(
-                    sg.to_identifier(field["COLUMN_NAME"], quoted=quoted).sql(
-                        self.name
-                    ),
-                    field["TYPE"],
-                    " NOT NULL" if not field["NULLABLE"] else "",
-                )
-                for field in json.loads(info)
             )
+            (info,) = cur.execute(query.sql(self.dialect)).fetchone()
             stmts = [
                 # create a temporary table using the stage and format inferred
                 # from the CSV
-                f"CREATE TEMP TABLE {qtable} ({columns})",
+                sge.Create(
+                    kind="TABLE",
+                    this=sge.Schema(
+                        this=qtable,
+                        expressions=[
+                            sge.ColumnDef(
+                                this=sg.to_identifier(
+                                    field["COLUMN_NAME"], quoted=quoted
+                                ),
+                                kind=field["TYPE"],
+                                constraints=(
+                                    [sge.NotNullColumnConstraint()]
+                                    if not field["NULLABLE"]
+                                    else None
+                                ),
+                            )
+                            for field in json.loads(info)
+                        ],
+                    ),
+                    properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
+                ).sql(self.dialect),
                 # load the CSV into the table
                 f"""
                 COPY INTO {qtable}
@@ -940,7 +958,7 @@ $$"""
         return self.table(table)
 
     def read_json(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Read newline-delimited JSON into an ibis table, using Snowflake.
 
@@ -959,12 +977,12 @@ $$"""
         -------
         Table
             An ibis table expression
-
         """
         stage = util.gen_name("read_json_stage")
         file_format = util.gen_name("read_json_format")
         table = table_name or util.gen_name("read_json_snowflake")
-        qtable = sg.to_identifier(table, quoted=self.compiler.quoted)
+        quoted = self.compiler.quoted
+        qtable = sg.table(table, quoted=quoted)
         threads = min((os.cpu_count() or 2) // 2, 99)
 
         kwargs.setdefault("strip_outer_array", True)
@@ -979,32 +997,48 @@ $$"""
             f"CREATE TEMP STAGE {stage} FILE_FORMAT = {file_format}",
         ]
 
+        compiler = self.compiler
+        query = sg.select(
+            sge.WithinGroup(
+                this=sge.ArrayAgg(this=sge.StarMap(this=STAR)),
+                expression=sge.Order(
+                    expressions=[sge.Ordered(this=sg.column("ORDER_ID"))]
+                ),
+            )
+        ).from_(
+            compiler.f.anon.TABLE(
+                compiler.f.anon.INFER_SCHEMA(
+                    sge.Kwarg(
+                        this=compiler.v.LOCATION,
+                        expression=sge.convert(f"@{stage}"),
+                    ),
+                    sge.Kwarg(
+                        this=compiler.v.FILE_FORMAT,
+                        expression=sge.convert(file_format),
+                    ),
+                )
+            )
+        )
         with self._safe_raw_sql(";\n".join(stmts)) as cur:
             cur.execute(
-                f"PUT 'file://{Path(path).absolute()}' @{stage} PARALLEL = {threads:d}"
+                f"PUT 'file://{Path(path).absolute().as_posix()}' @{stage} PARALLEL = {threads:d}"
             )
             cur.execute(
                 ";\n".join(
                     [
-                        f"""
-                        CREATE TEMP TABLE {qtable}
-                        USING TEMPLATE (
-                            SELECT ARRAY_AGG(OBJECT_CONSTRUCT(*))
-                            WITHIN GROUP (ORDER BY ORDER_ID ASC)
-                            FROM TABLE(
-                                INFER_SCHEMA(
-                                    LOCATION => '@{stage}',
-                                    FILE_FORMAT => '{file_format}'
-                                )
-                            )
-                        )
-                        """,
+                        f"CREATE TEMP TABLE {qtable} USING TEMPLATE ({query.sql(self.dialect)})",
                         # load the JSON file into the table
-                        f"""
-                        COPY INTO {qtable}
-                        FROM @{stage}
-                        MATCH_BY_COLUMN_NAME = {str(match_by_column_name).upper()}
-                        """,
+                        sge.Copy(
+                            this=qtable,
+                            kind=True,
+                            files=[sge.Table(this=sge.Var(this=f"@{stage}"))],
+                            params=[
+                                sge.CopyParameter(
+                                    this=self.compiler.v.MATCH_BY_COLUMN_NAME,
+                                    expression=sge.convert(match_by_column_name),
+                                )
+                            ],
+                        ).sql(self.dialect),
                     ]
                 )
             )
@@ -1012,7 +1046,7 @@ $$"""
         return self.table(table)
 
     def read_parquet(
-        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+        self, path: str | Path, /, *, table_name: str | None = None, **kwargs: Any
     ) -> ir.Table:
         """Read a Parquet file into an ibis table, using Snowflake.
 
@@ -1031,13 +1065,12 @@ $$"""
         -------
         Table
             An ibis table expression
-
         """
         import pyarrow.dataset as ds
 
         from ibis.formats.pyarrow import PyArrowSchema
 
-        abspath = Path(path).absolute()
+        abspath = Path(path).absolute().as_posix()
         schema = PyArrowSchema.to_ibis(
             ds.dataset(glob.glob(str(abspath)), format="parquet").schema
         )
@@ -1045,106 +1078,105 @@ $$"""
         stage = util.gen_name("read_parquet_stage")
         table = table_name or util.gen_name("read_parquet_snowflake")
         quoted = self.compiler.quoted
-        qtable = sg.to_identifier(table, quoted=quoted)
+        qtable = sg.table(table, quoted=quoted)
         threads = min((os.cpu_count() or 2) // 2, 99)
 
-        options = " " * bool(kwargs) + " ".join(
+        kwargs.setdefault("USE_LOGICAL_TYPE", True)
+        options = " ".join(
             f"{name.upper()} = {value!r}" for name, value in kwargs.items()
         )
 
-        # we can't infer the schema from the format alone because snowflake
-        # doesn't support logical timestamp types in parquet files
-        #
-        # see
-        # https://community.snowflake.com/s/article/How-to-load-logical-type-TIMESTAMP-data-from-Parquet-files-into-Snowflake
-        names_types = [
-            (
-                name,
-                self.compiler.type_mapper.to_string(typ),
-                typ.nullable,
-                typ.is_timestamp(),
-            )
-            for name, typ in schema.items()
-        ]
-        snowflake_schema = ", ".join(
-            f"{sg.to_identifier(col, quoted=quoted)} {typ}{' NOT NULL' * (not nullable)}"
-            for col, typ, nullable, _ in names_types
-        )
-        cols = ", ".join(
-            f"$1:{col}{'::VARCHAR' * is_timestamp}::{typ}"
-            for col, typ, _, is_timestamp in names_types
-        )
+        type_mapper = self.compiler.type_mapper
 
+        dialect = self.dialect
         stmts = [
-            f"CREATE TEMP STAGE {stage} FILE_FORMAT = (TYPE = PARQUET{options})",
-            f"CREATE TEMP TABLE {qtable} ({snowflake_schema})",
+            f"CREATE TEMP STAGE {stage} FILE_FORMAT = (TYPE = PARQUET {options})",
+            sge.Create(
+                kind="TABLE",
+                this=sge.Schema(
+                    this=qtable,
+                    expressions=schema.to_sqlglot_column_defs(dialect),
+                ),
+                properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
+            ).sql(dialect),
         ]
 
         query = ";\n".join(stmts)
+
+        param = sge.Parameter(this=sge.convert(1))
+        copy_select = (
+            sg.select(
+                *(
+                    sg.cast(
+                        self.compiler.f.get(param, sge.convert(col)),
+                        type_mapper.from_ibis(typ),
+                    )
+                    for col, typ in schema.items()
+                )
+            )
+            .from_(sge.Table(this=sge.Var(this=f"@{stage}")))
+            .subquery()
+        )
+        copy_query = sge.Copy(this=qtable, kind=True, files=[copy_select]).sql(dialect)
         with self._safe_raw_sql(query) as cur:
             cur.execute(f"PUT 'file://{abspath}' @{stage} PARALLEL = {threads:d}")
-            cur.execute(f"COPY INTO {qtable} FROM (SELECT {cols} FROM @{stage})")
+            cur.execute(copy_query)
 
         return self.table(table)
 
     def insert(
         self,
-        table_name: str,
+        name: str,
+        /,
         obj: pd.DataFrame | ir.Table | list | dict,
-        schema: str | None = None,
+        *,
         database: str | None = None,
         overwrite: bool = False,
     ) -> None:
         """Insert data into a table.
 
+        ::: {.callout-note}
+        ## Ibis does not use the word `schema` to refer to database hierarchy.
+        A collection of tables is referred to as a `database`.
+        A collection of `database` is referred to as a `catalog`.
+        These terms are mapped onto the corresponding features in each
+        backend (where available), regardless of whether the backend itself
+        uses the same terminology.
+        :::
+
         Parameters
         ----------
-        table_name
+        name
             The name of the table to which data needs will be inserted
         obj
             The source data or expression to insert
-        schema
-            The name of the schema that the table is located in
-        schema
-            [deprecated] The name of the schema that the table is located in
         database
             Name of the attached database that the table is located in.
 
             For multi-level table hierarchies, you can pass in a dotted string
             path like `"catalog.database"` or a tuple of strings like
             `("catalog", "database")`.
-
-            ::: {.callout-note}
-            ## Ibis does not use the word `schema` to refer to database hierarchy.
-            A collection of tables is referred to as a `database`.
-            A collection of `database` is referred to as a `catalog`.
-            These terms are mapped onto the corresponding features in each
-            backend (where available), regardless of whether the backend itself
-            uses the same terminology.
-            :::
         overwrite
             If `True` then replace existing contents of table
-
         """
-        table_loc = self._warn_and_create_table_loc(database, schema)
+        table_loc = self._to_sqlglot_table(database)
         catalog, db = self._to_catalog_db_tuple(table_loc)
 
         if not isinstance(obj, ir.Table):
             obj = ibis.memtable(obj)
 
-        table = sg.table(table_name, db=db, catalog=catalog, quoted=True)
         self._run_pre_execute_hooks(obj)
-        query = sg.exp.insert(
-            expression=self.compile(obj),
-            into=table,
-            columns=[sg.to_identifier(col, quoted=True) for col in obj.columns],
-            dialect=self.name,
-        )
 
+        query = self._build_insert_from_table(
+            target=name, source=obj, db=db, catalog=catalog
+        )
+        table = sg.table(name, db=db, catalog=catalog, quoted=self.compiler.quoted)
+
+        dialect = self.dialect
         statements = []
         if overwrite:
-            statements.append(f"TRUNCATE TABLE {table.sql(self.name)}")
-        statements.append(query.sql(self.name))
+            statements.append(f"TRUNCATE TABLE {table.sql(dialect)}")
+        statements.append(query.sql(dialect))
 
         statement = ";".join(statements)
         with self._safe_raw_sql(statement):
