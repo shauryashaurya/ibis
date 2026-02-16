@@ -42,6 +42,9 @@ class PostgresUDFNode(ops.Value):
     shape = rlz.shape_like("args")
 
 
+_DOUBLE_PRECISION_TYPE = sge.DataType(this=sge.DataType.Type.DOUBLE)
+
+
 class PostgresCompiler(SQLGlotCompiler):
     __slots__ = ()
 
@@ -52,9 +55,9 @@ class PostgresCompiler(SQLGlotCompiler):
 
     agg = AggGen(supports_filter=True, supports_order_by=True)
 
-    NAN = sge.Literal.number("'NaN'::double precision")
-    POS_INF = sge.Literal.number("'Inf'::double precision")
-    NEG_INF = sge.Literal.number("'-Inf'::double precision")
+    NAN = sge.cast(sge.Literal.string("NaN"), _DOUBLE_PRECISION_TYPE)
+    POS_INF = sge.cast(sge.Literal.string("Inf"), _DOUBLE_PRECISION_TYPE)
+    NEG_INF = -POS_INF
 
     LOWERED_OPS = {ops.Sample: lower_sample(physical_tables_only=True)}
 
@@ -627,7 +630,11 @@ $$""".format(
     def visit_RegexExtract(self, op, *, arg, pattern, index):
         pattern = self.f.concat("(", pattern, ")")
         matches = self.f.regexp_match(arg, pattern)
-        return self.if_(arg.rlike(pattern), sge.paren(matches, copy=False)[index], NULL)
+        return self.if_(
+            arg.rlike(sge.paren(pattern, copy=False)),
+            sge.paren(matches, copy=False)[index],
+            NULL,
+        )
 
     def visit_FindInSet(self, op, *, needle, values):
         return self.f.coalesce(
@@ -719,7 +726,11 @@ $$""".format(
         return self.f.extract("epoch", arg)
 
     def visit_ArrayIndex(self, op, *, arg, index):
-        index = self.if_(index < 0, self.f.cardinality(arg) + index, index)
+        index = self.if_(
+            index < 0,
+            self.f.cardinality(arg) + sge.paren(index + 1, copy=False),
+            index + 1,
+        )
         return sge.paren(arg, copy=False)[index]
 
     def visit_ArraySlice(self, op, *, arg, start, stop):
